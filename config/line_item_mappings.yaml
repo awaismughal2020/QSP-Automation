@@ -1,0 +1,240 @@
+# Management Accounts Line Item Mappings
+# Maps row labels in Management Cijfers sheet to BDO account codes
+# 
+# Format:
+#   row_label:
+#     accounts: ["code1", "code2", "code*"]  # Use * for wildcard
+#     calc_type: "sum" or "direct"
+#
+# Dutch Chart of Accounts Reference:
+#   10xxxxx, 11xxxxx = Equity (Eigen Vermogen / EV)
+#   16xxxxx = Real Estate (Vastgoed / VG)
+#   17xxxxx = Financial Fixed Assets (FVA)
+#   19xxxxx = Long-term Liabilities / Loans (LLS)
+#   20xxxxx = Receivables (Vorderingen / VOR)
+#   23xxxxx = Current Liabilities (Kruisposten / LM)
+#   24xxxxx = Bank Accounts (LM)
+#   25xxxxx = Tax/Service costs (Belasting / BEL)
+#   26xxxxx, 27xxxxx = Accruals (RC, KLS)
+#   40-47xxxxx = Expenses (KN, FINBL, AFKN)
+#   80-84xxxxx = Income (OPB - Opbrengsten)
+#   95xxxxx = Tax/Result (VPB)
+
+balance_sheet:
+  # === ASSETS ===
+  "Deferred Tax Asset":
+    accounts: ["1790002"]
+    calc_type: "direct"
+    
+  "Real estate":
+    accounts: ["1600000", "1600200", "1601000", "1610803", "1611003"]
+    calc_type: "sum"
+    
+  "Financial fixed assets":
+    accounts: ["1760000", "1760300", "1790000"]
+    calc_type: "sum"
+    
+  "Accounts receivable":
+    accounts: ["2000000", "2000100", "2000300"]
+    calc_type: "sum"
+    
+  "Service costs to be settled":
+    accounts: ["2040100", "2040200", "2040601"]
+    calc_type: "sum"
+    
+  "Prepaid expenses":
+    accounts: ["2040500", "2040900"]
+    calc_type: "sum"
+    
+  "Cash":
+    accounts: ["2400200", "2400201", "2400202", "2400203", "2400204", "2400205", "2400206"]
+    calc_type: "sum"
+
+  # === EQUITY ===
+  "Equity":
+    accounts: ["1000002", "1100000", "1160000"]
+    calc_type: "sum"
+
+  # === LIABILITIES ===
+  "AC Shareholder":
+    accounts: ["2620000", "2630000", "2640000", "2650000", "2650001"]
+    calc_type: "sum"
+    
+  "Bank loan":
+    accounts: ["1930001", "1930101"]
+    calc_type: "sum"
+    
+  "Amortised fee":
+    accounts: ["1930200"]
+    calc_type: "direct"
+    
+  "Accounts payable":
+    accounts: ["2730000", "2730001"]
+    calc_type: "sum"
+    
+  "Current account":
+    accounts: ["2300000", "2300001"]
+    calc_type: "sum"
+    
+  "VAT payable":
+    accounts: ["2512100"]
+    calc_type: "direct"
+    
+  "Deposits":
+    accounts: ["2740100"]
+    calc_type: "direct"
+    
+  "Rent Invoiced in advance":
+    accounts: ["2740300", "2740500", "2741000", "2741001", "2741004", "2741200", "2742000"]
+    calc_type: "sum"
+
+profit_loss:
+  # === INCOME ===
+  "Gross Theoretical rental income":
+    accounts: ["8000003"]
+    calc_type: "direct"
+    
+  "(Financial vacancy)":
+    accounts: ["8000004"]
+    calc_type: "direct"
+    
+  "Gross rental income":
+    accounts: ["8000003", "8000004"]
+    calc_type: "sum"
+    
+  "Service costs charged (100% occupancy)":
+    accounts: ["8400600", "8400700"]
+    calc_type: "sum"
+    
+  "Service charges":
+    accounts: ["8400600", "8400700"]
+    calc_type: "sum"
+    
+  "Service charges ":
+    accounts: ["8400600", "8400700"]
+    calc_type: "sum"
+
+  # === PROPERTY EXPENSES ===
+  "(Maintenance & repair costs actual)":
+    accounts: ["4100400"]
+    calc_type: "direct"
+    
+  "(Owners society costs (VVE))":
+    accounts: ["4100900"]
+    calc_type: "direct"
+    
+  "(Insurance costs)":
+    accounts: ["4310400"]
+    calc_type: "direct"
+    
+  "(Landlord tax costs)":
+    accounts: ["4101000", "4100410"]
+    calc_type: "sum"
+    
+  "(Property tax)":
+    accounts: ["4101000", "4101010"]
+    calc_type: "sum"
+    
+  "(Water collection, sewerage costs)":
+    accounts: ["4101020"]
+    calc_type: "direct"
+    
+  "(Agent costs)":
+    accounts: ["4311000"]
+    calc_type: "direct"
+    
+  "(Brokerage costs)":
+    accounts: ["4311800"]
+    calc_type: "direct"
+    
+  "(Other costs)":
+    accounts: ["4319800", "4300500", "4311900"]
+    calc_type: "sum"
+    
+  "(Accountant costs)":
+    accounts: ["4310600", "4310700", "4312600"]
+    calc_type: "sum"
+    
+  "(Advisory costs)":
+    accounts: ["4311000", "4310800"]
+    calc_type: "sum"
+    
+  "(Intercompany costs)":
+    accounts: ["4300200"]
+    calc_type: "direct"
+    
+  "Property related expenses":
+    accounts: ["4051400", "4100400", "4100900", "4101000", "4100410", "4101010", "4101020", "4310400"]
+    calc_type: "sum"
+
+  # === MANAGEMENT FEES ===
+  "(Management fees)":
+    accounts: ["4051400", "4310500"]
+    calc_type: "sum"
+    
+  "(Management fee Shareholder)":
+    accounts: ["4051400"]
+    calc_type: "direct"
+
+  # === DEPRECIATION & AMORTIZATION ===
+  "(Depreciation)":
+    accounts: ["4730000"]
+    calc_type: "direct"
+
+  # === INTEREST ===
+  "(Net interest expenses - SFA)":
+    accounts: ["4623001", "4620200", "4643000"]
+    calc_type: "sum"
+    
+  "(Net interest expenses - QSPESS Limited)":
+    accounts: ["4601000"]
+    calc_type: "direct"
+    
+  "(Net interest expenses - Tax/other)":
+    accounts: ["4642000"]
+    calc_type: "direct"
+    
+  "(Net interest income - DMRRP INV I)":
+    accounts: ["4663000", "4611000"]
+    calc_type: "sum"
+    
+  "(Net interest expenses)":
+    accounts: ["4601000", "4611000", "4613000", "4620200", "4623001", "4643000", "4642000"]
+    calc_type: "sum"
+
+  # === SALES ===
+  "Cash proceeds sale":
+    accounts: ["8400800"]
+    calc_type: "direct"
+    
+  "(Cost of sales)":
+    accounts: ["4730200"]
+    calc_type: "direct"
+
+  # === TAX & RESULT ===
+  "(Delta DTA & CIT)":
+    accounts: ["9510000"]
+    calc_type: "direct"
+    
+  "Direct result":
+    accounts: ["9500000", "9510000"]
+    calc_type: "sum"
+
+  # === CASH FLOW ITEMS ===
+  "Rental income in period":
+    accounts: ["8000003", "8000004"]
+    calc_type: "sum"
+    
+  "Service Charge Income":
+    accounts: ["8400600", "8400700"]
+    calc_type: "sum"
+
+# Validation configuration
+equity_accounts:
+  prefixes: ["10", "11"]
+  
+income_accounts:
+  prefixes: ["8"]
+  
+expense_accounts:
+  prefixes: ["4"]

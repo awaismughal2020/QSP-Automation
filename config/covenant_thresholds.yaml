@@ -1,0 +1,40 @@
+# Covenant Thresholds from Senior Facility Agreement
+
+covenants:
+  historic_debt_service_cover:
+    threshold: 1.20  # 120%
+    operator: ">="
+    description: "Historic DSCR must be >= 120%"
+    calculation: "Net Operating Income / Debt Service"
+    
+  projected_debt_service_cover:
+    threshold: 1.20  # 120%
+    operator: ">="
+    description: "Projected DSCR must be >= 120%"
+    calculation: "Projected NOI / Projected Debt Service"
+    
+  historic_net_debt_yield:
+    threshold: 0.062  # 6.20%
+    operator: ">="
+    description: "Historic Net Debt Yield must be >= 6.20%"
+    calculation: "Net Operating Income / Net Debt"
+    
+  projected_net_debt_yield:
+    threshold: 0.062  # 6.20%
+    operator: ">="
+    description: "Projected Net Debt Yield must be >= 6.20%"
+    calculation: "Projected NOI / Net Debt"
+    
+  loan_to_value:
+    threshold: 0.62  # 62%
+    operator: "<="
+    description: "LTV must be <= 62%"
+    calculation: "Net Debt / Property Value"
+
+# Validation rules
+validation:
+  require_all_pass: true
+  alert_on_margin_breach:
+    enabled: true
+    margin_percentage: 5  # Alert if within 5% of threshold
+

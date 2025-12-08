@@ -1,0 +1,123 @@
+# QSP Quarterly Reporting Automation - Cursor AI Rules
+
+## Project Overview
+Automated quarterly financial reporting system for QSP ESS B.V. (Dutch real estate investment vehicle) for ASX compliance. Processes BDO accountant data, rent rolls, sales trackers, and compliance calculations into a final merged PDF report.
+
+## Key Technical Challenges
+1. **BDO Schema Drift**: Column count varies (8-14) across quarters. MUST parse by account code, NOT column position.
+2. **Multi-file Coordination**: 6 input files → 4 output files with complex dependencies.
+3. **Excel Formula Preservation**: Management Accounts has historical formulas that break with layout changes.
+4. **PDF Assembly**: Strict page order required for ASX submission.
+
+## Critical Account Codes (Always Reference)
+```
+1600000 - Property Acquisition (Verkrijgingsprijs)
+1600200 - Cumulative Depreciation (negative value)
+1601000/1610803 - Disposals (code changed over time!)
+1611003 - Disposal Depreciation
+1760000 - Receivables DMRRP
+1790000 - Swap Fee (introduced 2023)
+1790002 - Deferred Tax Asset
+0900000/0910000 - Senior Loan
+```
+
+## Code Architecture
+```
+src/
+├── parsers/       # Read external files (schema-drift resistant)
+├── transformers/  # Business logic & calculations
+├── generators/    # Produce output files
+├── validators/    # Data validation rules
+└── utils/         # Shared utilities
+```
+
+## Required Patterns
+
+### BDO Parsing Pattern
+```python
+# CORRECT - Match by account code
+for code, entry in bdo_result.accounts.items():
+    if code.startswith('16'):  # Real estate accounts
+        total += entry.closing_balance
+
+# WRONG - Never use column positions
+value = df.iloc[row, 5]  # This breaks with schema drift!
+```
+
+### Validation Pattern
+```python
+# Always validate the critical equation
+equity_movement = equity_end - equity_start
+direct_result = sum(p_and_l_mutations)
+assert abs(equity_movement - direct_result) < 1.00, "Balance check failed"
+```
+
+### Excel Update Pattern
+```python
+# CORRECT - Copy formatting when adding columns
+from copy import copy
+new_cell.font = copy(source_cell.font)
+new_cell.number_format = source_cell.number_format
+
+# WRONG - Don't overwrite formulas blindly
+cell.value = new_value  # May destroy important formula!
+```
+
+## File Naming Conventions
+- BDO: `Cijfers QSP DD-MM-YYYY d.d. DD-MM-YYYY.xlsx`
+- Management Accounts: `Management Accounts QX YYYY - Draft N.xlsx`
+- Rent Roll: `QSP huurlijst DD-MM-YYYY.xlsx`
+- Sales Tracker: `Unit Sales tracker QX_updated.xlsx`
+- Compliance: `Compliance Certificate Berekening QSP - QX YYYY.xlsx`
+- Word: `Quarterly QSP - QX YYYY - Draft.docx`
+- Final PDF: `Quarterly QSP - QX YYYY - ASX.pdf`
+
+## Covenant Thresholds (CRITICAL - Must Pass)
+- Historic/Projected DSCR >= 120%
+- Historic/Projected NDY >= 6.20%
+- LTV <= 62%
+
+## Dependencies to Use
+- `openpyxl` - Excel read/write with formatting
+- `python-docx` - Word document manipulation
+- `PyPDF2` - PDF merging
+- `pandas` - Data analysis (but NOT for writing Excel with formatting)
+- `loguru` - Logging
+- `pydantic` - Data validation
+- LibreOffice (soffice) - Document conversion
+
+## Error Handling Rules
+1. Never silently skip missing accounts - log warning and continue
+2. Fail hard on balance validation errors
+3. Provide actionable error messages with file/row context
+4. Clean up temp files even on failure
+
+## Testing Requirements
+- Test with BOTH old (Q1 2019) and new (Q3 2025) BDO formats
+- Verify schema drift detection with mock files
+- Test covenant calculations against known values
+- Integration test the full orchestrator
+
+## Dutch Terminology Reference
+- Verkrijgingsprijs = Acquisition cost
+- Afschrijving = Depreciation
+- Huuropbrengsten = Rental income
+- Debiteuren = Accounts receivable
+- Vooruitbetaald = Prepaid
+- Opgelopen rente = Accrued interest
+- Lening = Loan
+
+## Common Pitfalls to Avoid
+1. ❌ Using `pd.read_excel()` header=0 - headers may not be row 0
+2. ❌ Hardcoding column indices - BDO changes format
+3. ❌ Converting EUR to USD - All values are EUR
+4. ❌ Using `xlwings` - Requires Excel installed, use openpyxl
+5. ❌ Modifying original input files - Always copy first
+6. ❌ Assuming dates are datetime - May be strings in Dutch format
+
+## When Implementing
+1. Read the full implementation plan document first
+2. Start with BDO parser - it's the foundation
+3. Write tests before complex transformations
+4. Use dry-run mode for validation without file generation
+5. Log everything with context (file, row, account code)

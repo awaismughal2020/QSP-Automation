@@ -1,0 +1,273 @@
+# BDO Account Code Mappings
+# Maps Dutch account codes to standardized internal names
+# Handles historical naming variations
+
+account_codes:
+  # ASSETS - Real Estate
+  property_acquisition:
+    codes: ["1600000"]
+    name_patterns: ["Verkrijgingsprijs", "Acquisition cost"]
+    category: "assets"
+    subcategory: "real_estate"
+    
+  cumulative_depreciation:
+    codes: ["1600200"]
+    name_patterns: ["Cumulatieve afschrijving", "Cumulative depreciation"]
+    category: "assets"
+    subcategory: "real_estate"
+    sign: "negative"
+    
+  disposals_cost:
+    codes: ["1601000", "1610803"]  # Code changed over time
+    name_patterns: ["Verkoop verkrijgingsprijs", "Disposal acquisition"]
+    category: "assets"
+    subcategory: "real_estate"
+    
+  disposals_depreciation:
+    codes: ["1611003"]
+    name_patterns: ["Verkoop afschrijving", "Disposal depreciation"]
+    category: "assets"
+    subcategory: "real_estate"
+
+  # ASSETS - Financial
+  receivables_dmrrp:
+    codes: ["1760000"]
+    name_patterns: ["Te vorderen DMRRP", "Receivable DMRRP"]
+    category: "assets"
+    subcategory: "financial_fixed_assets"
+
+  receivables_other:
+    codes: ["1760*", "1760300"]
+    name_patterns: ["Te vorderen", "Receivable", "Vorderingen"]
+    category: "assets"
+    subcategory: "financial_fixed_assets"
+
+  deferred_tax_asset:
+    codes: ["1790002"]
+    name_patterns: ["Latente belastingvordering", "Deferred tax asset"]
+    category: "assets"
+    subcategory: "financial_fixed_assets"
+
+  swap_fee:
+    codes: ["1790000"]
+    name_patterns: ["Swap fee", "Swap vergoeding"]
+    category: "assets"
+    subcategory: "financial_fixed_assets"
+    introduced: "2023-Q1"  # New account
+
+  # CURRENT ASSETS
+  accounts_receivable:
+    codes: ["1300*", "1310*", "1320*"]
+    name_patterns: ["Debiteuren", "Accounts receivable"]
+    category: "current_assets"
+    
+  service_costs_settlement:
+    codes: ["1350*"]
+    name_patterns: ["Af te rekenen", "Service costs"]
+    category: "current_assets"
+    sign: "can_be_negative"
+
+  prepaid_expenses:
+    codes: ["1360*", "1370*"]
+    name_patterns: ["Vooruitbetaald", "Prepaid"]
+    category: "current_assets"
+
+  suspense_accounts:
+    codes: ["1930*", "1000*"]
+    name_patterns: ["Tussenrekening", "Suspense", "Kruispost"]
+    category: "current_assets"
+    subcategory: "other"
+
+  cash_bank:
+    codes: ["1100*", "1110*", "1120*", "1160*"]
+    name_patterns: ["Kas", "Bank", "Cash", "Geld"]
+    category: "current_assets"
+
+  # EQUITY & LIABILITIES
+  share_capital:
+    codes: ["0500*"]
+    name_patterns: ["Aandelenkapitaal", "Share capital"]
+    category: "equity"
+
+  share_premium:
+    codes: ["0510*"]
+    name_patterns: ["Agio", "Share premium"]
+    category: "equity"
+
+  retained_earnings:
+    codes: ["0600*", "0610*"]
+    name_patterns: ["Ingehouden winst", "Retained earnings"]
+    category: "equity"
+
+  # LIABILITIES
+  senior_loan:
+    codes: ["0900*", "0910*"]
+    name_patterns: ["Senior lening", "Senior loan", "Hoofdsom"]
+    category: "liabilities"
+    subcategory: "long_term"
+
+  accrued_interest:
+    codes: ["0920*", "0930*"]
+    name_patterns: ["Opgelopen rente", "Accrued interest"]
+    category: "liabilities"
+
+  # P&L - INCOME
+  rental_income:
+    codes: ["8000*", "8010*"]
+    name_patterns: ["Huuropbrengsten", "Rental income"]
+    category: "income"
+
+  service_charge_income:
+    codes: ["8100*"]
+    name_patterns: ["Servicekosten", "Service charge"]
+    category: "income"
+
+  # P&L - EXPENSES
+  property_expenses:
+    codes: ["4000*", "4100*"]
+    name_patterns: ["Vastgoed kosten", "Property expenses"]
+    category: "expenses"
+
+  maintenance:
+    codes: ["4200*", "4210*"]
+    name_patterns: ["Onderhoud", "Maintenance"]
+    category: "expenses"
+
+  depreciation:
+    codes: ["4300*"]
+    name_patterns: ["Afschrijving", "Depreciation"]
+    category: "expenses"
+
+  interest_expense:
+    codes: ["4400*", "4410*"]
+    name_patterns: ["Rentelasten", "Interest expense"]
+    category: "expenses"
+
+  management_fees:
+    codes: ["4050*", "4051*"]
+    name_patterns: ["Management fee", "Beheerkosten"]
+    category: "expenses"
+
+  professional_fees:
+    codes: ["4100*", "4101*", "4102*"]
+    name_patterns: ["Advieskosten", "Professional fees", "Accountant"]
+    category: "expenses"
+
+  administrative_expenses:
+    codes: ["4300*", "4310*", "4311*", "4312*", "4319*", "4320*"]
+    name_patterns: ["Administratie", "Administrative", "Kantoor", "Overige kosten"]
+    category: "expenses"
+
+  insurance_expenses:
+    codes: ["4500*", "4501*"]
+    name_patterns: ["Verzekering", "Insurance"]
+    category: "expenses"
+
+  other_operating_expenses:
+    codes: ["4600*", "4601*", "4610*", "4611*", "4613*", "4620*", "4623*", "4630*", "4640*", "4642*", "4643*", "4650*", "4660*", "4663*"]
+    name_patterns: ["Overige bedrijfskosten", "Other operating", "Kosten"]
+    category: "expenses"
+
+  bank_charges:
+    codes: ["4730*"]
+    name_patterns: ["Bankkosten", "Bank charges"]
+    category: "expenses"
+
+  # P&L - OTHER INCOME
+  other_income:
+    codes: ["8400*"]
+    name_patterns: ["Overige opbrengsten", "Other income"]
+    category: "income"
+
+  # P&L - RESULT
+  result_accounts:
+    codes: ["9500*", "9510*", "9520*"]
+    name_patterns: ["Resultaat", "Result", "Winst"]
+    category: "result"
+
+  # CURRENT ASSETS - Receivables (20xxxxx range)
+  debtors:
+    codes: ["2000*"]
+    name_patterns: ["Debiteuren", "Debtors", "VOR"]
+    category: "current_assets"
+    subcategory: "receivables"
+
+  intercompany_receivables:
+    codes: ["2000100", "2000300"]
+    name_patterns: ["intercompany", "Debiteuren intercompany"]
+    category: "current_assets"
+    subcategory: "receivables"
+
+  other_receivables:
+    codes: ["2040*"]
+    name_patterns: ["Overige vorderingen", "Other receivables"]
+    category: "current_assets"
+    subcategory: "receivables"
+
+  accruals_receivables:
+    codes: ["2100*", "2110*", "2200*"]
+    name_patterns: ["Overlopende", "Accruals", "Te ontvangen"]
+    category: "current_assets"
+    subcategory: "accruals"
+
+  # LIABILITIES - Creditors (23xxxxx range)
+  creditors:
+    codes: ["2300*"]
+    name_patterns: ["Crediteuren", "Creditors", "Payables"]
+    category: "liabilities"
+    subcategory: "current"
+
+  creditors_intercompany:
+    codes: ["2300001", "2300100"]
+    name_patterns: ["Crediteuren intercompany"]
+    category: "liabilities"
+    subcategory: "current"
+
+  # LIABILITIES - Other (24xxxxx range)
+  other_payables:
+    codes: ["2400*"]
+    name_patterns: ["Overige schulden", "Other payables"]
+    category: "liabilities"
+    subcategory: "current"
+
+  tax_liabilities:
+    codes: ["2500*", "2502*", "2510*", "2512*", "2520*"]
+    name_patterns: ["Belasting", "Tax", "BTW", "VAT", "Omzetbelasting"]
+    category: "liabilities"
+    subcategory: "current"
+
+  accruals_payables:
+    codes: ["2600*", "2610*", "2620*", "2630*", "2640*", "2650*", "2700*", "2730*", "2740*", "2741*", "2742*", "2760*", "2800*", "2900*"]
+    name_patterns: ["Overlopende passiva", "Accrued", "Te betalen", "Nog te betalen"]
+    category: "liabilities"
+    subcategory: "accruals"
+
+  provisions:
+    codes: ["3000*", "3100*"]
+    name_patterns: ["Voorziening", "Provision", "Reserve"]
+    category: "liabilities"
+    subcategory: "provisions"
+
+# Schema drift handling rules
+schema_handling:
+  # How to detect data start row
+  data_start_detection:
+    - look_for_numeric_account_code: true
+    - skip_header_rows: 4
+    - fallback_row: 5
+
+  # Column detection by header patterns
+  column_patterns:
+    account_code: ["Grootboek", "Account", "Code", "Nr"]
+    account_name: ["Omschrijving", "Description", "Naam"]
+    opening_balance: ["Beginsaldo", "Opening", "Start"]
+    mutations: ["Mutatie", "Movement", "Change"]
+    closing_balance: ["Eindsaldo", "Closing", "End", "Saldo"]
+    period_indicator: ["Periode", "Period", "Q[1-4]"]
+
+  # Fallback to position-based if pattern matching fails
+  position_fallback:
+    account_code_col: 0
+    account_name_col: 1
+    balance_cols_start: 2
+

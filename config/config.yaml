@@ -1,0 +1,49 @@
+# QSP Quarterly Reporting Configuration
+
+project:
+  name: "QSP ESS B.V."
+  entity_type: "Dutch Real Estate Investment Vehicle"
+  reporting_standard: "ASX Quarterly"
+
+paths:
+  input_folder: "./inputs"
+  output_folder: "./outputs"
+  templates_folder: "./templates"
+  logs_folder: "./logs"
+
+current_quarter:
+  year: 2025
+  quarter: 3
+  period_end: "2025-09-30"
+  report_date: "2025-10-14"
+
+file_patterns:
+  bdo_financials: "Cijfers*QSP*.xlsx"
+  management_accounts: "Management*Accounts*.xlsx"
+  rent_roll: "QSP*huurlijst*.xlsx"
+  sales_tracker: "Unit*Sales*tracker*.xlsx"
+  compliance_calc: "Compliance*Certificate*.xlsx"
+  word_template: "Quarterly*QSP*.docx"
+
+excel_settings:
+  preserve_formatting: true
+  recalculate_formulas: true
+  date_format: "DD-MM-YYYY"
+  number_format: "#,##0.00"
+  currency: "EUR"
+
+pdf_settings:
+  dpi: 150
+  page_size: "A4"
+  merge_order:
+    - "main_report"      # Word export (pages 1-7)
+    - "rent_roll"        # Excel export (pages 8-19)
+    - "management_accounts"  # Excel export (page 20-21)
+    - "sales_tracker"    # Excel export (pages 22-23)
+    - "compliance_cert"  # Excel export (pages 24-28)
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/quarterly_report_{timestamp}.log"
+

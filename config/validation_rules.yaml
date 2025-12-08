@@ -1,0 +1,63 @@
+# Data Validation Rules
+
+balance_sheet:
+  # Total Assets = Total Liabilities + Equity
+  fundamental_equation:
+    rule: "assets == liabilities + equity"
+    tolerance: 0.01  # EUR 0.01 tolerance for rounding
+    
+  # Equity movement validation
+  equity_movement:
+    rule: "equity_end - equity_start == direct_result"
+    tolerance: 1.00
+    critical: true
+    error_message: "Equity movement does not match Direct Result"
+
+  # Real estate reconciliation
+  real_estate_net:
+    rule: "property_acquisition + cumulative_depreciation + disposals_cost + disposals_depreciation"
+    components:
+      - property_acquisition
+      - cumulative_depreciation
+      - disposals_cost  
+      - disposals_depreciation
+
+cross_file_reconciliation:
+  # Rent roll total matches report
+  rent_roll_total:
+    source: "rent_roll"
+    target: "executive_summary.rent_roll_annual"
+    tolerance: 100  # EUR tolerance
+    
+  # Unit sales count matches tracker
+  unit_sales_count:
+    source: "sales_tracker.quarter_count"
+    target: "executive_summary.units_sold"
+    exact_match: true
+
+  # Cash balance matches bank statements
+  cash_reconciliation:
+    source: "bdo_financials.cash_total"
+    target: "management_accounts.cash"
+    tolerance: 0.01
+
+data_quality:
+  # No negative property values
+  property_positive:
+    field: "property_acquisition"
+    rule: ">= 0"
+    
+  # Depreciation should be negative
+  depreciation_negative:
+    field: "cumulative_depreciation"
+    rule: "<= 0"
+    
+  # Rent roll completeness
+  rent_roll_completeness:
+    required_fields:
+      - unit_id
+      - address
+      - monthly_rent
+      - annual_rent
+    no_nulls: true
+
