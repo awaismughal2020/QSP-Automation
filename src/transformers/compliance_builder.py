@@ -45,6 +45,15 @@ class ComplianceConfig:
             prev_q = 4
             prev_y -= 1
         return f"Q{prev_q} {prev_y}"
+    
+    @property
+    def period_end(self):
+        """Calculate period end date for the quarter."""
+        from datetime import datetime
+        # Q1: March 31, Q2: June 30, Q3: September 30, Q4: December 31
+        month = self.quarter * 3
+        day = 31 if month in [3, 6, 9, 12] else 30
+        return datetime(self.year, month, day)
 
 
 class ComplianceBuilder:
@@ -96,7 +105,10 @@ class ComplianceBuilder:
         # Step 3: Add new column to Impact Unit Sales
         self._update_impact_unit_sales_sheet()
         
-        # Step 4: Update SFA CC formulas (if needed)
+        # Step 4: Update formulas in Suppl. Calc to reference Q3 Management Accounts
+        self._update_suppl_calc_formulas()
+        
+        # Step 5: Update SFA CC formulas (if needed)
         self._update_sfa_cc_sheet()
         
         # Save output
@@ -119,10 +131,17 @@ class ComplianceBuilder:
             old_sheet_name = ma_sheets[0]  # Use the first one found
             logger.info(f"Found Management Accounts sheet: {old_sheet_name}")
             
-            # Rename to new quarter format
+            # Get the old sheet structure BEFORE renaming (to preserve it)
             old_sheet = self.workbook[old_sheet_name]
-            old_sheet.title = new_ma_sheet_name
-            logger.info(f"Renamed sheet to: {new_ma_sheet_name}")
+            
+            # Create a new sheet with the new name, copying structure from old sheet
+            new_sheet = self.workbook.copy_worksheet(old_sheet)
+            new_sheet.title = new_ma_sheet_name
+            
+            # Remove the old sheet
+            self.workbook.remove(old_sheet)
+            
+            logger.info(f"Created new sheet: {new_ma_sheet_name} with structure from {old_sheet_name}")
             
             # If we have a management accounts file, copy data from it
             if management_accounts_path:
@@ -137,6 +156,9 @@ class ComplianceBuilder:
         Creates a simplified structure for the Compliance Certificate:
         - Column A: Row labels (Balance sheet items, P&L items)
         - Column C: Q3 2025 values (the new quarter data)
+        
+        This function maps line items to their expected row numbers in the Compliance Certificate
+        to ensure formulas can find data in the correct locations.
         """
         try:
             source_wb = openpyxl.load_workbook(source_path, data_only=True)
@@ -162,14 +184,18 @@ class ComplianceBuilder:
             source_sheet = source_wb[source_sheet_name]
             target_sheet = self.workbook[target_sheet_name]
             
-            # Find the Q3 2025 column in the source (should be the last date column)
+            # Find the Q3 2025 column in the source
             q3_col = None
             from datetime import datetime
+            period_end = self.config.period_end if hasattr(self.config, 'period_end') else datetime(self.config.year, 9, 30)
+            
             for col in range(1, source_sheet.max_column + 1):
                 val = source_sheet.cell(row=2, column=col).value
-                if isinstance(val, datetime) and val.year == 2025 and val.month == 9:
-                    q3_col = col
-                    break
+                if isinstance(val, datetime):
+                    # Match by year and month
+                    if val.year == period_end.year and val.month == period_end.month:
+                        q3_col = col
+                        break
             
             if not q3_col:
                 # Find the last date column as fallback
@@ -180,59 +206,98 @@ class ComplianceBuilder:
                         break
             
             if not q3_col:
-                logger.warning("Could not find Q3 2025 column in source")
+                logger.warning(f"Could not find {period_end.strftime('%Y-%m')} column in source")
                 return
             
-            logger.info(f"Found Q3 data in column {q3_col}")
+            logger.info(f"Found Q{self.config.quarter} data in column {q3_col}")
             
-            # Clear the target sheet first
-            for row in range(1, target_sheet.max_row + 1):
-                for col in range(1, target_sheet.max_column + 1):
-                    target_sheet.cell(row=row, column=col).value = None
+            # Build a mapping of label -> source row for quick lookup
+            label_to_source_row = {}
+            for row in range(2, min(source_sheet.max_row + 1, 200)):
+                label = source_sheet.cell(row=row, column=1).value
+                if label and isinstance(label, str):
+                    # Normalize label for matching (strip whitespace, case-insensitive)
+                    normalized = label.strip()
+                    label_to_source_row[normalized.lower()] = row
             
-            # Create the simplified structure
-            # The target structure should match the SFA CC formula references
-            # SFA CC formulas reference rows like C22 for Gross Theoretical rental income
-            # Target row = Source row - 1 (to account for header offset)
+            # Clear only column C (data column) to remove old values
+            # Preserve column A (labels) and all other columns (formulas, etc.)
+            for row in range(1, min(target_sheet.max_row + 1, 200)):
+                # Clear column C only
+                target_sheet.cell(row=row, column=3).value = None
             
-            # Row 1: Header with date
-            target_sheet.cell(row=1, column=1).value = "Balance sheet"
-            target_sheet.cell(row=1, column=3).value = datetime(2025, 9, 30)
+            # Update Row 1: Header with date (preserve structure but update date)
+            if target_sheet.cell(row=1, column=1).value is None:
+                target_sheet.cell(row=1, column=1).value = "Balance sheet"
+            target_sheet.cell(row=1, column=3).value = period_end
             target_sheet.cell(row=1, column=3).number_format = 'YYYY-MM-DD'
             
-            # Define P&L rows where signs need to be negated
-            # These are income items that come from BDO as negative (credit) but should be positive
-            # Row numbers refer to TARGET rows
-            income_rows = {22, 24, 26, 27, 29}  # Gross rental income, service charges, etc.
+            # Define income items that need sign negation (BDO shows credits as negative)
+            income_labels = {
+                'gross theoretical rental income',
+                'gross rental income',
+                'service costs charged (100% occupancy)',
+                'service charges',
+                'service charges ',
+                'cash proceeds sale'
+            }
             
-            # Copy row labels (column A) and Q3 values (to column C)
-            # Source has title at row 1, header at row 2, data starts at row 3
-            # Target has header at row 1, data starts at row 2
-            # So target row = source row - 1
-            for source_row in range(2, min(source_sheet.max_row + 1, 130)):
-                target_row = source_row - 1  # Shift up by 1
-                
-                # Copy label from column A
-                label = source_sheet.cell(row=source_row, column=1).value
-                if label:
-                    # Skip the "Balance sheet" header row (we already have it at row 1)
-                    if source_row == 2 and str(label).lower() == "balance sheet":
-                        continue
+            # Copy data by matching labels to existing structure in target sheet
+            # The target sheet structure (from previous quarter) must be preserved
+            # Formulas reference specific rows, so we must match labels to rows
+            items_copied = 0
+            items_not_found = []
+            
+            # Match labels from target sheet to source data
+            for row in range(1, min(target_sheet.max_row + 1, 200)):
+                existing_label = target_sheet.cell(row=row, column=1).value
+                if existing_label and isinstance(existing_label, str):
+                    # Normalize label for matching
+                    normalized_label = existing_label.strip().lower()
                     
-                    target_sheet.cell(row=target_row, column=1).value = label
+                    # Try to find matching source row
+                    source_row = label_to_source_row.get(normalized_label)
                     
-                    # Copy Q3 value to column C
-                    value = source_sheet.cell(row=source_row, column=q3_col).value
-                    if value is not None:
-                        # For income items, negate the sign (BDO shows credits as negative)
-                        if isinstance(value, (int, float)) and target_row in income_rows:
-                            value = -value
+                    if source_row:
+                        # Get the cell from source
+                        source_cell = source_sheet.cell(row=source_row, column=q3_col)
                         
-                        target_sheet.cell(row=target_row, column=3).value = value
-                        if isinstance(value, (int, float)):
-                            target_sheet.cell(row=target_row, column=3).number_format = '#,##0.00'
+                        # Get value - handle both formulas and direct values
+                        if source_cell.data_type == 'f':
+                            # It's a formula - get the calculated value
+                            # Use data_only mode which we already loaded with
+                            value = source_cell.value
+                            # If still a formula string, try to evaluate or use None
+                            if isinstance(value, str) and value.startswith('='):
+                                logger.debug(f"Source cell {source_row},{q3_col} has formula: {value[:50]}")
+                                value = None  # Can't evaluate, will skip
+                        else:
+                            # Direct value
+                            value = source_cell.value
+                        
+                        if value is not None and value != '':
+                            # Negate sign for income items (BDO shows credits as negative)
+                            if normalized_label in income_labels and isinstance(value, (int, float)):
+                                value = -value
+                            
+                            # Update column C with the value
+                            target_sheet.cell(row=row, column=3).value = value
+                            if isinstance(value, (int, float)):
+                                target_sheet.cell(row=row, column=3).number_format = '#,##0.00'
+                            items_copied += 1
+                        else:
+                            # Value is None or empty - might be a calculated field or missing data
+                            logger.debug(f"No value found for '{existing_label}' at row {row}")
+                    else:
+                        # Label not found in source - might be a calculated row or header
+                        # Don't add to not_found if it's a header or separator
+                        if normalized_label not in ['balance sheet', 'profit and loss', '']:
+                            items_not_found.append(existing_label)
             
-            logger.info(f"Created simplified Q3 Management Accounts from {source_sheet_name}")
+            if items_not_found:
+                logger.warning(f"Could not find source data for {len(items_not_found)} labels: {items_not_found[:5]}")
+            
+            logger.info(f"Updated {items_copied} line items in Q{self.config.quarter} Management Accounts (column C)")
             
         except Exception as e:
             logger.warning(f"Error copying MA data: {e}")
@@ -344,6 +409,67 @@ class ComplianceBuilder:
         
         logger.info(f"Added {next_forecast_quarter} column to Impact Unit Sales at position {new_col}")
     
+    def _update_suppl_calc_formulas(self):
+        """
+        Update formulas in Suppl. Calc sheet to reference Q3 Management Accounts correctly.
+        
+        The formulas in Suppl. Calc reference the Management Accounts sheet, and we need to ensure
+        they reference the correct sheet name and column (column C for Q3 data).
+        """
+        if 'Suppl. Calc' not in self.workbook.sheetnames:
+            return
+        
+        sheet = self.workbook['Suppl. Calc']
+        ma_sheet_name = f"Q{self.config.quarter} Management Accounts"
+        
+        prev_q = self.config.quarter - 1
+        prev_y = self.config.year
+        if prev_q == 0:
+            prev_q = 4
+            prev_y -= 1
+        
+        old_ma_patterns = [
+            f"'Q{prev_q} {prev_y} Management Accounts'",
+            f"'Q{prev_q} Management Accounts'",
+            f"Q{prev_q} Management Accounts",
+        ]
+        new_ma_name = f"'{ma_sheet_name}'"
+        
+        updated_count = 0
+        
+        for row in range(1, sheet.max_row + 1):
+            for col in range(1, sheet.max_column + 1):
+                cell = sheet.cell(row=row, column=col)
+                cell_value = cell.value
+                
+                if cell_value is None:
+                    continue
+                
+                if isinstance(cell_value, str) and cell_value.startswith('='):
+                    original_value = cell_value
+                    new_value = original_value
+                    
+                    # Update Management Accounts sheet references
+                    for old_pattern in old_ma_patterns:
+                        if old_pattern in new_value:
+                            new_value = new_value.replace(old_pattern, new_ma_name)
+                            # Ensure proper exclamation mark
+                            if "'" in new_value and "!" not in new_value.split("'")[-1]:
+                                # Add ! if missing after sheet name
+                                parts = new_value.split("'")
+                                for i in range(len(parts) - 1):
+                                    if parts[i].endswith(" Management Accounts") and i + 1 < len(parts):
+                                        if not parts[i + 1].startswith("!"):
+                                            parts[i + 1] = "!" + parts[i + 1]
+                                new_value = "'".join(parts)
+                    
+                    if new_value != original_value:
+                        cell.value = new_value
+                        updated_count += 1
+        
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} formulas in Suppl. Calc to reference {ma_sheet_name}")
+    
     def _update_sfa_cc_sheet(self):
         """
         Update SFA CC sheet with current quarter references.
@@ -352,6 +478,7 @@ class ComplianceBuilder:
         1. Updating sheet name references in formulas (Q2 Management Accounts → Q3 Management Accounts)
         2. Updating Suppl. Calc column references for NTM (column S → T after insert)
         3. Updating text references to quarter
+        4. Fixing any #NAME? errors by ensuring correct references
         """
         if 'SFA CC' not in self.workbook.sheetnames:
             logger.warning("SFA CC sheet not found")
@@ -360,7 +487,6 @@ class ComplianceBuilder:
         sheet = self.workbook['SFA CC']
         
         # Get the NTM column shift info
-        # After inserting 26Q3, NTM shifted from S (19) to T (20)
         old_ntm_col_letter = None
         new_ntm_col_letter = None
         
@@ -371,7 +497,8 @@ class ComplianceBuilder:
                 if val and str(val).upper() == 'NTM':
                     new_ntm_col_letter = get_column_letter(col)
                     # The old NTM was one column to the left (before we inserted)
-                    old_ntm_col_letter = get_column_letter(col - 1)
+                    if col > 1:
+                        old_ntm_col_letter = get_column_letter(col - 1)
                     break
             
             if old_ntm_col_letter and new_ntm_col_letter:
@@ -388,6 +515,8 @@ class ComplianceBuilder:
             f"'Q{prev_q} {prev_y} Management Accounts'",
             f"'Q{prev_q} Management Accounts'",
             f"Q{prev_q} Management Accounts",
+            f"'Q{prev_q} {prev_y} Management Accounts'!",
+            f"'Q{prev_q} Management Accounts'!",
         ]
         new_ma_name = f"'Q{self.config.quarter} Management Accounts'"
         
@@ -397,51 +526,67 @@ class ComplianceBuilder:
         for row in range(1, sheet.max_row + 1):
             for col in range(1, sheet.max_column + 1):
                 cell = sheet.cell(row=row, column=col)
-                if cell.value and isinstance(cell.value, str):
-                    original_value = cell.value
-                    new_value = original_value
+                
+                # Handle both string formulas and formula objects
+                cell_value = cell.value
+                if cell_value is None:
+                    continue
+                
+                # Convert to string for processing
+                if hasattr(cell_value, 'text'):
+                    original_value = cell_value.text
+                else:
+                    original_value = str(cell_value)
+                
+                new_value = original_value
+                
+                # Check if it's a formula
+                if isinstance(cell_value, str) and new_value.startswith('='):
+                    # Update Management Accounts sheet references
+                    for old_pattern in old_ma_patterns:
+                        if old_pattern in new_value:
+                            new_value = new_value.replace(old_pattern, new_ma_name + "!")
+                            # Remove double exclamation if created
+                            new_value = new_value.replace("!!", "!")
+                            logger.debug(f"Updated MA reference: {old_pattern} → {new_ma_name}")
                     
-                    # Check if it's a formula
-                    if new_value.startswith('='):
-                        # Update Management Accounts sheet references
-                        for old_pattern in old_ma_patterns:
-                            if old_pattern in new_value:
-                                new_value = new_value.replace(old_pattern, new_ma_name)
+                    # Update Suppl. Calc NTM column references
+                    if old_ntm_col_letter and new_ntm_col_letter and "'Suppl. Calc'" in new_value:
+                        # Replace column letter references for NTM (e.g., S5 → T5)
+                        # Pattern with $ signs: 'Suppl. Calc'!$S$5 or 'Suppl. Calc'!$S5
+                        pattern = rf"'Suppl\. Calc'!\${old_ntm_col_letter}(\$?\d+)"
+                        replacement = f"'Suppl. Calc'!${new_ntm_col_letter}\\1"
+                        new_value = re.sub(pattern, replacement, new_value)
                         
-                        # Update Suppl. Calc NTM column references
-                        if old_ntm_col_letter and new_ntm_col_letter and "'Suppl. Calc'" in new_value:
-                            # Replace column letter references for NTM (e.g., S5 → T5)
-                            # With $ sign
-                            pattern = rf"'Suppl\. Calc'!\${old_ntm_col_letter}(\$?\d+)"
-                            replacement = f"'Suppl. Calc'!${new_ntm_col_letter}\\1"
-                            new_value = re.sub(pattern, replacement, new_value)
-                            
-                            # Without $ sign
-                            pattern = rf"'Suppl\. Calc'!{old_ntm_col_letter}(\d+)"
-                            replacement = f"'Suppl. Calc'!{new_ntm_col_letter}\\1"
-                            new_value = re.sub(pattern, replacement, new_value)
+                        # Pattern without $ signs: 'Suppl. Calc'!S5
+                        pattern = rf"'Suppl\. Calc'!{old_ntm_col_letter}(\d+)"
+                        replacement = f"'Suppl. Calc'!{new_ntm_col_letter}\\1"
+                        new_value = re.sub(pattern, replacement, new_value)
                         
-                        # Update Impact Unit Sales column references similarly
-                        if old_ntm_col_letter and new_ntm_col_letter and "'Impact Unit Sales'" in new_value:
-                            pattern = rf"'Impact Unit Sales'!\${old_ntm_col_letter}(\$?\d+)"
-                            replacement = f"'Impact Unit Sales'!${new_ntm_col_letter}\\1"
-                            new_value = re.sub(pattern, replacement, new_value)
-                            
-                            pattern = rf"'Impact Unit Sales'!{old_ntm_col_letter}(\d+)"
-                            replacement = f"'Impact Unit Sales'!{new_ntm_col_letter}\\1"
-                            new_value = re.sub(pattern, replacement, new_value)
-                        
-                        if new_value != original_value:
-                            formula_count += 1
+                        logger.debug(f"Updated Suppl. Calc NTM reference: {old_ntm_col_letter} → {new_ntm_col_letter}")
                     
-                    # Update text references to quarter (non-formula)
-                    else:
-                        if self.config.prev_quarter_str in new_value:
-                            new_value = new_value.replace(self.config.prev_quarter_str, self.config.quarter_str)
+                    # Update Impact Unit Sales column references similarly
+                    if old_ntm_col_letter and new_ntm_col_letter and "'Impact Unit Sales'" in new_value:
+                        pattern = rf"'Impact Unit Sales'!\${old_ntm_col_letter}(\$?\d+)"
+                        replacement = f"'Impact Unit Sales'!${new_ntm_col_letter}\\1"
+                        new_value = re.sub(pattern, replacement, new_value)
+                        
+                        pattern = rf"'Impact Unit Sales'!{old_ntm_col_letter}(\d+)"
+                        replacement = f"'Impact Unit Sales'!{new_ntm_col_letter}\\1"
+                        new_value = re.sub(pattern, replacement, new_value)
                     
                     if new_value != original_value:
+                        formula_count += 1
                         cell.value = new_value
                         updated_count += 1
+                
+                # Update text references to quarter (non-formula)
+                elif isinstance(cell_value, str) and not new_value.startswith('='):
+                    if self.config.prev_quarter_str in new_value:
+                        new_value = new_value.replace(self.config.prev_quarter_str, self.config.quarter_str)
+                        if new_value != original_value:
+                            cell.value = new_value
+                            updated_count += 1
         
         logger.info(f"Updated {updated_count} cells in SFA CC ({formula_count} formulas)")
     

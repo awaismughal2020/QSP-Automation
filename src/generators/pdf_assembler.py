@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import os
+import shutil
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter
 from loguru import logger
 
@@ -138,7 +139,9 @@ class PDFAssembler:
         if merged_path.exists():
             if self.output_path.exists():
                 self.output_path.unlink()
-            merged_path.rename(self.output_path)
+            # Use shutil.copy2 instead of rename for cross-filesystem compatibility (Docker)
+            shutil.copy2(merged_path, self.output_path)
+            merged_path.unlink()  # Delete source after copy
         
         logger.info(f"Final PDF saved to: {self.output_path}")
         return self.output_path

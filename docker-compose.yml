@@ -1,0 +1,129 @@
+services:
+  # ============================================
+  # QSP Automation FastAPI Application
+  # ============================================
+  qsp-automation-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qsp-automation:latest
+    container_name: qsp-automation-api
+    restart: unless-stopped
+    
+    # Port mapping: host:container
+    ports:
+      - "8000:8000"
+    
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    
+    # Uncomment if you have a .env file
+    # env_file:
+    #   - .env
+    
+    # Volume mounts
+    volumes:
+      # Input files (upload your input files here)
+      - ./inputs:/app/inputs
+      # Generated output files
+      - ./outputs:/app/outputs
+      # Configuration files (read-only)
+      - ./config:/app/config:ro
+      # Logs directory
+      - ./logs:/app/logs
+      # Uploads directory
+      - ./uploads:/app/uploads
+    
+    # Networking
+    networks:
+      - qsp-network
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    
+    # Labels
+    labels:
+      - "com.qsp.service=api"
+      - "com.qsp.description=QSP Quarterly Report Automation API"
+
+  # ============================================
+  # n8n Workflow Automation
+  # ============================================
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: qsp-n8n
+    restart: unless-stopped
+    
+    # Port mapping
+    ports:
+      - "5678:5678"
+    
+    # Environment variables
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-qsp2025}
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+      - GENERIC_TIMEZONE=Europe/Amsterdam
+      - TZ=Europe/Amsterdam
+      # Allow connections to qsp-automation-api
+      - N8N_RUNNERS_DISABLED=false
+    
+    # Volume mounts
+    volumes:
+      # n8n data persistence
+      - n8n_data:/home/node/.n8n
+      # Shared inputs/outputs with API
+      - ./inputs:/data/inputs
+      - ./outputs:/data/outputs
+      # n8n workflows directory
+      - ./n8n/workflows:/data/workflows
+    
+    # Networking
+    networks:
+      - qsp-network
+    
+    # Depends on API being healthy
+    depends_on:
+      qsp-automation-api:
+        condition: service_healthy
+    
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    # Labels
+    labels:
+      - "com.qsp.service=n8n"
+      - "com.qsp.description=n8n Workflow Automation for QSP"
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  qsp-network:
+    driver: bridge
+    name: qsp-network
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  n8n_data:
+    name: qsp-n8n-data
+

@@ -1,0 +1,572 @@
+{
+  "name": "QSP Report Generator Form",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "qsp-report-form",
+        "formTitle": "QSP Quarterly Report Generator",
+        "formDescription": "Upload your quarterly files to generate the QSP report. All files are required.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Year",
+              "fieldType": "number",
+              "placeholder": "2025",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Quarter",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Q1"
+                  },
+                  {
+                    "option": "Q2"
+                  },
+                  {
+                    "option": "Q3"
+                  },
+                  {
+                    "option": "Q4"
+                  }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "BDO_File",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Prev_MA_File",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Rent_Roll",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Sales_Tracker",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Prev_Compliance",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Word_Template",
+              "fieldType": "file",
+              "acceptFileTypes": ".docx",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ab873cee-06af-4e73-91ca-1ae267dd4d4d",
+      "name": "Report Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.1,
+      "position": [
+        1248,
+        816
+      ],
+      "webhookId": "qsp-report-form"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "BDO_File"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2819a6fb-8a25-496b-b8be-4e9e71da42d5",
+      "name": "Upload BDO",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1792,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Prev_MA_File"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0c6f48e8-9b48-411c-b0cc-a877df7a51c3",
+      "name": "Upload MA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1792,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Rent_Roll"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5469ea29-9dfa-4230-abb8-251ec0100d28",
+      "name": "Upload Rent Roll",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1792,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Sales_Tracker"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "46c6d6fb-d900-4207-843a-a9f7473f0505",
+      "name": "Upload Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1792,
+        944
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Prev_Compliance"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d77c2533-6866-4e08-a026-fb732ac5e077",
+      "name": "Upload Compliance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1792,
+        1104
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Word_Template"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ed48b500-e295-4d43-a420-a299f205813d",
+      "name": "Upload Word",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1792,
+        1264
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "aef33e5d-ed4e-4139-9545-458b0f42ea6f",
+      "name": "Wait All Uploads",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2416,
+        832
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 600000
+        }
+      },
+      "id": "9ca718f9-462c-4546-8b60-78cf17657078",
+      "name": "Generate Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        2912,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "success-check",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "480e9eb6-70e4-4b89-9064-cb9fc1067641",
+      "name": "Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3152,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Report Generated</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#4ade80;margin-bottom:20px}\n        .btn{display:inline-block;margin:8px 8px 8px 0;padding:12px 20px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px;font-weight:500}\n        .btn:hover{background:#2563eb}\n        .warn{background:#422006;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b}\n        .stats{background:#0f172a;padding:15px;border-radius:8px;margin:15px 0}\n        a{color:#60a5fa}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <h1>✅ Report Generated Successfully!</h1>\n    <div class=\"stats\">\n        <p><strong>Job ID:</strong> {{ $json.job_id }}</p>\n        <p><strong>Execution Time:</strong> {{ $json.execution_time_seconds ? $json.execution_time_seconds.toFixed(1) + ' seconds' : 'N/A' }}</p>\n    </div>\n    <h3>📥 Download Generated Files:</h3>\n    <p>\n    {{ ($json.output_files || []).map(f => '<a class=\"btn\" href=\"http://localhost:8000/api/v1/outputs/' + f.split('/').pop() + '\" target=\"_blank\">📄 ' + f.split('/').pop() + '</a>').join(' ') }}\n    </p>\n    {{ $json.warnings && $json.warnings.length > 0 ? '<div class=\"warn\"><strong>⚠️ Warnings:</strong><ul>' + $json.warnings.map(w => '<li>' + w + '</li>').join('') + '</ul></div>' : '' }}\n    <p style=\"margin-top:25px\"><a href=\"/form/qsp-report-form\">← Generate Another Report</a></p>\n</div>\n</body>\n</html>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b2940763-9269-4cba-bc3a-bf4aa551ce42",
+      "name": "Success Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3472,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Generation Failed</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#f87171}\n        .err{background:#450a0a;padding:20px;border-radius:8px;border-left:4px solid #ef4444}\n        .btn{display:inline-block;margin-top:20px;padding:12px 24px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <h1>❌ Report Generation Failed</h1>\n    <div class=\"err\">\n        <p><strong>Error Details:</strong></p>\n        {{ ($json.errors || []).map(e => '<p>• ' + e + '</p>').join('') }}\n        {{ $json.detail ? '<p>• ' + $json.detail + '</p>' : '' }}\n        {{ $json.message ? '<p>• ' + $json.message + '</p>' : '' }}\n    </div>\n    <a class=\"btn\" href=\"/form/qsp-report-form\">🔄 Try Again</a>\n</div>\n</body>\n</html>",
+        "options": {
+          "responseCode": 500,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "387df3a7-fd66-4922-b389-555db0e0ceb2",
+      "name": "Error Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3472,
+        928
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const year = $('Report Form').first().json.Year;\nconst quarterRaw = $('Report Form').first().json.Quarter;\nconst quarter = parseInt(quarterRaw.replace('Q', ''));\nconst bdo_file = $('Upload BDO').first().json.path;\nconst prev_ma_file = $('Upload MA').first().json.path;\nconst rent_roll_file = $('Upload Rent Roll').first().json.path;\nconst sales_tracker_file = $('Upload Sales').first().json.path;\nconst prev_compliance_file = $('Upload Compliance').first().json.path;\nconst word_template_file = $('Upload Word').first().json.path;\n\nreturn [{\n  json: {\n    year: year,\n    quarter: quarter,\n    bdo_file: bdo_file,\n    prev_ma_file: prev_ma_file,\n    rent_roll_file: rent_roll_file,\n    sales_tracker_file: sales_tracker_file,\n    prev_compliance_file: prev_compliance_file,\n    word_template_file: word_template_file\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2656,
+        832
+      ],
+      "id": "08050cda-96bb-4d68-a091-18aafda0a0fb",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "numberInputs": 6
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2128,
+        752
+      ],
+      "id": "65351784-5aa2-4d14-b105-7c7d75605ec8",
+      "name": "Merge"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Report Form": {
+      "main": [
+        [
+          {
+            "node": "Upload BDO",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload MA",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Rent Roll",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Sales",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Compliance",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Word",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload BDO": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload MA": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Upload Rent Roll": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Upload Sales": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Upload Compliance": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "Upload Word": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      ]
+    },
+    "Wait All Uploads": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Report": {
+      "main": [
+        [
+          {
+            "node": "Success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Success?": {
+      "main": [
+        [
+          {
+            "node": "Success Page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Wait All Uploads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Generate Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "fa1c7e81-74a9-427b-b897-cab89b8f9f8e",
+  "meta": {
+    "instanceId": "3ecdfafcebd2d909f6bdbcc4efcff0181215ab4df5798de0faf205c5f785c545"
+  },
+  "id": "DfsRbOuInnmEijVW",
+  "tags": []
+}

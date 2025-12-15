@@ -58,9 +58,30 @@ python -m src.main generate --dry-run \
     --output-dir "outputs"
 ```
 
-### Option 2: REST API
+### Option 2: Docker (Recommended for Production)
 
-Start the API server:
+```bash
+# Copy environment file
+cp env.example .env
+
+# Build and start all services (API + n8n)
+docker-compose up -d --build
+
+# View logs
+docker-compose logs -f
+
+# Stop services
+docker-compose down
+```
+
+Services available:
+- **QSP API**: http://localhost:8000
+- **n8n Workflow**: http://localhost:5678 (login: admin/qsp2025)
+- **API Docs**: http://localhost:8000/docs
+
+### Option 3: REST API (Development)
+
+Start the API server locally:
 
 ```bash
 # Start server
@@ -394,6 +415,74 @@ if result['status'] == 'success':
         with open(filename.split('/')[-1], 'wb') as f:
             f.write(file_response.content)
 ```
+
+## Docker Deployment
+
+### Quick Start with Docker
+
+```bash
+# 1. Clone and enter directory
+cd QSP-Automation
+
+# 2. Copy environment file
+cp env.example .env
+
+# 3. Place input files in inputs/ directory
+
+# 4. Build and start
+docker-compose up -d --build
+
+# 5. Check services are running
+docker-compose ps
+```
+
+### Services
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| QSP API | http://localhost:8000 | FastAPI application |
+| API Docs | http://localhost:8000/docs | Swagger UI |
+| n8n | http://localhost:5678 | Workflow automation |
+
+### n8n Workflow Automation
+
+n8n provides a visual workflow interface for running the automation:
+
+1. Open http://localhost:5678
+2. Login: `admin` / `qsp2025`
+3. Import workflow from `n8n/workflows/`
+4. Execute manually or via webhook
+
+**Available Workflows:**
+- `qsp_quarterly_report_workflow.json` - Basic manual trigger
+- `qsp_full_workflow_with_upload.json` - Advanced with webhook
+
+### Docker Commands
+
+```bash
+# View logs
+docker-compose logs -f qsp-automation-api
+docker-compose logs -f n8n
+
+# Restart services
+docker-compose restart
+
+# Stop all
+docker-compose down
+
+# Rebuild after code changes
+docker-compose up -d --build
+
+# Clean up volumes
+docker-compose down -v
+```
+
+### File Paths in Docker
+
+When running in Docker, use these paths:
+- Input files: `inputs/filename.xlsx`
+- Output files: `outputs/filename.xlsx`
+- Config files: `config/filename.yaml`
 
 ## License
 

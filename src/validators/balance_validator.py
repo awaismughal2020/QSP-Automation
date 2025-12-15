@@ -191,18 +191,29 @@ class BalanceValidator:
         
         equity_movement = equity_end - equity_start
         
-        # Calculate direct result from P&L
-        # Income (8xxxxx) - shown as negative (credits)
-        # Expenses (4xxxxx) - shown as positive (debits)
-        # Result = Income + Expenses (with proper signs)
+        # Calculate direct result from P&L using mutations (changes during period)
+        # First try to get from result accounts (95xxxxx) - these directly show the result
         direct_result = 0.0
+        result_account_found = False
+        
         for code, entry in bdo_result.accounts.items():
-            first_digit = code[0] if code else ''
-            # Use closing balance differences to calculate P&L impact
-            if first_digit == '8':  # Income accounts (negative = credit)
-                direct_result += entry.closing_balance
-            elif first_digit == '4':  # Expense accounts (positive = debit)
-                direct_result += entry.closing_balance
+            first_two = code[:2] if len(code) >= 2 else ''
+            if first_two == '95':  # Result accounts (VPB - Vennootschapsbelasting)
+                result_account_found = True
+                # Use mutation (change during period) for result accounts
+                mutation = entry.closing_balance - entry.opening_balance
+                direct_result += mutation
+        
+        # If no result account found, calculate from income/expense mutations
+        if not result_account_found:
+            for code, entry in bdo_result.accounts.items():
+                first_digit = code[0] if code else ''
+                # Calculate mutation (change during period) for P&L accounts
+                mutation = entry.closing_balance - entry.opening_balance
+                if first_digit == '8':  # Income accounts (credits - typically negative)
+                    direct_result += mutation
+                elif first_digit == '4':  # Expense accounts (debits - typically positive)
+                    direct_result += mutation
         
         difference = abs(equity_movement - direct_result)
         passed = difference <= self.equity_movement_tolerance

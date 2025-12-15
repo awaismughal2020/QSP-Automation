@@ -1,0 +1,62 @@
+# Docker ignore file - rename to .dockerignore
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursor/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation
+*.md
+docs/
+
+# Large files and data
+*.xlsx
+*.docx
+*.pdf
+data/
+inputs/*.xlsx
+outputs/
+
+# Logs
+logs/
+*.log
+
+# Docker
+Dockerfile
+docker-compose*.yml
+
+# n8n workflows (mounted as volume)
+n8n/
+
+# Misc
+.DS_Store
+Thumbs.db
+*.bak
+
