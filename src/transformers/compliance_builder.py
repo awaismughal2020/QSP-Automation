@@ -52,7 +52,11 @@ class ComplianceConfig:
         from datetime import datetime
         # Q1: March 31, Q2: June 30, Q3: September 30, Q4: December 31
         month = self.quarter * 3
-        day = 31 if month in [3, 6, 9, 12] else 30
+        # March=31, June=30, September=30, December=31
+        if month in [3, 12]:
+            day = 31
+        else:  # 6, 9
+            day = 30
         return datetime(self.year, month, day)
 
 

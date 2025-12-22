@@ -209,50 +209,97 @@ class PDFAssembler:
     
     def _export_excel_sheet_to_pdf(self, xlsx_path: Path, sheet_name: str, 
                                     output_dir: Path) -> Path:
-        """Export a specific Excel sheet to PDF."""
+        """
+        Export a specific Excel sheet to PDF.
+        
+        IMPORTANT (Issue 9 fix): #NAME? errors in PDF but not Excel
+        This happens because:
+        1. LibreOffice may not recalculate formulas properly
+        2. Formulas referencing external/other sheets may not resolve
+        
+        Solution: We use the full workbook conversion and extract the needed page,
+        OR we copy the calculated values instead of formulas.
+        """
         import openpyxl
         from copy import copy
         
-        # Load workbook
-        wb = openpyxl.load_workbook(xlsx_path)
+        # Load workbook with data_only=True to get calculated values instead of formulas
+        # This prevents #NAME? errors in PDF conversion
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
         
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Sheet '{sheet_name}' not found in {xlsx_path}")
+        
+        # Also load with formulas to preserve formatting
+        wb_format = openpyxl.load_workbook(xlsx_path, data_only=False)
         
         # Create a new workbook with just this sheet
         temp_xlsx = output_dir / f"temp_{sheet_name.replace(' ', '_')}.xlsx"
         
         # Copy the sheet to new workbook
         source_sheet = wb[sheet_name]
+        source_sheet_format = wb_format[sheet_name]
         new_wb = openpyxl.Workbook()
         new_sheet = new_wb.active
         new_sheet.title = sheet_name
         
-        # Copy cell values and formatting
+        # Copy cell VALUES (not formulas) and formatting
+        # This ensures no #NAME? errors in PDF as all formulas are resolved
         for row in source_sheet.iter_rows():
             for cell in row:
                 new_cell = new_sheet.cell(row=cell.row, column=cell.column)
+                # Use calculated value, not formula
                 new_cell.value = cell.value
-                if cell.has_style:
-                    new_cell.font = copy(cell.font)
-                    new_cell.alignment = copy(cell.alignment)
-                    new_cell.number_format = cell.number_format
-                    new_cell.border = copy(cell.border)
-                    new_cell.fill = copy(cell.fill)
+                
+                # Get formatting from format workbook
+                format_cell = source_sheet_format.cell(row=cell.row, column=cell.column)
+                if format_cell.has_style:
+                    new_cell.font = copy(format_cell.font)
+                    new_cell.alignment = copy(format_cell.alignment)
+                    new_cell.number_format = format_cell.number_format
+                    new_cell.border = copy(format_cell.border)
+                    new_cell.fill = copy(format_cell.fill)
         
         # Copy column widths
-        for col_letter, dim in source_sheet.column_dimensions.items():
+        for col_letter, dim in source_sheet_format.column_dimensions.items():
             new_sheet.column_dimensions[col_letter].width = dim.width
         
         # Copy row heights
-        for row_idx, dim in source_sheet.row_dimensions.items():
+        for row_idx, dim in source_sheet_format.row_dimensions.items():
             new_sheet.row_dimensions[row_idx].height = dim.height
+        
+        # Copy merged cells
+        for merged_range in source_sheet_format.merged_cells.ranges:
+            new_sheet.merge_cells(str(merged_range))
         
         # Set print settings
         new_sheet.page_setup.orientation = 'landscape'
         new_sheet.page_setup.fitToPage = True
         new_sheet.page_setup.fitToWidth = 1
         new_sheet.page_setup.fitToHeight = 0
+        
+        # Handle print area:
+        # For SFA CC sheet, extend print area to include signature page (rows 82+)
+        # This fixes Issue 10: signature page incomplete
+        if source_sheet_format.print_area:
+            print_area = source_sheet_format.print_area
+            
+            # Check if this is SFA CC and signature rows exist
+            if 'SFA CC' in sheet_name and new_sheet.max_row > 81:
+                # Extend print area to include all rows (for signature section)
+                # Original print area might be like $A$2:$J$81
+                import re
+                match = re.match(r"['\"]?[^'\"]*['\"]?!\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", print_area)
+                if match:
+                    start_col, start_row, end_col, end_row = match.groups()
+                    # Extend to include all content rows
+                    new_print_area = f"${start_col}${start_row}:${end_col}${new_sheet.max_row}"
+                    new_sheet.print_area = new_print_area
+                    logger.debug(f"Extended print area for {sheet_name}: {print_area} → {new_print_area}")
+                else:
+                    new_sheet.print_area = print_area
+            else:
+                new_sheet.print_area = print_area
         
         new_wb.save(temp_xlsx)
         
@@ -276,6 +323,7 @@ class PDFAssembler:
         if temp_xlsx.exists():
             temp_xlsx.unlink()
         
+        logger.debug(f"Exported sheet '{sheet_name}' to PDF with calculated values")
         return pdf_path
     
     def _extract_pages(self, pdf_path: Path, page_range: tuple) -> Path:

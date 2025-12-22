@@ -8,7 +8,7 @@ Updates the quarterly report Word template with:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import subprocess
 import re
@@ -134,36 +134,88 @@ class WordTemplateUpdater:
             raise RuntimeError(f"Pandoc conversion failed: {result.stderr}")
     
     def _replace_quarter(self, content: str, old_quarter: str, new_quarter: str) -> str:
-        """Replace all quarter references."""
-        # Handle various formats: Q2 2025, Q2-2025, Q2/2025, Q2 25, etc.
-        old_patterns = [
-            old_quarter,  # Q2 2025
-            old_quarter.replace(' ', '-'),  # Q2-2025
-            old_quarter.replace(' ', '/'),  # Q2/2025
-            old_quarter.replace(' 20', ' '),  # Q2 25
+        """
+        Replace ALL quarter references comprehensively.
+        
+        This addresses Issue 7.1 from feedback: mixed quarter references.
+        Handles all possible formats and variations.
+        """
+        import re
+        
+        # Extract quarter number and year
+        old_parts = old_quarter.split()  # e.g., ["Q2", "2025"]
+        new_parts = new_quarter.split()
+        
+        if len(old_parts) != 2 or len(new_parts) != 2:
+            logger.warning(f"Unexpected quarter format: {old_quarter} -> {new_quarter}")
+            return content
+        
+        old_q_num = old_parts[0][1]  # "2" from "Q2"
+        old_year = old_parts[1]  # "2025"
+        new_q_num = new_parts[0][1]  # "3" from "Q3"
+        new_year = new_parts[1]  # "2025"
+        
+        # Comprehensive replacement patterns
+        replacements = [
+            # Standard formats
+            (old_quarter, new_quarter),  # Q2 2025 -> Q3 2025
+            (old_quarter.lower(), new_quarter.lower()),  # q2 2025 -> q3 2025
+            (old_quarter.replace(' ', '-'), new_quarter.replace(' ', '-')),  # Q2-2025
+            (old_quarter.replace(' ', '/'), new_quarter.replace(' ', '/')),  # Q2/2025
+            (f"Q{old_q_num} {old_year[-2:]}", f"Q{new_q_num} {new_year[-2:]}"),  # Q2 25
+            (f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}"),  # Q2-25
+            (f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}"),  # 25Q2
+            
+            # Text variations
+            (f"Actions {old_quarter}", f"Actions {new_quarter}"),
+            (f"Portfolio highlights – {old_quarter}", f"Portfolio highlights – {new_quarter}"),
+            (f"Portfolio highlights - {old_quarter}", f"Portfolio highlights - {new_quarter}"),
+            (f"Report {old_quarter}", f"Report {new_quarter}"),
+            (f"Quarter {old_q_num} {old_year}", f"Quarter {new_q_num} {new_year}"),
+            
+            # Dutch variations
+            (f"Kwartaal {old_q_num} {old_year}", f"Kwartaal {new_q_num} {new_year}"),
         ]
         
-        new_value = new_quarter
+        for old_pattern, new_pattern in replacements:
+            content = content.replace(old_pattern, new_pattern)
+            # Also try case-insensitive for text variations
+            if not old_pattern[0].isdigit():
+                content = re.sub(re.escape(old_pattern), new_pattern, content, flags=re.IGNORECASE)
         
-        for pattern in old_patterns:
-            content = content.replace(pattern, new_value)
-            content = content.replace(pattern.lower(), new_value.lower())
-        
-        # Also handle month references
+        # Handle month references
         quarter_to_month = {
-            'Q1': ('March', '31'),
-            'Q2': ('June', '30'),
-            'Q3': ('September', '30'),
-            'Q4': ('December', '31'),
+            'Q1': ('March', '31', 'maart'),
+            'Q2': ('June', '30', 'juni'),
+            'Q3': ('September', '30', 'september'),
+            'Q4': ('December', '31', 'december'),
         }
         
-        old_q = old_quarter.split()[0]
-        new_q = new_quarter.split()[0]
+        old_q = old_parts[0]
+        new_q = new_parts[0]
         
         if old_q in quarter_to_month and new_q in quarter_to_month:
-            old_month, old_day = quarter_to_month[old_q]
-            new_month, new_day = quarter_to_month[new_q]
+            old_month, old_day, old_month_nl = quarter_to_month[old_q]
+            new_month, new_day, new_month_nl = quarter_to_month[new_q]
+            
+            # Replace English months
             content = content.replace(old_month, new_month)
+            content = content.replace(old_month.lower(), new_month.lower())
+            
+            # Replace Dutch months
+            content = content.replace(old_month_nl, new_month_nl)
+            content = content.replace(old_month_nl.capitalize(), new_month_nl.capitalize())
+            
+            # Replace date formats like "30 June 2025"
+            for year in [old_year, str(int(old_year) - 1), str(int(old_year) + 1)]:
+                old_date = f"{old_day} {old_month} {year}"
+                new_date = f"{new_day} {new_month} {new_year}"
+                content = content.replace(old_date, new_date)
+                
+                # Dutch format: 30 juni 2025
+                old_date_nl = f"{old_day} {old_month_nl} {year}"
+                new_date_nl = f"{new_day} {new_month_nl} {new_year}"
+                content = content.replace(old_date_nl, new_date_nl)
         
         return content
     
@@ -220,9 +272,15 @@ class WordTemplateUpdater:
         # Open and modify
         doc = Document(self.output_path)
         
+        # Build list of old dates to replace (for cover page dynamic date - Issue 7.2)
+        # The cover page date should be the current run date, not copied from template
+        old_date_patterns = self._get_old_date_patterns(previous_quarter)
+        
         # Process paragraphs
         for para in doc.paragraphs:
             self._process_paragraph(para, values, previous_quarter, current_quarter)
+            # Also update any old dates on cover page to current run date
+            self._update_cover_page_date(para, old_date_patterns, values.report_date)
         
         # Process tables
         for table in doc.tables:
@@ -230,6 +288,7 @@ class WordTemplateUpdater:
                 for cell in row.cells:
                     for para in cell.paragraphs:
                         self._process_paragraph(para, values, previous_quarter, current_quarter)
+                        self._update_cover_page_date(para, old_date_patterns, values.report_date)
         
         # Process headers/footers
         for section in doc.sections:
@@ -241,6 +300,57 @@ class WordTemplateUpdater:
         doc.save(self.output_path)
         logger.info(f"Generated updated report: {self.output_path}")
         return self.output_path
+    
+    def _get_old_date_patterns(self, previous_quarter: str) -> List[str]:
+        """Generate date patterns that might appear on cover page from previous quarter."""
+        patterns = []
+        
+        # Extract year from quarter
+        parts = previous_quarter.split()
+        if len(parts) == 2:
+            year = int(parts[1])
+            q_num = int(parts[0][1])
+            
+            # Calculate previous quarter end month
+            month = q_num * 3
+            
+            # Generate various date formats for several months around report date
+            # Reports are typically dated 2-3 weeks after quarter end
+            for m in range(month, min(month + 3, 13)):
+                for d in range(1, 32):
+                    try:
+                        from datetime import datetime
+                        date = datetime(year, m, d)
+                        # Common date formats
+                        patterns.extend([
+                            date.strftime('%d %B %Y'),  # 21 July 2025
+                            date.strftime('%d %b %Y'),  # 21 Jul 2025
+                            date.strftime('%-d %B %Y'),  # 21 July 2025 (no leading zero)
+                            # Dutch formats
+                            self._format_dutch_date(date),  # 21 juli 2025
+                        ])
+                    except ValueError:
+                        continue
+        
+        # Remove duplicates and empty
+        return list(set(p for p in patterns if p))
+    
+    def _format_dutch_date(self, date) -> str:
+        """Format date in Dutch style."""
+        dutch_months = {
+            1: 'januari', 2: 'februari', 3: 'maart', 4: 'april',
+            5: 'mei', 6: 'juni', 7: 'juli', 8: 'augustus',
+            9: 'september', 10: 'oktober', 11: 'november', 12: 'december'
+        }
+        return f"{date.day} {dutch_months[date.month]} {date.year}"
+    
+    def _update_cover_page_date(self, para, old_patterns: List[str], new_date: str):
+        """Update cover page date to current run date (Issue 7.2)."""
+        text = para.text
+        for old_pattern in old_patterns:
+            if old_pattern in text:
+                self._replace_in_runs(para, old_pattern, new_date)
+                return  # Only replace once per paragraph
     
     def _process_paragraph(self, para, values: ReportValues, 
                           old_quarter: str, new_quarter: str):

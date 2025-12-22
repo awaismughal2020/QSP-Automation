@@ -319,21 +319,48 @@ class QuarterlyReportOrchestrator:
             results['output_files'].append(str(word_output))
             
             # Step 8: Assemble PDF (optional - requires LibreOffice)
+            # Per Issue 8: Each section introduction should be immediately followed by its attachment
+            # The reference PDF structure has sections interleaved with attachments, not bulk at end
             logger.info("Step 8: Assembling final PDF")
             try:
                 pdf_output = self.config.output_dir / f"Quarterly QSP - {self.config.quarter_str} - ASX.pdf"
+                
+                # PDF Assembly Order (per reference document structure):
+                # 1. Main Report (Word) - includes section intros
+                # 2. Rent Roll (Excel) - Attachment 1
+                # 3. Management Accounts (Excel) - Attachment 2
+                # 4. Sales Tracker (Excel) - Attachment 3
+                # 5. Compliance Certificate (Excel sheets) - Attachment 4
+                #    - SFA CC (main compliance)
+                #    - Q{quarter} Management Accounts (MA data in CC)
+                #    - Suppl. Calc
+                #    - Impact Unit Sales
                 pdf_sources = [
+                    # Section 1: Main Report
                     PDFSource("Main Report", word_output, 'docx'),
+                    
+                    # Attachment 1: Rent Roll
                     PDFSource("Rent Roll", self.config.rent_roll_file, 'xlsx'),
+                    
+                    # Attachment 2: Management Accounts
                     PDFSource(
                         "Management Accounts",
                         ma_output,
                         'xlsx',
                         ma_config.summary_sheet_name
                     ),
+                    
+                    # Attachment 3: Sales Tracker
                     PDFSource("Sales Tracker", self.config.sales_tracker_file, 'xlsx'),
-                    # Compliance Certificate sheets
+                    
+                    # Attachment 4: Compliance Certificate (all sheets in order)
                     PDFSource("Compliance SFA CC", compliance_output, 'xlsx', "SFA CC"),
+                    PDFSource(
+                        f"Q{self.config.quarter} Management Accounts",
+                        compliance_output,
+                        'xlsx',
+                        f"Q{self.config.quarter} Management Accounts"
+                    ),
                     PDFSource("Compliance Suppl Calc", compliance_output, 'xlsx', "Suppl. Calc"),
                     PDFSource("Compliance Impact Sales", compliance_output, 'xlsx', "Impact Unit Sales"),
                 ]

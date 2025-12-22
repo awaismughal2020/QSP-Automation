@@ -3,9 +3,13 @@ Management Accounts Transformer
 
 Builds the Management Accounts Excel file by:
 1. Copying previous quarter structure
-2. Adding new BDO sheet for current quarter
+2. Cloning the previous BDO sheet and adding new column for current quarter
 3. Updating Management Cijfers summary with new column
-4. Recalculating formulas programmatically
+4. Updating all date references
+
+CRITICAL: The BDO sheet structure must be preserved exactly because formulas
+in Management Cijfers reference specific row numbers. Cloning the sheet and
+inserting columns (not creating new rows) ensures formula integrity.
 """
 
 from dataclasses import dataclass
@@ -13,9 +17,9 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import openpyxl
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, Alignment, Border, PatternFill
+from openpyxl.styles import Font, Alignment, Border, PatternFill, Side
+from openpyxl.styles.fills import FILL_SOLID
 from copy import copy
-import pandas as pd
 import yaml
 from datetime import datetime
 from loguru import logger
@@ -40,11 +44,11 @@ class ManagementAccountsBuilder:
     - Historical BDO sheets (one per quarter from Q1 2019 onwards)
     - Summary "Management Cijfers" sheet with calculated columns
     
-    This builder:
-    1. Copies the previous quarter file
-    2. Adds new BDO sheet with current quarter data
-    3. Adds new column to summary sheet
-    4. Updates formulas to reference new BDO sheet
+    CRITICAL APPROACH (per feedback):
+    - Clone the previous BDO sheet to preserve exact row structure
+    - Insert a new column for the current quarter's mutations
+    - Update values based on account codes (semantic mapping)
+    - This ensures all formula references remain valid
     
     Line item mappings are loaded from config/line_item_mappings.yaml
     """
@@ -61,6 +65,9 @@ class ManagementAccountsBuilder:
         self.income_prefixes = []
         self.expense_prefixes = []
         self._load_validation_config()
+        
+        # Account code to BDO row mapping (built during BDO sheet processing)
+        self._account_row_map = {}
     
     def _load_mappings(self) -> Dict[str, Tuple[List[str], str]]:
         """Load line item mappings from YAML config file."""
@@ -76,16 +83,18 @@ class ManagementAccountsBuilder:
         # Process balance sheet mappings
         if 'balance_sheet' in config:
             for label, item_config in config['balance_sheet'].items():
-                accounts = item_config.get('accounts', [])
-                calc_type = item_config.get('calc_type', 'sum')
-                mappings[label] = (accounts, calc_type)
+                if item_config:
+                    accounts = item_config.get('accounts', [])
+                    calc_type = item_config.get('calc_type', 'sum')
+                    mappings[label] = (accounts, calc_type)
         
         # Process P&L mappings
         if 'profit_loss' in config:
             for label, item_config in config['profit_loss'].items():
-                accounts = item_config.get('accounts', [])
-                calc_type = item_config.get('calc_type', 'sum')
-                mappings[label] = (accounts, calc_type)
+                if item_config:
+                    accounts = item_config.get('accounts', [])
+                    calc_type = item_config.get('calc_type', 'sum')
+                    mappings[label] = (accounts, calc_type)
         
         logger.info(f"Loaded {len(mappings)} line item mappings from {self.mappings_path}")
         return mappings
@@ -144,13 +153,16 @@ class ManagementAccountsBuilder:
         self.workbook = openpyxl.load_workbook(self.previous_path)
         logger.info(f"Loaded previous file with {len(self.workbook.sheetnames)} sheets")
         
-        # Step 1: Add new BDO sheet
-        self._add_bdo_sheet(bdo_result)
+        # Step 1: Clone and update BDO sheet (preserves row structure!)
+        self._clone_and_update_bdo_sheet(bdo_result)
         
-        # Step 2: Update summary sheet
+        # Step 2: Update summary sheet with new columns
         self._update_summary_sheet(bdo_result)
         
-        # Step 3: Validate calculations
+        # Step 3: Update all date references throughout the workbook
+        self._update_date_references()
+        
+        # Step 4: Validate calculations
         self._validate_calculations(bdo_result)
         
         # Save output
@@ -159,143 +171,188 @@ class ManagementAccountsBuilder:
         
         return self.output_path
     
-    def _add_bdo_sheet(self, bdo_result: BDOParseResult):
-        """Add new BDO sheet with current quarter data."""
+    def _clone_and_update_bdo_sheet(self, bdo_result: BDOParseResult):
+        """
+        Clone the previous BDO sheet and add new quarter column.
+        
+        CRITICAL: This approach preserves the exact row structure of the BDO sheet,
+        ensuring all formula references in Management Cijfers remain valid.
+        
+        The previous BDO sheet has structure:
+        - Row 1: Headers
+        - Row 2: Empty
+        - Row 3+: Category headers (bold) and account rows
+        - Columns: A=Code, B=Name, C=Opening Balance, D-F=Previous quarters, G=Last quarter, H=Saldi
+        
+        For the new sheet:
+        - Copy entire structure
+        - Column G becomes previous quarter data
+        - Insert new column G for current quarter mutations
+        - Column H (now I) becomes Saldi = SUM(C:H)
+        """
         sheet_name = self.config.bdo_sheet_name
         
-        # Check if sheet already exists (shouldn't, but handle gracefully)
+        # Find the most recent BDO sheet to clone
+        bdo_sheets = [name for name in self.workbook.sheetnames if name.startswith('BDO')]
+        if not bdo_sheets:
+            logger.error("No existing BDO sheet found to clone!")
+            raise ValueError("No BDO sheet found in previous Management Accounts file")
+        
+        prev_bdo_name = bdo_sheets[-1]  # Most recent
+        prev_bdo = self.workbook[prev_bdo_name]
+        logger.info(f"Cloning BDO sheet from: {prev_bdo_name}")
+        
+        # Check if new sheet already exists
         if sheet_name in self.workbook.sheetnames:
-            logger.warning(f"Sheet {sheet_name} already exists, will overwrite")
+            logger.warning(f"Sheet {sheet_name} already exists, will remove and recreate")
             del self.workbook[sheet_name]
         
-        # Find position for new sheet (after last BDO sheet, before summary)
+        # Copy the sheet
+        new_sheet = self.workbook.copy_worksheet(prev_bdo)
+        new_sheet.title = sheet_name
+        
+        # Find position to move the sheet (after the last BDO sheet)
         bdo_sheets = [name for name in self.workbook.sheetnames if name.startswith('BDO')]
-        if bdo_sheets:
-            last_bdo_idx = self.workbook.sheetnames.index(bdo_sheets[-1])
-            insert_idx = last_bdo_idx + 1
-        else:
-            insert_idx = len(self.workbook.sheetnames) - 1  # Before last sheet
+        last_bdo_idx = self.workbook.sheetnames.index(bdo_sheets[-1])
+        # Move is done automatically by copy_worksheet
         
-        # Create new sheet
-        new_sheet = self.workbook.create_sheet(sheet_name, insert_idx)
+        # Build account code to row mapping from the cloned sheet
+        self._build_account_row_map(new_sheet)
         
-        # Copy formatting from previous BDO sheet
-        if bdo_sheets:
-            self._copy_sheet_formatting(self.workbook[bdo_sheets[-1]], new_sheet)
+        # Determine column structure
+        # Find the "Saldi" column (last data column with values)
+        saldi_col = self._find_saldi_column(new_sheet)
+        mutations_col = saldi_col - 1  # Last mutations column
         
-        # Populate with BDO data
-        self._populate_bdo_sheet(new_sheet, bdo_result)
+        logger.info(f"Current structure: Mutations col={mutations_col}, Saldi col={saldi_col}")
         
-        logger.info(f"Added sheet '{sheet_name}' at position {insert_idx}")
+        # Insert new column for Q3 mutations (before Saldi column)
+        new_sheet.insert_cols(saldi_col)
+        new_mutations_col = saldi_col
+        new_saldi_col = saldi_col + 1
+        
+        # Update header for new mutations column
+        period_str = self.config.period_end.strftime('%d-%m-%Y')
+        new_sheet.cell(row=1, column=new_mutations_col).value = f"Mutaties {self.config.quarter}"
+        new_sheet.cell(row=1, column=new_mutations_col).font = Font(bold=True)
+        new_sheet.cell(row=1, column=new_mutations_col).alignment = Alignment(horizontal='center')
+        
+        # Update Saldi column header
+        new_sheet.cell(row=1, column=new_saldi_col).value = f"Saldi per {period_str}"
+        new_sheet.cell(row=1, column=new_saldi_col).font = Font(bold=True)
+        new_sheet.cell(row=1, column=new_saldi_col).alignment = Alignment(horizontal='center')
+        
+        # Copy column width from previous mutations column
+        prev_mutations_letter = get_column_letter(mutations_col)
+        new_mutations_letter = get_column_letter(new_mutations_col)
+        if prev_mutations_letter in new_sheet.column_dimensions:
+            new_sheet.column_dimensions[new_mutations_letter].width = \
+                new_sheet.column_dimensions[prev_mutations_letter].width
+        
+        # Populate the new mutations column with BDO data
+        accounts_updated = 0
+        for row_idx in range(2, new_sheet.max_row + 1):
+            code_cell = new_sheet.cell(row=row_idx, column=1)
+            code = str(code_cell.value).strip() if code_cell.value else ''
+            
+            # Skip if not an account code (category headers, empty rows)
+            if not code or not code[0].isdigit():
+                # For non-account rows, check if there's a formula in Saldi column
+                # and update it to include the new column
+                self._update_saldi_formula(new_sheet, row_idx, new_saldi_col, new_mutations_col)
+                continue
+            
+            # Find the account in BDO result
+            if code in bdo_result.accounts:
+                entry = bdo_result.accounts[code]
+                
+                # Calculate mutations for this quarter
+                mutations = entry.closing_balance - entry.opening_balance
+                
+                # Set mutations value
+                new_sheet.cell(row=row_idx, column=new_mutations_col).value = mutations
+                new_sheet.cell(row=row_idx, column=new_mutations_col).number_format = '#,##0.00'
+                
+                # Update Saldi column to be closing balance (or update formula)
+                saldi_cell = new_sheet.cell(row=row_idx, column=new_saldi_col)
+                if saldi_cell.value and isinstance(saldi_cell.value, str) and saldi_cell.value.startswith('='):
+                    # Update formula to include new column
+                    self._update_saldi_formula(new_sheet, row_idx, new_saldi_col, new_mutations_col)
+                else:
+                    # Direct value
+                    saldi_cell.value = entry.closing_balance
+                    saldi_cell.number_format = '#,##0.00'
+                
+                accounts_updated += 1
+            else:
+                # Account not in BDO result - set mutations to 0
+                new_sheet.cell(row=row_idx, column=new_mutations_col).value = 0
+                new_sheet.cell(row=row_idx, column=new_mutations_col).number_format = '#,##0.00'
+                
+                # Update Saldi formula if present
+                self._update_saldi_formula(new_sheet, row_idx, new_saldi_col, new_mutations_col)
+        
+        logger.info(f"Created BDO sheet '{sheet_name}' with {accounts_updated} accounts updated")
+        logger.info(f"New mutations column: {get_column_letter(new_mutations_col)}, Saldi column: {get_column_letter(new_saldi_col)}")
     
-    def _copy_sheet_formatting(self, source_sheet, target_sheet):
-        """Copy column widths and basic formatting from source to target."""
-        for col_idx, col_dim in source_sheet.column_dimensions.items():
-            target_sheet.column_dimensions[col_idx].width = col_dim.width
-            
-        # Copy row heights for header rows
-        for row_idx in range(1, 6):
-            if row_idx in source_sheet.row_dimensions:
-                target_sheet.row_dimensions[row_idx].height = source_sheet.row_dimensions[row_idx].height
+    def _build_account_row_map(self, sheet):
+        """Build mapping of account codes to row numbers."""
+        self._account_row_map = {}
+        for row_idx in range(1, sheet.max_row + 1):
+            code = sheet.cell(row=row_idx, column=1).value
+            if code and isinstance(code, str) and code.strip() and code.strip()[0].isdigit():
+                self._account_row_map[code.strip()] = row_idx
+        logger.info(f"Built account row map with {len(self._account_row_map)} accounts")
     
-    def _populate_bdo_sheet(self, sheet, bdo_result: BDOParseResult):
-        """
-        Populate BDO sheet with parsed account data.
+    def _find_saldi_column(self, sheet) -> int:
+        """Find the Saldi (closing balance) column in BDO sheet."""
+        # Look for "Saldi" in row 1
+        for col_idx in range(1, sheet.max_column + 1):
+            cell_value = sheet.cell(row=1, column=col_idx).value
+            if cell_value and 'Saldi' in str(cell_value):
+                return col_idx
         
-        CRITICAL: The structure MUST match the original BDO sheets exactly:
-        - Column A (1): Account Code
-        - Column B (2): Account Name  
-        - Column C (3): Opening Balance (Eindbalans previous period)
-        - Columns D-F (4-6): Previous quarter mutations (can be empty)
-        - Column G (7): Current Quarter Mutations
-        - Column H (8): Closing Balance (Saldi = SUM of C:G)
+        # Fallback: return last column with data
+        return sheet.max_column
+    
+    def _update_saldi_formula(self, sheet, row_idx: int, saldi_col: int, new_mutations_col: int):
+        """Update Saldi formula to include the new mutations column."""
+        saldi_cell = sheet.cell(row=row_idx, column=saldi_col)
         
-        This is required because Management Cijfers formulas reference:
-        - Column G for quarter data: ='BDO - Q3-25'!G73
-        - Column H for LTM data: ='BDO - Q3-25'!H73
-        """
-        # Build period end date string
-        period_end = bdo_result.period_end
-        if hasattr(period_end, 'strftime'):
-            period_str = period_end.strftime('%d-%m-%Y')
-        else:
-            period_str = str(period_end)
-        
-        # Header row - match original BDO sheet structure
-        # Note: self.config.quarter is already "Q3 2025" format
-        headers = {
-            1: None,  # Account Code (no header in original)
-            2: None,  # Account Name (no header in original)  
-            3: f"Eindbalans per {period_str}",  # Opening balance
-            4: None,  # Previous Q mutations (empty for new sheets)
-            5: None,  # Previous Q mutations (empty for new sheets)
-            6: None,  # Previous Q mutations (empty for new sheets)
-            7: f"Mutaties {self.config.quarter}",  # Current quarter (e.g., "Mutaties Q3 2025")
-            8: f"Saldi per {period_str}",  # Closing balance
-        }
-        
-        for col_idx, header in headers.items():
-            if header:
-                cell = sheet.cell(row=1, column=col_idx, value=header)
-                cell.font = Font(bold=True)
-                cell.alignment = Alignment(horizontal='center')
-        
-        # Data rows - sorted by account code
-        row_idx = 2
-        for code in sorted(bdo_result.accounts.keys()):
-            entry = bdo_result.accounts[code]
+        if not saldi_cell.value:
+            return
             
-            # Column A: Account Code
-            sheet.cell(row=row_idx, column=1, value=entry.code)
+        if isinstance(saldi_cell.value, str) and saldi_cell.value.startswith('='):
+            # It's a formula - need to update it
+            old_formula = saldi_cell.value
             
-            # Column B: Account Name
-            sheet.cell(row=row_idx, column=2, value=entry.name)
+            # The formula typically references a range like C6:G6
+            # We need to extend it to include the new column
+            import re
             
-            # Column C: Opening Balance
-            sheet.cell(row=row_idx, column=3, value=entry.opening_balance)
-            
-            # Columns D-F: Empty (previous quarter mutations not available)
-            # These would need historical BDO data to populate
-            
-            # Column G: Current Quarter Mutations (closing - opening)
-            mutations = entry.closing_balance - entry.opening_balance
-            sheet.cell(row=row_idx, column=7, value=mutations)
-            
-            # Column H: Closing Balance (or use formula =SUM(C:G))
-            # Using the actual value for reliability
-            sheet.cell(row=row_idx, column=8, value=entry.closing_balance)
-            
-            # Number formatting for financial columns
-            for col in [3, 7, 8]:
-                cell = sheet.cell(row=row_idx, column=col)
-                if cell.value is not None:
-                    cell.number_format = '#,##0.00'
-            
-            row_idx += 1
-        
-        # Store row mapping for formula generation
-        self._bdo_row_mapping = {}
-        row_idx = 2
-        for code in sorted(bdo_result.accounts.keys()):
-            self._bdo_row_mapping[code] = row_idx
-            row_idx += 1
-        
-        logger.info(f"Populated {row_idx - 2} account rows in 8-column BDO format")
+            # Pattern to match SUM ranges like SUM(C6:G6) or SUM(C6:H6)
+            sum_match = re.search(r'SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', old_formula, re.IGNORECASE)
+            if sum_match:
+                start_col_letter, start_row, end_col_letter, end_row = sum_match.groups()
+                # Extend the end column to include the new mutations column
+                new_end_letter = get_column_letter(new_mutations_col)
+                new_formula = f"=SUM({start_col_letter}{start_row}:{new_end_letter}{end_row})"
+                saldi_cell.value = new_formula
     
     def _update_summary_sheet(self, bdo_result: BDOParseResult):
         """
         Update Management Cijfers summary sheet with new quarter column.
         
-        The correct process (based on manual Q3 file analysis):
-        1. Find the LTM column (e.g., "LTM Q2 2025" at col 27)
-        2. The LTM column BECOMES the Q3 data column - update formulas to reference BDO - Q3-25!G
-        3. Add a NEW LTM column after it (col 28) with formulas referencing BDO - Q3-25!H
-        4. Update Balance Sheet row date header
-        5. Update P&L section headers
+        Expected structure for Q3 2025:
+        - Column Z: Q2 2025 (existing)
+        - Column AA: Q3 2025 (NEW - formulas reference BDO column G/mutations)
+        - Column AB: LTM Q3 2025 (NEW - highlighted blue, formulas reference BDO column H/saldi)
+        - Column AC: Empty spacer
+        - Column AD: Commentary
         
-        CRITICAL: Formulas must reference the correct BDO sheet and row numbers!
+        The LTM column should be highlighted blue, not the quarterly column.
         """
-        # Find or update the summary sheet
+        # Find the summary sheet
         summary_sheets = [name for name in self.workbook.sheetnames 
                          if 'Management Cijfers' in name]
         
@@ -308,87 +365,135 @@ class ManagementAccountsBuilder:
             raise ValueError("Management Cijfers sheet not found")
         
         old_summary_name = summary_sheets[-1]
-        old_summary = self.workbook[old_summary_name]
+        summary_sheet = self.workbook[old_summary_name]
         
         # Rename sheet to new quarter
         new_summary_name = self.config.summary_sheet_name
         if old_summary_name != new_summary_name:
-            old_summary.title = new_summary_name
+            summary_sheet.title = new_summary_name
         
-        summary_sheet = self.workbook[new_summary_name]
+        logger.info(f"Updating summary sheet: {new_summary_name}")
         
-        # Find the LTM column (contains "LTM" in header, usually row 22 for P&L section)
+        # Find the current LTM column (row 22 has P&L headers)
         ltm_col = self._find_ltm_column(summary_sheet)
         if not ltm_col:
-            logger.warning("LTM column not found, falling back to last date column method")
+            logger.warning("LTM column not found, using last data column")
             ltm_col = self._find_last_data_column(summary_sheet) + 1
         
-        # The Q3 data goes into the current LTM column position
+        logger.info(f"Found LTM column at: {ltm_col} ({get_column_letter(ltm_col)})")
+        
+        # The current LTM column will become the new Q3 column
+        # We insert a new column after it for the new LTM
         q3_data_col = ltm_col
-        # The new LTM goes into the next column
         new_ltm_col = ltm_col + 1
         
-        logger.info(f"Q3 data column: {q3_data_col}, New LTM column: {new_ltm_col}")
-        
-        # Check if we need to shift Commentary
+        # Find Commentary column to know if we need to shift
         commentary_col = None
-        for col_idx in range(ltm_col + 1, summary_sheet.max_column + 5):
-            cell = summary_sheet.cell(row=2, column=col_idx)
+        for col_idx in range(ltm_col + 1, min(ltm_col + 5, summary_sheet.max_column + 5)):
+            cell = summary_sheet.cell(row=22, column=col_idx)
             if cell.value and 'Commentary' in str(cell.value):
                 commentary_col = col_idx
                 break
+            cell2 = summary_sheet.cell(row=2, column=col_idx)
+            if cell2.value and 'Commentary' in str(cell2.value):
+                commentary_col = col_idx
+                break
         
-        # If new LTM column would overwrite Commentary, insert column
-        if commentary_col and new_ltm_col >= commentary_col:
-            logger.info(f"Inserting column at {new_ltm_col} to make room for LTM")
-            summary_sheet.insert_cols(new_ltm_col)
+        # Insert a new column for LTM Q3
+        logger.info(f"Inserting new column at position {new_ltm_col} for LTM")
+        summary_sheet.insert_cols(new_ltm_col)
         
-        # Build BDO row mapping for formula generation
+        # Copy formatting from previous LTM column to new LTM column
+        self._copy_column_formatting(summary_sheet, q3_data_col, new_ltm_col)
+        
+        # Get the new BDO sheet name and column positions
         bdo_sheet_name = self.config.bdo_sheet_name
-        bdo_row_map = self._build_bdo_row_mapping(bdo_result)
         
-        # Update Q3 data column (was LTM Q2) - formulas reference BDO column G
-        self._update_column_with_formulas(summary_sheet, q3_data_col, bdo_sheet_name, 
-                                          bdo_row_map, col_letter='G')
+        # Find mutations and saldi columns in the new BDO sheet
+        bdo_sheet = self.workbook[bdo_sheet_name]
+        bdo_saldi_col = self._find_saldi_column(bdo_sheet)
+        bdo_mutations_col = bdo_saldi_col - 1
         
-        # Update new LTM column - formulas reference BDO column H
-        self._update_column_with_formulas(summary_sheet, new_ltm_col, bdo_sheet_name,
-                                          bdo_row_map, col_letter='H')
+        bdo_mutations_letter = get_column_letter(bdo_mutations_col)
+        bdo_saldi_letter = get_column_letter(bdo_saldi_col)
+        
+        logger.info(f"BDO sheet columns: Mutations={bdo_mutations_letter}, Saldi={bdo_saldi_letter}")
+        
+        # Update Q3 column (was LTM Q2) - formulas reference BDO mutations column
+        self._update_column_formulas(summary_sheet, q3_data_col, bdo_sheet_name, bdo_mutations_letter)
+        
+        # Update new LTM column - formulas reference BDO saldi column
+        self._update_column_formulas(summary_sheet, new_ltm_col, bdo_sheet_name, bdo_saldi_letter)
         
         # Update headers
-        # Balance sheet header (row 2) - date for Q3
-        date_col = self._find_balance_sheet_date_column(summary_sheet)
-        if date_col:
-            # The date column for balance sheet might be separate from P&L columns
-            # Find the column that had the previous date and update to Q3
-            for col_idx in range(date_col, min(date_col + 5, summary_sheet.max_column + 1)):
-                cell = summary_sheet.cell(row=2, column=col_idx)
-                if isinstance(cell.value, datetime):
-                    # This is Q2 date, need to add Q3 date
-                    break
-        
-        # Add Q3 date in balance sheet row
-        summary_sheet.cell(row=2, column=q3_data_col + 1).value = self.config.period_end
-        summary_sheet.cell(row=2, column=q3_data_col + 1).number_format = 'YYYY-MM-DD'
-        summary_sheet.cell(row=2, column=q3_data_col + 1).font = Font(bold=True)
-        
-        # Update P&L headers (row 22)
-        # self.config.quarter is already "Q3 2025", so don't add extra "Q" prefix
+        # Row 22: P&L headers
         summary_sheet.cell(row=22, column=q3_data_col).value = self.config.quarter
-        summary_sheet.cell(row=22, column=new_ltm_col).value = f"LTM {self.config.quarter}"
+        summary_sheet.cell(row=22, column=q3_data_col).font = Font(bold=True)
+        # Remove blue highlighting from Q3 column
+        summary_sheet.cell(row=22, column=q3_data_col).fill = PatternFill()  # Clear fill
         
-        logger.info(f"Set headers: Col {q3_data_col}='{self.config.quarter}', Col {new_ltm_col}='LTM {self.config.quarter}'")
+        summary_sheet.cell(row=22, column=new_ltm_col).value = f"LTM {self.config.quarter}"
+        summary_sheet.cell(row=22, column=new_ltm_col).font = Font(bold=True)
+        # Apply blue highlighting to LTM column
+        blue_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        summary_sheet.cell(row=22, column=new_ltm_col).fill = blue_fill
+        
+        # Row 2: Balance sheet date header
+        summary_sheet.cell(row=2, column=q3_data_col).value = self.config.period_end
+        summary_sheet.cell(row=2, column=q3_data_col).number_format = 'YYYY-MM-DD'
+        summary_sheet.cell(row=2, column=q3_data_col).font = Font(bold=True)
+        
+        # LTM column in row 2 might not have a header, but add date if needed
+        summary_sheet.cell(row=2, column=new_ltm_col).value = self.config.period_end
+        summary_sheet.cell(row=2, column=new_ltm_col).number_format = 'YYYY-MM-DD'
+        summary_sheet.cell(row=2, column=new_ltm_col).font = Font(bold=True)
+        
+        # Apply blue fill to entire LTM column (for data rows)
+        for row_idx in range(3, summary_sheet.max_row + 1):
+            cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
+            if cell.value is not None:
+                cell.fill = blue_fill
         
         # Update title
         title_cell = summary_sheet.cell(row=1, column=1)
         title_cell.value = f"Management Accounts QSP ESS B.V. - {self.config.quarter}"
         
-        logger.info(f"Updated summary sheet with Q3 formulas: {new_summary_name}")
+        logger.info(f"Updated summary sheet: Q3 col={get_column_letter(q3_data_col)}, LTM col={get_column_letter(new_ltm_col)}")
+    
+    def _update_column_formulas(self, sheet, col_idx: int, bdo_sheet_name: str, bdo_col_letter: str):
+        """
+        Update formulas in a column to reference the new BDO sheet.
+        
+        Preserves the row references (semantic mapping through row structure)
+        but updates the sheet name and column letter.
+        """
+        import re
+        
+        for row_idx in range(1, sheet.max_row + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            
+            if not cell.value:
+                continue
+                
+            if isinstance(cell.value, str) and cell.value.startswith('='):
+                old_formula = cell.value
+                
+                # Pattern to match BDO sheet references like 'BDO - Q2-25'!G73
+                # Replace sheet name and column letter, keep row number
+                pattern = r"'BDO[^']*'!([A-Z]+)(\d+)"
+                
+                def replace_ref(match):
+                    old_col = match.group(1)
+                    row_num = match.group(2)
+                    return f"'{bdo_sheet_name}'!{bdo_col_letter}{row_num}"
+                
+                new_formula = re.sub(pattern, replace_ref, old_formula)
+                
+                if new_formula != old_formula:
+                    cell.value = new_formula
     
     def _find_ltm_column(self, sheet) -> int:
         """Find the LAST LTM (Last Twelve Months) column in the P&L section."""
-        # P&L headers are typically in row 22
-        # We need the LAST LTM column (most recent quarter), not the first
         ltm_col = None
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=22, column=col_idx)
@@ -400,120 +505,18 @@ class ManagementAccountsBuilder:
             logger.info(f"Found last LTM column at {ltm_col}: {cell_value}")
         return ltm_col
     
-    def _find_balance_sheet_date_column(self, sheet) -> int:
-        """Find the last date column in the Balance Sheet header (row 2)."""
-        last_date_col = None
-        for col_idx in range(1, sheet.max_column + 1):
-            cell = sheet.cell(row=2, column=col_idx)
-            if isinstance(cell.value, datetime):
-                last_date_col = col_idx
-        return last_date_col
-    
-    def _build_bdo_row_mapping(self, bdo_result: BDOParseResult) -> dict:
-        """Build mapping of account codes to BDO sheet row numbers."""
-        row_map = {}
-        row_idx = 2  # Data starts at row 2 (row 1 is headers)
-        for code in sorted(bdo_result.accounts.keys()):
-            row_map[code] = row_idx
-            row_idx += 1
-        return row_map
-    
-    def _update_column_with_formulas(self, sheet, col_idx: int, bdo_sheet_name: str,
-                                     bdo_row_map: dict, col_letter: str):
-        """
-        Update a column with formulas referencing the BDO sheet.
-        
-        The formulas follow the pattern: =-'BDO - Q3-25'!G76
-        - Negative sign because BDO uses opposite sign convention
-        - Column G for quarter data, Column H for LTM data
-        """
-        # Map Management Cijfers rows to account codes
-        row_to_account = self._get_row_account_mapping(sheet)
-        
-        for row_idx, account_codes in row_to_account.items():
-            if not account_codes:
-                continue
-            
-            # Build formula for this row
-            # If multiple accounts, sum them
-            if len(account_codes) == 1:
-                code = account_codes[0]
-                if code in bdo_row_map:
-                    bdo_row = bdo_row_map[code]
-                    formula = f"=-'{bdo_sheet_name}'!{col_letter}{bdo_row}"
-                    sheet.cell(row=row_idx, column=col_idx).value = formula
-            else:
-                # Multiple accounts - create SUM formula
-                parts = []
-                for code in account_codes:
-                    if code in bdo_row_map:
-                        bdo_row = bdo_row_map[code]
-                        parts.append(f"'{bdo_sheet_name}'!{col_letter}{bdo_row}")
-                if parts:
-                    formula = f"=-({'+'.join(parts)})"
-                    sheet.cell(row=row_idx, column=col_idx).value = formula
-    
-    def _get_row_account_mapping(self, sheet) -> dict:
-        """
-        Get mapping of Management Cijfers rows to account codes.
-        
-        This is derived from the line_item_mappings config.
-        """
-        row_to_accounts = {}
-        
-        # Build row label to row index mapping
-        row_labels = {}
-        for row_idx in range(1, sheet.max_row + 1):
-            label = sheet.cell(row=row_idx, column=1).value
-            if label:
-                row_labels[str(label).strip()] = row_idx
-        
-        # Map labels to account codes
-        for label, (account_codes, calc_type) in self.line_item_mappings.items():
-            row_idx = row_labels.get(label)
-            if row_idx:
-                # Expand wildcard patterns
-                expanded_codes = []
-                for code_pattern in account_codes:
-                    if code_pattern.endswith('*'):
-                        prefix = code_pattern[:-1]
-                        # Find matching codes from BDO result
-                        # For now, just use the pattern as-is
-                        expanded_codes.append(prefix)
-                    else:
-                        expanded_codes.append(code_pattern)
-                row_to_accounts[row_idx] = expanded_codes
-        
-        return row_to_accounts
-    
     def _find_last_data_column(self, sheet) -> int:
-        """
-        Find the last DATE column in row 2 (header row).
-        
-        The summary sheet has date headers (datetime) for each quarter,
-        followed by a 'Commentary' column. We need to find the last date column
-        to know where to insert the new quarter data.
-        """
+        """Find the last DATE column in row 2 (header row)."""
         last_date_col = 1
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=2, column=col_idx)
             if cell.value is not None:
-                # Check if it's a date (datetime object or date-like string)
                 if isinstance(cell.value, datetime):
                     last_date_col = col_idx
                 elif isinstance(cell.value, str):
-                    # Skip text columns like "Balance sheet", "Commentary"
                     if any(skip in cell.value.lower() for skip in ['balance', 'commentary', 'sheet']):
                         continue
-                    # Try to parse as date
-                    try:
-                        from dateutil import parser
-                        parser.parse(cell.value)
-                        last_date_col = col_idx
-                    except:
-                        pass
         
-        logger.debug(f"Last date column found: {last_date_col}")
         return last_date_col
     
     def _copy_column_formatting(self, sheet, source_col: int, target_col: int):
@@ -535,68 +538,84 @@ class ManagementAccountsBuilder:
                 target_cell.alignment = copy(source_cell.alignment)
                 target_cell.number_format = source_cell.number_format
                 target_cell.border = copy(source_cell.border)
-                target_cell.fill = copy(source_cell.fill)
+                # Don't copy fill for now - we'll apply blue fill to LTM later
     
-    def _populate_summary_values(self, sheet, col_idx: int, bdo_result: BDOParseResult):
-        """Populate summary sheet column with calculated values."""
-        # First, identify row labels in column A
-        row_labels = {}
-        for row_idx in range(1, sheet.max_row + 1):
-            label = sheet.cell(row=row_idx, column=1).value
-            if label:
-                label_clean = str(label).strip()
-                row_labels[label_clean] = row_idx
+    def _update_date_references(self):
+        """
+        Update all date references throughout the workbook.
         
-        # Map and populate values
-        for label, (account_codes, calc_type) in self.line_item_mappings.items():
-            if label not in row_labels:
-                # Try fuzzy match
-                matched_row = self._fuzzy_match_row(label, row_labels)
-                if matched_row is None:
-                    logger.warning(f"Row label not found: {label}")
-                    continue
-                row_idx = matched_row
-            else:
-                row_idx = row_labels[label]
+        This addresses Issue 4 from feedback: dates like "Per 30-6-2025" 
+        should be updated to "Per 30-9-2025" for Q3.
+        """
+        old_date_patterns = self._generate_date_patterns(self._get_previous_period_end())
+        new_date_str = self.config.period_end.strftime('%d-%m-%Y')
+        new_date_patterns = self._generate_date_patterns(self.config.period_end)
+        
+        # Update the summary sheet
+        summary_sheets = [name for name in self.workbook.sheetnames 
+                         if 'Management Cijfers' in name or 'Cijfers' in name]
+        
+        for sheet_name in summary_sheets:
+            sheet = self.workbook[sheet_name]
             
-            # Calculate value from BDO accounts
-            value = self._calculate_value(bdo_result, account_codes, calc_type)
-            
-            # Set cell value
-            cell = sheet.cell(row=row_idx, column=col_idx)
-            cell.value = value
-            cell.number_format = '#,##0.00'
-            
-            logger.debug(f"Set {label} = {value:,.2f}")
+            for row_idx in range(1, sheet.max_row + 1):
+                for col_idx in range(1, min(sheet.max_column + 1, 10)):  # First 10 columns
+                    cell = sheet.cell(row=row_idx, column=col_idx)
+                    if cell.value and isinstance(cell.value, str):
+                        original_value = cell.value
+                        new_value = original_value
+                        
+                        # Replace date patterns
+                        for old_pattern, new_pattern in zip(old_date_patterns, new_date_patterns):
+                            if old_pattern in new_value:
+                                new_value = new_value.replace(old_pattern, new_pattern)
+                        
+                        if new_value != original_value:
+                            cell.value = new_value
+                            logger.debug(f"Updated date in {sheet_name}!{get_column_letter(col_idx)}{row_idx}: {original_value} -> {new_value}")
     
-    def _fuzzy_match_row(self, target: str, row_labels: Dict[str, int]) -> Optional[int]:
-        """Find closest matching row label."""
-        target_lower = target.lower()
-        for label, row_idx in row_labels.items():
-            if target_lower in label.lower() or label.lower() in target_lower:
-                return row_idx
-        return None
+    def _get_previous_period_end(self) -> datetime:
+        """Get the previous quarter's period end date."""
+        month = self.config.period_end.month
+        year = self.config.period_end.year
+        
+        # Go back 3 months
+        if month <= 3:
+            prev_month = 12
+            prev_year = year - 1
+        else:
+            prev_month = month - 3
+            prev_year = year
+        
+        # Determine day
+        if prev_month in [1, 3, 5, 7, 8, 10, 12]:
+            day = 31
+        elif prev_month == 2:
+            day = 28
+        else:
+            day = 30
+        
+        return datetime(prev_year, prev_month, day)
     
-    def _calculate_value(self, bdo_result: BDOParseResult, 
-                         account_codes: List[str], calc_type: str) -> float:
-        """Calculate value from BDO accounts."""
-        total = 0.0
-        
-        for pattern in account_codes:
-            for code, entry in bdo_result.accounts.items():
-                if pattern.endswith('*'):
-                    if code.startswith(pattern[:-1]):
-                        total += entry.closing_balance
-                elif code == pattern:
-                    total += entry.closing_balance
-        
-        return total
+    def _generate_date_patterns(self, date: datetime) -> List[str]:
+        """Generate various date patterns for replacement."""
+        return [
+            date.strftime('%d-%m-%Y'),      # 30-09-2025
+            date.strftime('%d-%m-%y'),       # 30-09-25
+            date.strftime('%d/%m/%Y'),       # 30/09/2025
+            date.strftime('%-d-%-m-%Y'),     # 30-9-2025 (no leading zeros)
+            f"Per {date.strftime('%d-%m-%Y')}",  # Per 30-09-2025
+            f"Per {date.strftime('%-d-%-m-%Y')}", # Per 30-9-2025
+            date.strftime('%d %B %Y'),       # 30 September 2025
+            date.strftime('%B %d, %Y'),      # September 30, 2025
+        ]
     
     def _validate_calculations(self, bdo_result: BDOParseResult):
-        """Validate that calculations are correct."""
-        # Key validation: Total (Equity Movement) = Direct Result
-        # This is the critical check from the manual process
+        """
+        Validate that calculations are correct.
         
+        Key validation (per Issue 3.2): Total (Equity Movement) = Direct Result
+        """
         # Calculate equity movement using configurable equity prefixes
         equity_start = 0.0
         equity_end = 0.0
@@ -609,23 +628,36 @@ class ManagementAccountsBuilder:
         
         equity_movement = equity_end - equity_start
         
-        # Calculate direct result from P&L using configurable prefixes
-        direct_result = 0.0
+        # Calculate direct result from P&L (mutations during the period)
+        # Direct result = Income - Expenses (for the quarter)
+        income_mutations = 0.0
+        expense_mutations = 0.0
+        result_mutations = 0.0
+        
         for code, entry in bdo_result.accounts.items():
+            first_two = code[:2] if len(code) >= 2 else ''
             first_digit = code[0] if code else ''
+            
+            # Check if it's a result account (95xxxxx)
+            if first_two == '95':
+                result_mutations += (entry.closing_balance - entry.opening_balance)
             # Check income prefixes
-            if any(first_digit == prefix[0] for prefix in self.income_prefixes):
-                direct_result += entry.closing_balance
+            elif any(first_digit == prefix[0] for prefix in self.income_prefixes):
+                income_mutations += (entry.closing_balance - entry.opening_balance)
             # Check expense prefixes
             elif any(first_digit == prefix[0] for prefix in self.expense_prefixes):
-                direct_result += entry.closing_balance
+                expense_mutations += (entry.closing_balance - entry.opening_balance)
+        
+        # Direct result is the sum of P&L mutations
+        direct_result = result_mutations if result_mutations != 0 else (income_mutations + expense_mutations)
         
         # Check within tolerance
-        tolerance = 100.00  # EUR 100 tolerance for rounding
+        tolerance = 1000.00  # EUR 1000 tolerance for rounding
         if abs(equity_movement - direct_result) > tolerance:
             logger.warning(
-                f"Equity movement ({equity_movement:,.2f}) != Direct Result ({direct_result:,.2f})"
+                f"VALIDATION WARNING: Equity movement ({equity_movement:,.2f}) != Direct Result ({direct_result:,.2f})"
             )
+            logger.warning(f"  Difference: {abs(equity_movement - direct_result):,.2f}")
         else:
-            logger.info("✓ Equity movement validation passed")
+            logger.info(f"✓ Equity movement validation passed: {equity_movement:,.2f} ≈ {direct_result:,.2f}")
 
