@@ -155,6 +155,24 @@ class WordTemplateUpdater:
         new_q_num = new_parts[0][1]  # "3" from "Q3"
         new_year = new_parts[1]  # "2025"
         
+        # Handle ordinal words (second quarter → third quarter, etc.)
+        ordinal_map = {
+            '1': ('first', 'eerste'),
+            '2': ('second', 'tweede'),
+            '3': ('third', 'derde'),
+            '4': ('fourth', 'vierde'),
+        }
+        if old_q_num in ordinal_map and new_q_num in ordinal_map:
+            old_ordinal_en, old_ordinal_nl = ordinal_map[old_q_num]
+            new_ordinal_en, new_ordinal_nl = ordinal_map[new_q_num]
+            
+            # English ordinal patterns - case variations
+            content = re.sub(rf'\b{old_ordinal_en}\s+quarter\b', f'{new_ordinal_en} quarter', content, flags=re.IGNORECASE)
+            content = re.sub(rf'\bthe\s+{old_ordinal_en}\b', f'the {new_ordinal_en}', content, flags=re.IGNORECASE)
+            
+            # Dutch ordinal patterns
+            content = re.sub(rf'\b{old_ordinal_nl}\s+kwartaal\b', f'{new_ordinal_nl} kwartaal', content, flags=re.IGNORECASE)
+        
         # Comprehensive replacement patterns
         replacements = [
             # Standard formats
@@ -166,12 +184,25 @@ class WordTemplateUpdater:
             (f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}"),  # Q2-25
             (f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}"),  # 25Q2
             
+            # Year-quarter formats with different separators
+            (f"{old_year} – Q{old_q_num}", f"{new_year} – Q{new_q_num}"),  # 2025 – Q2
+            (f"{old_year} - Q{old_q_num}", f"{new_year} - Q{new_q_num}"),  # 2025 - Q2
+            
+            # Title and header formats (as seen in Sample.pdf)
+            (f"Quarterly Report {old_quarter}", f"Quarterly Report {new_quarter}"),
+            (f"Quarterly QSP - {old_quarter}", f"Quarterly QSP - {new_quarter}"),
+            (f"in {old_quarter}", f"in {new_quarter}"),
+            
             # Text variations
             (f"Actions {old_quarter}", f"Actions {new_quarter}"),
             (f"Portfolio highlights – {old_quarter}", f"Portfolio highlights – {new_quarter}"),
             (f"Portfolio highlights - {old_quarter}", f"Portfolio highlights - {new_quarter}"),
             (f"Report {old_quarter}", f"Report {new_quarter}"),
             (f"Quarter {old_q_num} {old_year}", f"Quarter {new_q_num} {new_year}"),
+            
+            # Compliance certificate references
+            (f"Interest Period: {self._get_period_date(old_q_num, old_year)}", 
+             f"Interest Period: {self._get_period_date(new_q_num, new_year)}"),
             
             # Dutch variations
             (f"Kwartaal {old_q_num} {old_year}", f"Kwartaal {new_q_num} {new_year}"),
@@ -206,8 +237,9 @@ class WordTemplateUpdater:
             content = content.replace(old_month_nl, new_month_nl)
             content = content.replace(old_month_nl.capitalize(), new_month_nl.capitalize())
             
-            # Replace date formats like "30 June 2025"
+            # Replace date formats like "30 June 2025" and "30-6-2025"
             for year in [old_year, str(int(old_year) - 1), str(int(old_year) + 1)]:
+                # English format: 30 June 2025
                 old_date = f"{old_day} {old_month} {year}"
                 new_date = f"{new_day} {new_month} {new_year}"
                 content = content.replace(old_date, new_date)
@@ -216,8 +248,31 @@ class WordTemplateUpdater:
                 old_date_nl = f"{old_day} {old_month_nl} {year}"
                 new_date_nl = f"{new_day} {new_month_nl} {new_year}"
                 content = content.replace(old_date_nl, new_date_nl)
+                
+                # Numeric formats: 30-6-2025, 30/6/2025
+                old_month_num = {'March': 3, 'June': 6, 'September': 9, 'December': 12}[old_month]
+                new_month_num = {'March': 3, 'June': 6, 'September': 9, 'December': 12}[new_month]
+                
+                content = content.replace(f"{old_day}-{old_month_num}-{year}", f"{new_day}-{new_month_num}-{new_year}")
+                content = content.replace(f"{old_day}/{old_month_num}/{year}", f"{new_day}/{new_month_num}/{new_year}")
+                
+                # Rent roll date format: 1-10-2025 (1st of next month after quarter)
+                next_month_old = old_month_num + 1 if old_month_num < 12 else 1
+                next_year_old = year if old_month_num < 12 else str(int(year) + 1)
+                next_month_new = new_month_num + 1 if new_month_num < 12 else 1
+                next_year_new = new_year if new_month_num < 12 else str(int(new_year) + 1)
+                
+                content = content.replace(f"1-{next_month_old}-{next_year_old}", f"1-{next_month_new}-{next_year_new}")
         
         return content
+    
+    def _get_period_date(self, q_num: str, year: str) -> str:
+        """Get period end date string for a quarter."""
+        month_days = {'1': ('3', '31'), '2': ('6', '30'), '3': ('9', '30'), '4': ('12', '31')}
+        if q_num in month_days:
+            month, day = month_days[q_num]
+            return f"{day}-{month}-{year}"
+        return ""
     
     def _replace_placeholders(self, content: str, values: ReportValues) -> str:
         """Replace placeholder values in content."""
@@ -251,8 +306,12 @@ class WordTemplateUpdater:
                                  previous_quarter: str, 
                                  current_quarter: str) -> Path:
         """
-        Alternative update method using python-docx directly.
-        Better for preserving complex formatting.
+        Update Word document including text boxes using direct XML manipulation.
+        
+        This method handles:
+        - Regular paragraphs (via python-docx)
+        - Text boxes and shapes (via direct XML manipulation)
+        - Headers and footers
         
         Args:
             values: ReportValues with all data to insert
@@ -263,23 +322,28 @@ class WordTemplateUpdater:
             Path to updated Word document
         """
         from docx import Document
+        import zipfile
+        import os
         
-        logger.info(f"Updating Word template for {current_quarter} (python-docx method)")
+        logger.info(f"Updating Word template for {current_quarter} (python-docx + XML method)")
         
         # Copy template to output location
         shutil.copy2(self.template_path, self.output_path)
         
-        # Open and modify
+        # Build replacement map for text boxes
+        text_replacements = self._build_replacement_map(values, previous_quarter, current_quarter)
+        
+        # Step 1: Update text boxes via direct XML manipulation
+        self._update_text_boxes_xml(text_replacements)
+        
+        # Step 2: Update regular paragraphs/tables via python-docx
         doc = Document(self.output_path)
         
-        # Build list of old dates to replace (for cover page dynamic date - Issue 7.2)
-        # The cover page date should be the current run date, not copied from template
         old_date_patterns = self._get_old_date_patterns(previous_quarter)
         
         # Process paragraphs
         for para in doc.paragraphs:
             self._process_paragraph(para, values, previous_quarter, current_quarter)
-            # Also update any old dates on cover page to current run date
             self._update_cover_page_date(para, old_date_patterns, values.report_date)
         
         # Process tables
@@ -301,8 +365,324 @@ class WordTemplateUpdater:
         logger.info(f"Generated updated report: {self.output_path}")
         return self.output_path
     
+    def _build_replacement_map(self, values: ReportValues, old_quarter: str, new_quarter: str) -> List[Tuple[str, str]]:
+        """
+        Build comprehensive replacement map for all text that needs updating.
+        
+        Returns list of (old_text, new_text) tuples, sorted longest-first.
+        """
+        replacements = []
+        
+        # Extract quarter components
+        old_parts = old_quarter.split()
+        new_parts = new_quarter.split()
+        old_q_num = old_parts[0][1] if len(old_parts) == 2 else ''
+        old_year = old_parts[1] if len(old_parts) == 2 else ''
+        new_q_num = new_parts[0][1] if len(new_parts) == 2 else ''
+        new_year = new_parts[1] if len(new_parts) == 2 else ''
+        
+        # Quarter text replacements
+        replacements.extend([
+            (old_quarter, new_quarter),
+            (old_quarter.replace(' ', '-'), new_quarter.replace(' ', '-')),
+            (old_quarter.replace(' ', '/'), new_quarter.replace(' ', '/')),
+            (f"Q{old_q_num} {old_year[-2:]}", f"Q{new_q_num} {new_year[-2:]}"),
+            (f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}"),
+            (f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}"),
+            (f"{old_year} – Q{old_q_num}", f"{new_year} – Q{new_q_num}"),
+            (f"{old_year} - Q{old_q_num}", f"{new_year} - Q{new_q_num}"),
+        ])
+        
+        # Ordinal replacements
+        ordinal_map = {
+            '1': ('first', 'eerste'),
+            '2': ('second', 'tweede'),
+            '3': ('third', 'derde'),
+            '4': ('fourth', 'vierde'),
+        }
+        if old_q_num in ordinal_map and new_q_num in ordinal_map:
+            old_en, old_nl = ordinal_map[old_q_num]
+            new_en, new_nl = ordinal_map[new_q_num]
+            replacements.extend([
+                (f"{old_en} quarter", f"{new_en} quarter"),
+                (f"the {old_en}", f"the {new_en}"),
+                (f"{old_nl} kwartaal", f"{new_nl} kwartaal"),
+            ])
+        
+        # Date replacements
+        quarter_to_month = {
+            '1': ('March', 'maart', '31', '3'),
+            '2': ('June', 'juni', '30', '6'),
+            '3': ('September', 'september', '30', '9'),
+            '4': ('December', 'december', '31', '12'),
+        }
+        
+        if old_q_num in quarter_to_month and new_q_num in quarter_to_month:
+            old_month, old_month_nl, old_day, old_month_num = quarter_to_month[old_q_num]
+            new_month, new_month_nl, new_day, new_month_num = quarter_to_month[new_q_num]
+            
+            # Month names
+            replacements.extend([
+                (old_month, new_month),
+                (old_month.lower(), new_month.lower()),
+                (old_month_nl, new_month_nl),
+            ])
+            
+            # Date formats
+            replacements.extend([
+                (f"{old_day} {old_month} {old_year}", f"{new_day} {new_month} {new_year}"),
+                (f"{old_day} {old_month_nl} {old_year}", f"{new_day} {new_month_nl} {new_year}"),
+                (f"{old_day}-{old_month_num}-{old_year}", f"{new_day}-{new_month_num}-{new_year}"),
+                # Rent roll date (1st of next month)
+                (f"1-{int(old_month_num)+1}-{old_year}", f"1-{int(new_month_num)+1}-{new_year}"),
+            ])
+        
+        # Cover page date - get patterns and replace with current report date
+        old_date_patterns = self._get_old_date_patterns(old_quarter)
+        for old_date in old_date_patterns:
+            replacements.append((old_date, values.report_date))
+        
+        # Sort by length (longest first) to prevent partial matches
+        replacements.sort(key=lambda x: len(x[0]), reverse=True)
+        
+        return replacements
+    
+    def _update_text_boxes_xml(self, replacements: List[Tuple[str, str]]):
+        """
+        Update text in text boxes by directly manipulating the docx XML.
+        
+        Text boxes are stored as drawing elements in the document.xml,
+        and python-docx can't access them directly.
+        
+        IMPORTANT: Word XML often splits text across multiple <w:t> elements,
+        e.g., "Q2 2025" might be stored as ["Q2", " 2025"]. We handle this
+        by using regex patterns that account for XML tags between text fragments.
+        """
+        import zipfile
+        import os
+        
+        # Read the docx as a zip file
+        temp_dir = self.working_dir / "docx_xml"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract all files
+        with zipfile.ZipFile(self.output_path, 'r') as zin:
+            zin.extractall(temp_dir)
+        
+        # Process document.xml and any other relevant XML files
+        xml_files = [
+            temp_dir / "word" / "document.xml",
+        ]
+        
+        # Also process header/footer files if they exist
+        word_dir = temp_dir / "word"
+        for f in word_dir.iterdir():
+            if f.suffix == '.xml' and ('header' in f.name or 'footer' in f.name):
+                xml_files.append(f)
+        
+        updated_count = 0
+        for xml_file in xml_files:
+            if xml_file.exists():
+                with open(xml_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                original_content = content
+                
+                # Build fragmented patterns that account for XML tags between text pieces
+                # E.g., "Q2 2025" might be: <w:t>Q2</w:t></w:r><w:r><w:t> 2025</w:t>
+                content = self._apply_fragmented_replacements(content, replacements)
+                
+                if content != original_content:
+                    with open(xml_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    updated_count += 1
+        
+        logger.info(f"Updated {updated_count} XML files in docx")
+        
+        # Repack the docx
+        with zipfile.ZipFile(self.output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    arcname = file_path.relative_to(temp_dir)
+                    zout.write(file_path, arcname)
+        
+        # Cleanup temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def _apply_fragmented_replacements(self, content: str, replacements: List[Tuple[str, str]]) -> str:
+        """
+        Apply replacements handling fragmented text in Word XML.
+        
+        Word often splits text across multiple <w:t> elements. This method handles:
+        1. Direct text replacements (when text is not fragmented)
+        2. XML-aware pattern replacements for common fragments
+        """
+        import re
+        
+        # First, apply direct replacements
+        for old_text, new_text in replacements:
+            if old_text in content:
+                content = content.replace(old_text, new_text)
+        
+        # Apply common fragmented patterns using XML-aware regex
+        # These handle cases where Word splits text across <w:t> elements
+        content = self._apply_xml_aware_patterns(content, replacements)
+        
+        return content
+    
+    def _apply_xml_aware_patterns(self, content: str, replacements: List[Tuple[str, str]]) -> str:
+        """
+        Apply XML-aware patterns for commonly fragmented text.
+        
+        Word frequently fragments text like "Q2 2025" into separate runs:
+        - <w:t>Q2</w:t>...<w:t> 2025</w:t>
+        - <w:t>Q</w:t>...<w:t>2</w:t>...<w:t> 2025</w:t>
+        - <w:t>21</w:t>...<w:t> juli</w:t>...<w:t> 2025</w:t>
+        - <w:t>in Q</w:t>...<w:t>2</w:t>...<w:t> 2025</w:t>
+        
+        This function handles these cases with targeted regex patterns.
+        """
+        import re
+        
+        # Extract quarter numbers from replacements for dynamic pattern building
+        old_q_num = None
+        new_q_num = None
+        old_year = None
+        new_year = None
+        
+        for old_text, new_text in replacements:
+            # Find "Q2 2025" -> "Q3 2025" style replacements
+            old_match = re.match(r'Q(\d)\s+(\d{4})', old_text)
+            new_match = re.match(r'Q(\d)\s+(\d{4})', new_text)
+            if old_match and new_match:
+                old_q_num = old_match.group(1)
+                old_year = old_match.group(2)
+                new_q_num = new_match.group(1)
+                new_year = new_match.group(2)
+                break
+        
+        if not old_q_num:
+            return content
+        
+        # CRITICAL: Handle fragmented pattern where "in Q" is followed by "2" in next run
+        # Pattern: <w:t>in Q</w:t></w:r>...<w:t>2</w:t> → replace 2 with 3
+        # This is a common fragmentation in Word
+        def replace_fragmented_q_num(match):
+            """Replace the quarter number in fragmented 'in Q' + '2' pattern."""
+            return match.group(0).replace(f'>{old_q_num}</w:t>', f'>{new_q_num}</w:t>')
+        
+        # Match: 'in Q</w:t>' followed eventually by '>2</w:t>'
+        fragmented_pattern = rf'(in Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Also handle '% in Q</w:t>' pattern
+        fragmented_pattern2 = rf'(% in Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern2, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle 'In Q</w:t>' (capital I)
+        fragmented_pattern3 = rf'(In Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern3, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle ' Q</w:t>' followed by number (space before Q)
+        fragmented_pattern4 = rf'( Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern4, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle 'Actions Q</w:t>' followed by number
+        fragmented_pattern5 = rf'(Actions Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern5, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle '– Q</w:t>' followed by number (for Portfolio highlights)
+        fragmented_pattern6 = rf'(– Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern6, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle '- Q</w:t>' followed by number (dash variant)
+        fragmented_pattern7 = rf'(- Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern7, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle 's Q</w:t>' followed by number (for 'highlights Q2')
+        fragmented_pattern8 = rf'(s Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern8, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # Handle single 'Q</w:t>' followed by number in separate element
+        # This catches cases where "Q" and "2" are completely split
+        fragmented_pattern9 = rf'(>Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        content = re.sub(fragmented_pattern9, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
+        
+        # XML tag pattern that may appear between text fragments
+        xml_gap = r'</w:t></w:r>(?:<w:r[^>]*>)?(?:<w:rPr[^>]*>.*?</w:rPr>)?<w:t[^>]*>'
+        
+        # Define fragmented pattern replacements
+        xml_patterns = [
+            # "Q2 2025" fragmented as Q + 2 + " 2025" or "Q2" + " 2025"
+            (rf'>Q{old_q_num}</w:t>', f'>Q{new_q_num}</w:t>'),
+            (rf'>Q{old_q_num}<', f'>Q{new_q_num}<'),
+            (rf'>Q{old_q_num} {old_year}<', f'>Q{new_q_num} {new_year}<'),
+            
+            # "in Q2" patterns (common in narrative text)
+            (rf'> in Q{old_q_num}<', f'> in Q{new_q_num}<'),
+            (rf'>in Q{old_q_num}<', f'>in Q{new_q_num}<'),
+            (rf' in Q{old_q_num} {old_year}', f' in Q{new_q_num} {new_year}'),
+            (rf'in Q{old_q_num} {old_year}', f'in Q{new_q_num} {new_year}'),
+            
+            # "Actions Q2 2025" patterns
+            (rf'>Actions Q{old_q_num} {old_year}<', f'>Actions Q{new_q_num} {new_year}<'),
+            (rf'Actions Q{old_q_num} {old_year}', f'Actions Q{new_q_num} {new_year}'),
+            (rf'>Actions Q{old_q_num}<', f'>Actions Q{new_q_num}<'),
+            
+            # "In Q2 2025" patterns
+            (rf'>In Q{old_q_num} {old_year}<', f'>In Q{new_q_num} {new_year}<'),
+            (rf'In Q{old_q_num} {old_year}', f'In Q{new_q_num} {new_year}'),
+            
+            # Unit/amount references like "units in Q2 2025"
+            (rf' Q{old_q_num} {old_year}', f' Q{new_q_num} {new_year}'),
+            
+            # "2025 – Q2" patterns
+            (rf'>{old_year} – Q{old_q_num}<', f'>{new_year} – Q{new_q_num}<'),
+            (rf'>{old_year} - Q{old_q_num}<', f'>{new_year} - Q{new_q_num}<'),
+            (rf'>{old_year[-2:]} – Q{old_q_num}<', f'>{new_year[-2:]} – Q{new_q_num}<'),
+            (rf'5 – Q{old_q_num}<', f'5 – Q{new_q_num}<'),  # For "2025 – Q2" split
+            (rf'{old_year} – Q{old_q_num}', f'{new_year} – Q{new_q_num}'),
+            
+            # Ordinal patterns
+            (r'>second quarter<', '>third quarter<'),
+            (r'>second<', '>third<'),  # For split "second quarter"
+            (r'>the second<', '>the third<'),
+            (r'second quarter', 'third quarter'),
+            (r'the second quarter', 'the third quarter'),
+            
+            # Date patterns - juli to oktober for Q2->Q3
+            (rf'>21 juli {old_year}<', f'>21 oktober {new_year}<'),
+            (rf'> juli<', '> oktober<'),
+            (rf'>juli<', '>oktober<'),
+            (rf'>1-7-{old_year}<', f'>1-10-{new_year}<'),
+            (rf'>30-6-{old_year}<', f'>30-9-{new_year}<'),
+            (rf'1-7-{old_year}', f'1-10-{new_year}'),
+            
+            # Month patterns
+            (r'>June<', '>September<'),
+            (r'>juni<', '>september<'),
+            (r'>July<', '>October<'),
+            (r'>juli<', '>oktober<'),
+        ]
+        
+        for pattern, replacement in xml_patterns:
+            try:
+                if re.search(pattern, content):
+                    content = re.sub(pattern, replacement, content)
+                    logger.debug(f"XML pattern: {pattern} -> {replacement}")
+            except re.error as e:
+                logger.debug(f"Regex error for pattern {pattern}: {e}")
+        
+        return content
+    
     def _get_old_date_patterns(self, previous_quarter: str) -> List[str]:
-        """Generate date patterns that might appear on cover page from previous quarter."""
+        """
+        Generate date patterns that might appear on cover page from previous quarter.
+        
+        IMPORTANT: Patterns are sorted longest-first to prevent substring matching issues.
+        e.g., "21 juli 2025" must be matched before "1 juli 2025"
+        """
         patterns = []
         
         # Extract year from quarter
@@ -325,15 +705,16 @@ class WordTemplateUpdater:
                         patterns.extend([
                             date.strftime('%d %B %Y'),  # 21 July 2025
                             date.strftime('%d %b %Y'),  # 21 Jul 2025
-                            date.strftime('%-d %B %Y'),  # 21 July 2025 (no leading zero)
                             # Dutch formats
                             self._format_dutch_date(date),  # 21 juli 2025
                         ])
                     except ValueError:
                         continue
         
-        # Remove duplicates and empty
-        return list(set(p for p in patterns if p))
+        # Remove duplicates and empty, then SORT BY LENGTH (longest first)
+        # This prevents "1 juli 2025" from matching inside "21 juli 2025"
+        unique_patterns = list(set(p for p in patterns if p))
+        return sorted(unique_patterns, key=len, reverse=True)
     
     def _format_dutch_date(self, date) -> str:
         """Format date in Dutch style."""
@@ -358,18 +739,85 @@ class WordTemplateUpdater:
         # Check if paragraph contains text to replace
         text = para.text
         
+        # Extract quarter components for dynamic patterns
+        old_parts = old_quarter.split()
+        new_parts = new_quarter.split()
+        old_q_num = old_parts[0][1] if len(old_parts) == 2 else ''
+        old_year = old_parts[1] if len(old_parts) == 2 else ''
+        new_q_num = new_parts[0][1] if len(new_parts) == 2 else ''
+        new_year = new_parts[1] if len(new_parts) == 2 else ''
+        
         # Quarter replacement
         if old_quarter in text:
             self._replace_in_runs(para, old_quarter, new_quarter)
         
-        # Handle various quarter formats
+        # Handle various quarter formats dynamically
         quarter_patterns = [
-            (old_quarter.replace(' ', '-'), new_quarter.replace(' ', '-')),
-            (old_quarter.replace(' ', '/'), new_quarter.replace(' ', '/')),
+            (old_quarter.replace(' ', '-'), new_quarter.replace(' ', '-')),  # Q2-2025
+            (old_quarter.replace(' ', '/'), new_quarter.replace(' ', '/')),  # Q2/2025
+            (f"Q{old_q_num} {old_year[-2:]}", f"Q{new_q_num} {new_year[-2:]}"),  # Q2 25
+            (f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}"),  # Q2-25
+            (f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}"),  # 25Q2
         ]
         for old_pattern, new_pattern in quarter_patterns:
             if old_pattern in text:
                 self._replace_in_runs(para, old_pattern, new_pattern)
+        
+        # Handle ordinal quarter references (second quarter, third quarter, etc.)
+        ordinal_map = {
+            '1': ('first', 'eerste'),
+            '2': ('second', 'tweede'),
+            '3': ('third', 'derde'),
+            '4': ('fourth', 'vierde'),
+        }
+        if old_q_num in ordinal_map and new_q_num in ordinal_map:
+            old_ordinal_en, old_ordinal_nl = ordinal_map[old_q_num]
+            new_ordinal_en, new_ordinal_nl = ordinal_map[new_q_num]
+            
+            # English ordinal patterns
+            ordinal_patterns = [
+                (f"{old_ordinal_en} quarter", f"{new_ordinal_en} quarter"),
+                (f"{old_ordinal_en.capitalize()} quarter", f"{new_ordinal_en.capitalize()} quarter"),
+                (f"{old_ordinal_en} Quarter", f"{new_ordinal_en} Quarter"),
+                # Dutch ordinal patterns
+                (f"{old_ordinal_nl} kwartaal", f"{new_ordinal_nl} kwartaal"),
+                (f"{old_ordinal_nl} Kwartaal", f"{new_ordinal_nl} Kwartaal"),
+            ]
+            for old_ord, new_ord in ordinal_patterns:
+                if old_ord in text:
+                    self._replace_in_runs(para, old_ord, new_ord)
+        
+        # Handle month/date replacements dynamically
+        quarter_to_month = {
+            '1': ('March', 'maart', '31', '3'),
+            '2': ('June', 'juni', '30', '6'),
+            '3': ('September', 'september', '30', '9'),
+            '4': ('December', 'december', '31', '12'),
+        }
+        
+        if old_q_num in quarter_to_month and new_q_num in quarter_to_month:
+            old_month, old_month_nl, old_day, old_month_num = quarter_to_month[old_q_num]
+            new_month, new_month_nl, new_day, new_month_num = quarter_to_month[new_q_num]
+            
+            # Replace month names (only if they appear as standalone words related to quarter)
+            # Be careful not to replace months in unrelated contexts
+            if old_month in text:
+                self._replace_in_runs(para, old_month, new_month)
+            if old_month_nl in text:
+                self._replace_in_runs(para, old_month_nl, new_month_nl)
+            
+            # Replace date patterns - sort by length to prevent partial matches
+            date_patterns = [
+                # Longer patterns first
+                (f"{old_day} {old_month} {old_year}", f"{new_day} {new_month} {new_year}"),
+                (f"{old_day} {old_month_nl} {old_year}", f"{new_day} {new_month_nl} {new_year}"),
+                (f"{old_day}-{old_month_num}-{old_year}", f"{new_day}-{new_month_num}-{new_year}"),
+                # Rent roll date: 1-7-2025 (first of month after quarter)
+                (f"1-{int(old_month_num)+1}-{old_year}", f"1-{int(new_month_num)+1}-{new_year}"),
+            ]
+            for old_date, new_date in date_patterns:
+                if old_date in text:
+                    self._replace_in_runs(para, old_date, new_date)
         
         # Placeholder replacements
         for placeholder, attr_name in self.PLACEHOLDERS.items():

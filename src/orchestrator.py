@@ -175,7 +175,8 @@ class QuarterlyReportOrchestrator:
             ma_builder = ManagementAccountsBuilder(
                 str(self.config.previous_management_accounts),
                 str(ma_output),
-                ma_config
+                ma_config,
+                bdo_source_path=str(self.config.bdo_file)  # Pass BDO file for direct copy
             )
             ma_builder.build(bdo_result)
             results['steps']['management_accounts'] = {

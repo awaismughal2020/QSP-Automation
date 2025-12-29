@@ -69,14 +69,14 @@ class GenerateRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "year": 2025,
-                "quarter": 3,
-                "bdo_file": "inputs/Cijfers_QSP_30-09-2025_d_d__14-10-2025.xlsx",
-                "prev_ma_file": "inputs/Management Accounts Q2 2025 - Draft 1.xlsx",
-                "rent_roll_file": "inputs/QSP_huurlijst_1-10-2025.xlsx",
-                "sales_tracker_file": "inputs/Unit_Sales_tracker_Q3_updated.xlsx",
-                "prev_compliance_file": "inputs/Compliance Certificate Berekening QSP - Q2 2025_updated.xlsx",
-                "word_template_file": "inputs/Quarterly_QSP_-_Q3_2025_-_Draft.docx",
+                "year": 2025,  # Dynamic: Use the report year
+                "quarter": 3,  # Dynamic: 1-4 for Q1-Q4
+                "bdo_file": "inputs/Cijfers_QSP_<date>.xlsx",  # BDO quarterly financials
+                "prev_ma_file": "inputs/Management Accounts Q<prev_quarter> <year> - Draft 1.xlsx",
+                "rent_roll_file": "inputs/QSP_huurlijst_<date>.xlsx",  # Rent roll
+                "sales_tracker_file": "inputs/Unit_Sales_tracker_Q<quarter>_updated.xlsx",
+                "prev_compliance_file": "inputs/Compliance Certificate Berekening QSP - Q<prev_quarter> <year>_updated.xlsx",
+                "word_template_file": "inputs/Quarterly_QSP_-_Q<prev_quarter>_<year>_-_Draft.docx",
                 "dry_run": False
             }
         }
@@ -580,18 +580,31 @@ async def upload_form():
                 <div class="row">
                     <div class="form-group">
                         <label for="year">Year</label>
-                        <input type="number" id="year" name="year" value="2025" min="2020" max="2030" required>
+                        <input type="number" id="year" name="year" min="2020" max="2035" required>
                     </div>
                     <div class="form-group">
                         <label for="quarter">Quarter</label>
                         <select id="quarter" name="quarter" required>
                             <option value="1">Q1</option>
                             <option value="2">Q2</option>
-                            <option value="3" selected>Q3</option>
+                            <option value="3">Q3</option>
                             <option value="4">Q4</option>
                         </select>
                     </div>
                 </div>
+                <script>
+                    // Set dynamic defaults based on current date
+                    (function() {
+                        const now = new Date();
+                        const currentYear = now.getFullYear();
+                        const currentMonth = now.getMonth() + 1; // 1-12
+                        // Determine current quarter
+                        const currentQuarter = Math.ceil(currentMonth / 3);
+                        
+                        document.getElementById('year').value = currentYear;
+                        document.getElementById('quarter').value = currentQuarter;
+                    })();
+                </script>
                 
                 <div class="section-header">📁 Input Files</div>
                 

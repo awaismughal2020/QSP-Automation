@@ -99,52 +99,186 @@ class PDFAssembler:
         
     def assemble(self, sources: List[PDFSource]) -> Path:
         """
-        Assemble final PDF from multiple sources.
+        Assemble final PDF from multiple sources with interleaved structure.
+        
+        The Word document contains section intro pages with "File enclosed" text.
+        Each attachment should be inserted immediately after its section intro page.
         
         Args:
-            sources: Ordered list of PDF sources
+            sources: Ordered list of PDF sources. First source should be the Word doc,
+                    followed by attachments in order: Rent Roll, MA, Sales, Compliance.
             
         Returns:
             Path to merged PDF
         """
         logger.info(f"Assembling PDF from {len(sources)} sources")
         
-        # Step 1: Convert all sources to PDF
-        pdf_parts = []
-        for idx, source in enumerate(sources):
-            logger.info(f"Processing source {idx + 1}/{len(sources)}: {source.name}")
+        # Identify Word doc (first docx source) and attachment sources
+        word_source = None
+        attachment_sources = []
+        
+        for source in sources:
+            if source.source_type == 'docx' and word_source is None:
+                word_source = source
+            else:
+                attachment_sources.append(source)
+        
+        if word_source is None:
+            # Fallback to simple linear merge if no Word doc
+            return self._assemble_linear(sources)
+        
+        # Convert Word doc to PDF
+        logger.info("Converting Word document to PDF")
+        word_pdf = self._convert_docx_to_pdf(word_source.source_path)
+        
+        # Convert all attachments to PDF
+        attachment_pdfs = []
+        attachment_markers = [
+            ("Rent Roll", "rent roll"),
+            ("Management Accounts", "management accounts"),
+            ("Sales", "sales report"),
+            ("Compliance", "compliance"),
+        ]
+        
+        for source in attachment_sources:
+            logger.info(f"Processing attachment: {source.name}")
+            if source.source_type == 'xlsx':
+                pdf_path = self._convert_xlsx_to_pdf(source.source_path, source.sheet_name)
+            elif source.source_type == 'pdf':
+                pdf_path = source.source_path
+            else:
+                pdf_path = self._convert_docx_to_pdf(source.source_path)
             
+            if source.page_range:
+                pdf_path = self._extract_pages(pdf_path, source.page_range)
+            
+            attachment_pdfs.append((source.name, pdf_path))
+        
+        # Interleave Word PDF pages with attachments
+        merged_path = self._interleave_attachments(word_pdf, attachment_pdfs, attachment_markers)
+        
+        # Move to final output location
+        if merged_path.exists():
+            if self.output_path.exists():
+                self.output_path.unlink()
+            shutil.copy2(merged_path, self.output_path)
+            merged_path.unlink()
+        
+        logger.info(f"Final PDF saved to: {self.output_path}")
+        return self.output_path
+    
+    def _assemble_linear(self, sources: List[PDFSource]) -> Path:
+        """Fallback linear merge without interleaving."""
+        pdf_parts = []
+        for source in sources:
             if source.source_type == 'pdf':
                 pdf_path = source.source_path
             elif source.source_type == 'docx':
                 pdf_path = self._convert_docx_to_pdf(source.source_path)
             elif source.source_type == 'xlsx':
-                pdf_path = self._convert_xlsx_to_pdf(
-                    source.source_path, 
-                    source.sheet_name
-                )
+                pdf_path = self._convert_xlsx_to_pdf(source.source_path, source.sheet_name)
             else:
                 raise ValueError(f"Unknown source type: {source.source_type}")
             
-            # Extract page range if specified
             if source.page_range:
                 pdf_path = self._extract_pages(pdf_path, source.page_range)
             
             pdf_parts.append(pdf_path)
         
-        # Step 2: Merge all PDFs
         merged_path = self._merge_pdfs(pdf_parts)
         
-        # Step 3: Move to final output location
         if merged_path.exists():
             if self.output_path.exists():
                 self.output_path.unlink()
-            # Use shutil.copy2 instead of rename for cross-filesystem compatibility (Docker)
             shutil.copy2(merged_path, self.output_path)
-            merged_path.unlink()  # Delete source after copy
+            merged_path.unlink()
         
-        logger.info(f"Final PDF saved to: {self.output_path}")
         return self.output_path
+    
+    def _interleave_attachments(self, word_pdf: Path, attachment_pdfs: List[tuple], 
+                                 markers: List[tuple]) -> Path:
+        """
+        Interleave Word PDF pages with attachments based on section markers.
+        
+        Scans Word PDF for "File enclosed" pages and inserts corresponding
+        attachment immediately after each.
+        """
+        word_reader = PdfReader(word_pdf)
+        writer = PdfWriter()
+        
+        # Find pages with "File enclosed" and identify which section they belong to
+        section_pages = []  # List of (page_num, section_type)
+        
+        for page_num in range(len(word_reader.pages)):
+            text = word_reader.pages[page_num].extract_text().lower()
+            if "file enclosed" in text:
+                # Identify which section this is
+                for marker_name, marker_text in markers:
+                    if marker_text in text:
+                        section_pages.append((page_num, marker_name))
+                        logger.debug(f"Found '{marker_name}' section intro at page {page_num + 1}")
+                        break
+        
+        logger.info(f"Found {len(section_pages)} section intro pages: {[s[1] for s in section_pages]}")
+        
+        # Build mapping of section name to attachment PDFs
+        attachment_map = {}
+        for name, pdf_path in attachment_pdfs:
+            # Match attachment to section
+            name_lower = name.lower()
+            matched = False
+            for marker_name, _ in markers:
+                if marker_name.lower() in name_lower or name_lower in marker_name.lower():
+                    if marker_name not in attachment_map:
+                        attachment_map[marker_name] = []
+                    attachment_map[marker_name].append(pdf_path)
+                    matched = True
+                    break
+            
+            # Special handling for Compliance sheets (multiple)
+            if not matched and "compliance" in name_lower or "sfa" in name_lower or "suppl" in name_lower or "impact" in name_lower:
+                if "Compliance" not in attachment_map:
+                    attachment_map["Compliance"] = []
+                attachment_map["Compliance"].append(pdf_path)
+        
+        logger.debug(f"Attachment map: {list(attachment_map.keys())}")
+        
+        # Build the final PDF with interleaving
+        sections_inserted = set()
+        current_page = 0
+        
+        for page_num in range(len(word_reader.pages)):
+            # Add the Word page
+            writer.add_page(word_reader.pages[page_num])
+            
+            # Check if this is a section intro page
+            for section_page, section_name in section_pages:
+                if page_num == section_page and section_name not in sections_inserted:
+                    # Insert attachment(s) for this section
+                    if section_name in attachment_map:
+                        for attachment_pdf in attachment_map[section_name]:
+                            logger.info(f"Inserting {section_name} attachment after page {page_num + 1}")
+                            att_reader = PdfReader(attachment_pdf)
+                            for att_page in att_reader.pages:
+                                writer.add_page(att_page)
+                    sections_inserted.add(section_name)
+        
+        # Add any remaining attachments (e.g., Compliance after all Word pages)
+        for section_name, pdfs in attachment_map.items():
+            if section_name not in sections_inserted:
+                for pdf_path in pdfs:
+                    logger.info(f"Appending remaining attachment: {section_name}")
+                    reader = PdfReader(pdf_path)
+                    for page in reader.pages:
+                        writer.add_page(page)
+        
+        # Write the interleaved PDF
+        output_path = self.working_dir / "interleaved_output.pdf"
+        with open(output_path, 'wb') as f:
+            writer.write(f)
+        
+        logger.info(f"Interleaved PDF created with {len(writer.pages)} pages")
+        return output_path
     
     def _convert_docx_to_pdf(self, docx_path: Path) -> Path:
         """Convert Word document to PDF using LibreOffice."""
@@ -207,6 +341,41 @@ class PDFAssembler:
         
         return pdf_path
     
+    def _recalculate_workbook(self, xlsx_path: Path) -> Path:
+        """
+        Use LibreOffice to recalculate all formulas in a workbook.
+        This is necessary because openpyxl cannot calculate formulas.
+        
+        Returns the path to the recalculated workbook.
+        """
+        recalc_dir = self.working_dir / "recalculated"
+        recalc_dir.mkdir(exist_ok=True)
+        
+        soffice_cmd = self._find_soffice()
+        
+        # LibreOffice macro to recalculate and save
+        # We use --convert-to xlsx which forces recalculation
+        cmd = [
+            soffice_cmd,
+            '--headless',
+            '--calc',
+            '--convert-to', 'xlsx',
+            '--outdir', str(recalc_dir),
+            str(xlsx_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning(f"Recalculation may have failed: {result.stderr}")
+            return xlsx_path  # Return original if recalc fails
+        
+        recalc_path = recalc_dir / xlsx_path.name
+        if recalc_path.exists():
+            logger.debug(f"Workbook recalculated: {recalc_path}")
+            return recalc_path
+        
+        return xlsx_path
+    
     def _export_excel_sheet_to_pdf(self, xlsx_path: Path, sheet_name: str, 
                                     output_dir: Path) -> Path:
         """
@@ -217,20 +386,21 @@ class PDFAssembler:
         1. LibreOffice may not recalculate formulas properly
         2. Formulas referencing external/other sheets may not resolve
         
-        Solution: We use the full workbook conversion and extract the needed page,
-        OR we copy the calculated values instead of formulas.
+        Solution: First recalculate the workbook using LibreOffice, then export.
         """
         import openpyxl
         from copy import copy
         
-        # Load workbook with data_only=True to get calculated values instead of formulas
-        # This prevents #NAME? errors in PDF conversion
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        # First, recalculate the workbook to resolve all formulas
+        recalc_xlsx = self._recalculate_workbook(xlsx_path)
+        
+        # Load workbook with data_only=True to get calculated values
+        wb = openpyxl.load_workbook(recalc_xlsx, data_only=True)
         
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Sheet '{sheet_name}' not found in {xlsx_path}")
         
-        # Also load with formulas to preserve formatting
+        # Also load with formulas to preserve formatting (use original file for better formatting)
         wb_format = openpyxl.load_workbook(xlsx_path, data_only=False)
         
         # Create a new workbook with just this sheet

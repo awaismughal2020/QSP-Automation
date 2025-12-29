@@ -115,6 +115,9 @@ class ComplianceBuilder:
         # Step 5: Update SFA CC formulas (if needed)
         self._update_sfa_cc_sheet()
         
+        # Step 6: Update all dates and text references throughout workbook
+        self._update_all_dates_and_text()
+        
         # Save output
         self.workbook.save(self.output_path)
         logger.info(f"Saved to {self.output_path}")
@@ -157,151 +160,160 @@ class ComplianceBuilder:
         """
         Copy Management Accounts data from external file.
         
-        Creates a simplified structure for the Compliance Certificate:
-        - Column A: Row labels (Balance sheet items, P&L items)
-        - Column C: Q3 2025 values (the new quarter data)
+        IMPORTANT: The Management Accounts file has formulas that reference the BDO sheet.
+        Since we can't calculate formulas, we get data directly from the BDO sheet.
         
-        This function maps line items to their expected row numbers in the Compliance Certificate
-        to ensure formulas can find data in the correct locations.
+        The BDO sheet structure:
+        - Column A: Account codes
+        - Column B: Account names
+        - Column G: Mutations (quarterly changes)
+        - Column H: Closing balance (Saldi)
         """
         try:
-            source_wb = openpyxl.load_workbook(source_path, data_only=True)
+            # Load WITH formulas to find BDO sheet references
+            source_wb = openpyxl.load_workbook(source_path, data_only=False)
             
-            # Find the Management Cijfers sheet
-            source_sheet_name = None
-            for name in source_wb.sheetnames:
-                if 'Management Cijfers' in name and f'Q{self.config.quarter}' in name:
-                    source_sheet_name = name
-                    break
-            
-            if not source_sheet_name:
-                # Try without quarter in name
+            # Find the BDO sheet for current quarter
+            bdo_sheet_name = f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}"
+            if bdo_sheet_name not in source_wb.sheetnames:
+                # Try alternate formats
                 for name in source_wb.sheetnames:
-                    if 'Management Cijfers' in name:
-                        source_sheet_name = name
+                    if f'Q{self.config.quarter}' in name and 'BDO' in name:
+                        bdo_sheet_name = name
                         break
             
-            if not source_sheet_name:
-                logger.warning(f"No Management Cijfers sheet found in {source_path}")
+            if bdo_sheet_name not in source_wb.sheetnames:
+                logger.warning(f"BDO sheet {bdo_sheet_name} not found. Available: {source_wb.sheetnames[-5:]}")
                 return
             
-            source_sheet = source_wb[source_sheet_name]
+            bdo_sheet = source_wb[bdo_sheet_name]
             target_sheet = self.workbook[target_sheet_name]
             
-            # Find the Q3 2025 column in the source
-            q3_col = None
-            from datetime import datetime
-            period_end = self.config.period_end if hasattr(self.config, 'period_end') else datetime(self.config.year, 9, 30)
+            logger.info(f"Copying data from BDO sheet: {bdo_sheet_name}")
             
-            for col in range(1, source_sheet.max_column + 1):
-                val = source_sheet.cell(row=2, column=col).value
-                if isinstance(val, datetime):
-                    # Match by year and month
-                    if val.year == period_end.year and val.month == period_end.month:
-                        q3_col = col
-                        break
+            # Build mapping of account codes to row/values in BDO sheet
+            # Column H contains the closing balance (Saldi)
+            bdo_data = {}
+            for row in range(1, bdo_sheet.max_row + 1):
+                code = bdo_sheet.cell(row=row, column=1).value
+                name = bdo_sheet.cell(row=row, column=2).value
+                # Get closing balance from column H
+                closing_val = bdo_sheet.cell(row=row, column=8).value
+                
+                # If closing balance is a formula, try to calculate it manually
+                if isinstance(closing_val, str) and closing_val.startswith('='):
+                    # Simple SUM formula: =SUM(C6:G6)
+                    if 'SUM' in closing_val:
+                        try:
+                            # Extract range and sum
+                            import re
+                            match = re.search(r'SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', closing_val)
+                            if match:
+                                total = 0
+                                start_col = ord(match.group(1)) - ord('A') + 1
+                                end_col = ord(match.group(3)) - ord('A') + 1
+                                for c in range(start_col, end_col + 1):
+                                    v = bdo_sheet.cell(row=row, column=c).value
+                                    if isinstance(v, (int, float)):
+                                        total += v
+                                closing_val = total
+                        except:
+                            closing_val = None
+                
+                if code and isinstance(code, (str, int, float)):
+                    code_str = str(code).strip()
+                    bdo_data[code_str] = {
+                        'name': name,
+                        'closing': closing_val if isinstance(closing_val, (int, float)) else 0
+                    }
             
-            if not q3_col:
-                # Find the last date column as fallback
-                for col in range(source_sheet.max_column, 0, -1):
-                    val = source_sheet.cell(row=2, column=col).value
-                    if isinstance(val, datetime):
-                        q3_col = col
-                        break
+            logger.info(f"Loaded {len(bdo_data)} accounts from BDO sheet")
             
-            if not q3_col:
-                logger.warning(f"Could not find {period_end.strftime('%Y-%m')} column in source")
-                return
+            # Define the mapping from Compliance Certificate labels to BDO account codes
+            # This maps the target sheet labels to BDO account codes
+            label_to_accounts = {
+                'deferred tax asset': ['1790002'],
+                'real estate': ['1600000', '1600200', '1601000', '1611003', '1610803'],
+                'financial fixed assets': ['1760000', '1760300', '1790000'],
+                'accounts receivable': ['2000000', '2000100', '2099001', '2099101'],
+                'service costs to be charged': ['2010000'],
+                'prepaid expenses': ['2012400', '2012300'],
+                'cash': ['2400*'],
+                'equity': ['1000*', '1100000', '1160000'],
+                'ac shareholder': ['1200000'],
+                'bank loan': ['1930001', '1930101'],
+                'amortised fee': ['1930200'],
+                'accounts payable': ['1601000', '1700000', '1700300', '1708200'],
+                'current account': ['1750100'],
+                'vat payable': ['1730000'],
+                'deposits': ['1750000'],
+                'rent invoiced in advance': ['1708400'],
+                # P&L items
+                'gross theoretical rental income': ['8000*', '8001*'],
+                '(financial vacancy)': ['8005*'],
+                'gross rental income': None,  # Calculated
+                'service costs charged (100% occupancy)': ['8010*'],
+                '(vacancy costs)': ['8015*'],
+                '(service costs)': ['8020*'],
+                'service charges': None,  # Calculated
+                '(maintenance & repair costs actual)': ['4100*'],
+                '(owners society costs (vve))': ['4102*'],
+                '(insurance costs)': ['4105*', '4104*'],
+                '(landlord tax costs)': ['4106*'],
+                '(property tax)': ['4106200'],
+                '(water collection, sewerage costs)': ['4106100'],
+                '(agent costs)': ['4110*'],
+                '(brokerage costs)': ['4108*'],
+                '(other costs)': ['4199*'],
+                '(accountant costs)': ['4303*'],
+                '(advisory costs)': ['4301*'],
+                '(intercompany costs)': ['4300*'],
+                'cash proceeds sale': ['8500*'],
+                '(cost of sales)': ['4500*'],
+            }
             
-            logger.info(f"Found Q{self.config.quarter} data in column {q3_col}")
-            
-            # Build a mapping of label -> source row for quick lookup
-            label_to_source_row = {}
-            for row in range(2, min(source_sheet.max_row + 1, 200)):
-                label = source_sheet.cell(row=row, column=1).value
-                if label and isinstance(label, str):
-                    # Normalize label for matching (strip whitespace, case-insensitive)
-                    normalized = label.strip()
-                    label_to_source_row[normalized.lower()] = row
-            
-            # Clear only column C (data column) to remove old values
-            # Preserve column A (labels) and all other columns (formulas, etc.)
-            for row in range(1, min(target_sheet.max_row + 1, 200)):
-                # Clear column C only
-                target_sheet.cell(row=row, column=3).value = None
-            
-            # Update Row 1: Header with date (preserve structure but update date)
-            if target_sheet.cell(row=1, column=1).value is None:
-                target_sheet.cell(row=1, column=1).value = "Balance sheet"
+            # Update Row 1: Header with date
+            period_end = self.config.period_end
             target_sheet.cell(row=1, column=3).value = period_end
             target_sheet.cell(row=1, column=3).number_format = 'YYYY-MM-DD'
             
-            # Define income items that need sign negation (BDO shows credits as negative)
-            income_labels = {
-                'gross theoretical rental income',
-                'gross rental income',
-                'service costs charged (100% occupancy)',
-                'service charges',
-                'service charges ',
-                'cash proceeds sale'
-            }
-            
-            # Copy data by matching labels to existing structure in target sheet
-            # The target sheet structure (from previous quarter) must be preserved
-            # Formulas reference specific rows, so we must match labels to rows
             items_copied = 0
-            items_not_found = []
             
-            # Match labels from target sheet to source data
-            for row in range(1, min(target_sheet.max_row + 1, 200)):
-                existing_label = target_sheet.cell(row=row, column=1).value
-                if existing_label and isinstance(existing_label, str):
-                    # Normalize label for matching
-                    normalized_label = existing_label.strip().lower()
+            # Process each row in target sheet
+            for row in range(1, min(target_sheet.max_row + 1, 100)):
+                label = target_sheet.cell(row=row, column=1).value
+                if not label or not isinstance(label, str):
+                    continue
+                
+                normalized = label.strip().lower()
+                
+                # Look up account codes for this label
+                if normalized in label_to_accounts:
+                    account_patterns = label_to_accounts[normalized]
+                    if account_patterns is None:
+                        continue  # Calculated field
                     
-                    # Try to find matching source row
-                    source_row = label_to_source_row.get(normalized_label)
+                    # Sum values for all matching accounts
+                    total = 0
+                    for pattern in account_patterns:
+                        if pattern.endswith('*'):
+                            # Wildcard match
+                            prefix = pattern[:-1]
+                            for code, data in bdo_data.items():
+                                if code.startswith(prefix):
+                                    total += data['closing']
+                        else:
+                            # Exact match
+                            if pattern in bdo_data:
+                                total += bdo_data[pattern]['closing']
                     
-                    if source_row:
-                        # Get the cell from source
-                        source_cell = source_sheet.cell(row=source_row, column=q3_col)
-                        
-                        # Get value - handle both formulas and direct values
-                        if source_cell.data_type == 'f':
-                            # It's a formula - get the calculated value
-                            # Use data_only mode which we already loaded with
-                            value = source_cell.value
-                            # If still a formula string, try to evaluate or use None
-                            if isinstance(value, str) and value.startswith('='):
-                                logger.debug(f"Source cell {source_row},{q3_col} has formula: {value[:50]}")
-                                value = None  # Can't evaluate, will skip
-                        else:
-                            # Direct value
-                            value = source_cell.value
-                        
-                        if value is not None and value != '':
-                            # Negate sign for income items (BDO shows credits as negative)
-                            if normalized_label in income_labels and isinstance(value, (int, float)):
-                                value = -value
-                            
-                            # Update column C with the value
-                            target_sheet.cell(row=row, column=3).value = value
-                            if isinstance(value, (int, float)):
-                                target_sheet.cell(row=row, column=3).number_format = '#,##0.00'
-                            items_copied += 1
-                        else:
-                            # Value is None or empty - might be a calculated field or missing data
-                            logger.debug(f"No value found for '{existing_label}' at row {row}")
-                    else:
-                        # Label not found in source - might be a calculated row or header
-                        # Don't add to not_found if it's a header or separator
-                        if normalized_label not in ['balance sheet', 'profit and loss', '']:
-                            items_not_found.append(existing_label)
+                    if total != 0:
+                        target_sheet.cell(row=row, column=3).value = total
+                        target_sheet.cell(row=row, column=3).number_format = '#,##0.00'
+                        items_copied += 1
             
-            if items_not_found:
-                logger.warning(f"Could not find source data for {len(items_not_found)} labels: {items_not_found[:5]}")
-            
-            logger.info(f"Updated {items_copied} line items in Q{self.config.quarter} Management Accounts (column C)")
+            logger.info(f"Copied {items_copied} items to {target_sheet_name}")
+            source_wb.close()
             
         except Exception as e:
             logger.warning(f"Error copying MA data: {e}")
@@ -593,6 +605,279 @@ class ComplianceBuilder:
                             updated_count += 1
         
         logger.info(f"Updated {updated_count} cells in SFA CC ({formula_count} formulas)")
+        
+        # Update signature page dates (typically in rows 82+)
+        self._update_signature_page_dates(sheet)
+        
+        # Ensure signature page content exists
+        self._ensure_signature_page(sheet)
+    
+    def _update_signature_page_dates(self, sheet):
+        """
+        Update dates in the signature page section of SFA CC.
+        
+        The signature page typically contains:
+        - Date in format "DD-MM-YYYY" or "DD Month YYYY"
+        - Quarter references
+        - Interest Period dates
+        
+        These need to be updated to the current quarter's period end.
+        """
+        # Calculate dates
+        period_end = self.config.period_end
+        
+        # Report date is typically ~20 days after quarter end
+        from datetime import timedelta
+        report_date = period_end + timedelta(days=21)
+        
+        # Previous quarter dates
+        prev_q = self.config.quarter - 1
+        prev_y = self.config.year
+        if prev_q == 0:
+            prev_q = 4
+            prev_y -= 1
+        
+        # Calculate previous period end
+        prev_month = prev_q * 3
+        if prev_month in [3, 12]:
+            prev_day = 31
+        else:
+            prev_day = 30
+        
+        # New date formats
+        new_period_date = f"{period_end.day}-{period_end.month}-{period_end.year}"
+        new_report_date = f"{report_date.day}-{report_date.month}-{report_date.year}"
+        
+        # Date pattern replacements - sorted by specificity/length to avoid partial matches
+        date_replacements = [
+            # Interest Period formats (various)
+            (f"Interest Period: {prev_month}/{prev_day}/{prev_y}", 
+             f"Interest Period: {period_end.month}/{period_end.day}/{period_end.year}"),
+            (f"Interest Period: {prev_day}-{prev_month}-{prev_y}", 
+             f"Interest Period: {new_period_date}"),
+            # US format mm/dd/yyyy
+            (f"{prev_month}/{prev_day}/{prev_y}", 
+             f"{period_end.month}/{period_end.day}/{period_end.year}"),
+            # EU format dd-mm-yyyy
+            (f"{prev_day}-{prev_month}-{prev_y}", new_period_date),
+            # Dated field - report date (21 days after quarter end)
+            (f"Dated {self._calc_dated_field(prev_q, prev_y)}",
+             f"Dated {new_report_date}"),
+            # Just "21-7-2025" or similar
+            (f"21-{prev_month + 1 if prev_month < 12 else 1}-{prev_y}", new_report_date),
+        ]
+        
+        updated_dates = 0
+        
+        for row in range(1, sheet.max_row + 1):
+            for col in range(1, sheet.max_column + 1):
+                cell = sheet.cell(row=row, column=col)
+                if cell.value and isinstance(cell.value, str) and not cell.value.startswith('='):
+                    original = cell.value
+                    new_value = original
+                    
+                    # Apply date replacements
+                    for old_pattern, new_pattern in date_replacements:
+                        if old_pattern in new_value:
+                            new_value = new_value.replace(old_pattern, new_pattern)
+                    
+                    # Replace quarter text references
+                    old_q_str = f"Q{prev_q} {prev_y}"
+                    if old_q_str in new_value:
+                        new_value = new_value.replace(old_q_str, self.config.quarter_str)
+                    
+                    if new_value != original:
+                        cell.value = new_value
+                        updated_dates += 1
+        
+        if updated_dates > 0:
+            logger.info(f"Updated {updated_dates} dates in signature section")
+    
+    def _calc_dated_field(self, quarter: int, year: int) -> str:
+        """Calculate the 'Dated' field date (typically 21 days after quarter end)."""
+        from datetime import datetime, timedelta
+        month = quarter * 3
+        day = 31 if month in [3, 12] else 30
+        period_end = datetime(year, month, day)
+        dated = period_end + timedelta(days=21)
+        return f"{dated.day}-{dated.month}-{dated.year}"
+    
+    def _ensure_signature_page(self, sheet):
+        """
+        Ensure the signature page content exists in the SFA CC sheet.
+        
+        If row 81 says "Signature page follows" but the actual signature section
+        (rows 82+) is missing content, add the standard signature fields.
+        """
+        from datetime import timedelta
+        
+        # Check if signature page content already exists
+        signature_content_exists = False
+        for row in range(82, min(sheet.max_row + 1, 100)):
+            for col in range(1, 10):
+                cell_val = sheet.cell(row=row, column=col).value
+                if cell_val and isinstance(cell_val, str) and len(cell_val.strip()) > 0:
+                    # Actual content found
+                    if 'Name' in str(cell_val) or 'Title' in str(cell_val) or 'Signature' in str(cell_val):
+                        signature_content_exists = True
+                        break
+            if signature_content_exists:
+                break
+        
+        if signature_content_exists:
+            logger.debug("Signature page content already exists")
+            return
+        
+        # Add signature page content
+        # Calculate dates
+        period_end = self.config.period_end
+        report_date = period_end + timedelta(days=21)
+        report_date_str = report_date.strftime("%d %B %Y")
+        
+        # Standard signature page layout starting at row 83
+        signature_content = [
+            # Row 83: Title
+            (83, 1, "SIGNATURE PAGE"),
+            (83, 2, None),
+            # Row 85: QSP ESS B.V.
+            (85, 1, "For and on behalf of QSP ESS B.V."),
+            # Row 87-88: Name fields
+            (87, 1, "Name:"),
+            (87, 4, "_________________________________"),
+            (88, 1, "Title:"),
+            (88, 4, "_________________________________"),
+            (89, 1, "Date:"),
+            (89, 4, report_date_str),
+            # Row 91: Authorised Signatory
+            (91, 1, "Authorised Signatory"),
+            # Row 93-94: Second signer
+            (93, 1, "Name:"),
+            (93, 4, "_________________________________"),
+            (94, 1, "Title:"),
+            (94, 4, "_________________________________"),
+            (95, 1, "Date:"),
+            (95, 4, report_date_str),
+            # Row 97
+            (97, 1, "Authorised Signatory"),
+        ]
+        
+        for row, col, value in signature_content:
+            cell = sheet.cell(row=row, column=col)
+            cell.value = value
+            if row == 83:  # Title row
+                cell.font = Font(bold=True, size=14)
+            elif 'Name' in str(value) or 'Title' in str(value) or 'Date' in str(value):
+                cell.font = Font(bold=True)
+        
+        # Update print area to include signature page
+        if sheet.print_area:
+            import re
+            match = re.match(r".*\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", sheet.print_area)
+            if match:
+                start_col, start_row, end_col, _ = match.groups()
+                new_print_area = f"${start_col}${start_row}:${end_col}$99"
+                sheet.print_area = new_print_area
+                logger.debug(f"Extended print area to include signature page: {new_print_area}")
+        
+        logger.info("Added signature page content to SFA CC sheet")
+    
+    def _update_all_dates_and_text(self):
+        """
+        Update ALL dates and text references throughout the entire workbook.
+        
+        This ensures consistency across all sheets:
+        - SFA CC signature dates
+        - Interest Period references  
+        - Quarter text (Q2 2025 → Q3 2025)
+        - Date formats (21-7-2025 → 21-10-2025)
+        """
+        from datetime import timedelta
+        
+        period_end = self.config.period_end
+        report_date = period_end + timedelta(days=21)
+        
+        # Previous quarter info
+        prev_q = self.config.quarter - 1
+        prev_y = self.config.year
+        if prev_q == 0:
+            prev_q = 4
+            prev_y -= 1
+        
+        prev_month = prev_q * 3
+        prev_day = 31 if prev_month in [3, 12] else 30
+        
+        # Build comprehensive replacement map (sorted by length to prevent partial matches)
+        replacements = []
+        
+        # Quarter text patterns
+        replacements.extend([
+            (f"Q{prev_q} {prev_y}", self.config.quarter_str),
+            (f"Q{prev_q}-{prev_y}", f"Q{self.config.quarter}-{self.config.year}"),
+            (f"{str(prev_y)[-2:]}Q{prev_q}", self.config.short_quarter),
+        ])
+        
+        # Date patterns - multiple formats
+        # Dated field (report date, ~21 days after quarter)
+        prev_report_month = prev_month + 1 if prev_month < 12 else 1
+        prev_report_year = prev_y if prev_month < 12 else prev_y + 1
+        replacements.extend([
+            # Full dated field
+            (f"Dated 21-{prev_report_month}-{prev_report_year}",
+             f"Dated {report_date.day}-{report_date.month}-{report_date.year}"),
+            # Just the date
+            (f"21-{prev_report_month}-{prev_report_year}",
+             f"{report_date.day}-{report_date.month}-{report_date.year}"),
+        ])
+        
+        # Interest Period dates - US format mm/dd/yyyy
+        replacements.extend([
+            (f"Interest Period: {prev_month}/{prev_day}/{prev_y}",
+             f"Interest Period: {period_end.month}/{period_end.day}/{period_end.year}"),
+            (f"{prev_month}/{prev_day}/{prev_y}",
+             f"{period_end.month}/{period_end.day}/{period_end.year}"),
+        ])
+        
+        # Period end dates - EU format dd-mm-yyyy
+        replacements.extend([
+            (f"{prev_day}-{prev_month}-{prev_y}",
+             f"{period_end.day}-{period_end.month}-{period_end.year}"),
+        ])
+        
+        # Sort by length (longest first) to prevent partial matches
+        replacements.sort(key=lambda x: len(x[0]), reverse=True)
+        
+        total_updated = 0
+        
+        for sheet_name in self.workbook.sheetnames:
+            sheet = self.workbook[sheet_name]
+            sheet_updated = 0
+            
+            for row in range(1, min(sheet.max_row + 1, 200)):
+                for col in range(1, min(sheet.max_column + 1, 50)):
+                    cell = sheet.cell(row=row, column=col)
+                    
+                    if cell.value is None:
+                        continue
+                    
+                    # Only process string values (not formulas)
+                    if isinstance(cell.value, str) and not cell.value.startswith('='):
+                        original = cell.value
+                        new_value = original
+                        
+                        for old_pattern, new_pattern in replacements:
+                            if old_pattern in new_value:
+                                new_value = new_value.replace(old_pattern, new_pattern)
+                        
+                        if new_value != original:
+                            cell.value = new_value
+                            sheet_updated += 1
+            
+            if sheet_updated > 0:
+                logger.debug(f"Updated {sheet_updated} cells in sheet '{sheet_name}'")
+                total_updated += sheet_updated
+        
+        if total_updated > 0:
+            logger.info(f"Updated {total_updated} date/text references across all sheets")
     
     def _copy_column_formatting(self, sheet, source_col: int, target_col: int):
         """Copy column formatting from source to target."""
