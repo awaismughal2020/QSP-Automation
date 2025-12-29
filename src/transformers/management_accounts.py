@@ -4,7 +4,7 @@ Management Accounts Transformer
 Builds the Management Accounts Excel file by:
 1. Copying ALL data from the BDO file (Cijfers_QSP_) into a new sheet
 2. Inserting a new column in Management Cijfers before the LTM column
-3. Copying style and formula syntax from the previous quarter column
+3. Building formulas for the new column using formula templates (account code mapping)
 4. Updating formulas to reference the new BDO sheet with correct row numbers
 5. Ensuring Management Cijfers sheet is always at the end
 
@@ -12,14 +12,18 @@ WORKFLOW:
 - Copy all data from BDO file → Create new sheet "BDO - Q{quarter}-{YY}"
 - Build account code to row mapping from new BDO sheet
 - In Management Cijfers sheet, insert new column before LTM column
-- Copy column Z style/formulas to new column
-- Update formulas to reference new BDO sheet with validated row numbers
-- Update SUM formulas in shifted columns
+- Use formula templates to build formulas for new column (looking up account codes)
+- Update LTM column to reference new BDO sheet with column H
 - Move Management Cijfers sheet to be the last sheet
+
+KEY DESIGN:
+- Formula templates define which account codes each Management Cijfers row references
+- When building new column, look up account codes in the new BDO sheet to get correct row numbers
+- Only the NEW column gets updated formulas; existing columns remain unchanged
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 import openpyxl
 from openpyxl.utils import get_column_letter, column_index_from_string
@@ -41,6 +45,7 @@ class ManagementAccountsConfig:
     period_end: datetime
     bdo_sheet_name: str  # e.g., "BDO - Q3-25"
     summary_sheet_name: str  # e.g., "Management Cijfers - Q3 2025"
+    cash_proceeds_sale: float = 0.0  # Row 50: Cash proceeds from sales tracker
 
 
 class ManagementAccountsBuilder:
@@ -55,10 +60,16 @@ class ManagementAccountsBuilder:
     1. Copy ALL data from BDO file into new sheet named "BDO - Q{quarter}-{YY}"
     2. Build account code to row mapping from the new BDO sheet
     3. In Management Cijfers, insert new column before LTM column
-    4. Copy previous quarter column (Z) style/formulas to new column
-    5. Update formulas with correct BDO sheet name and validate row references
-    6. Update SUM formulas in shifted LTM column
-    7. Move Management Cijfers sheet to be last
+    4. Build formulas for new quarter column using formula templates
+    5. Build formulas for LTM column using same templates but with column H
+    6. Move Management Cijfers sheet to be last
+    
+    KEY DESIGN:
+    - Formula templates (config/formula_templates.yaml) define the account codes 
+      each Management Cijfers row should reference
+    - When adding a new column, we look up those account codes in the NEW BDO sheet
+      to get the correct row numbers
+    - Only the NEW column gets new formulas; existing columns remain unchanged
     """
     
     def __init__(self, previous_file_path: str, output_path: str, config: ManagementAccountsConfig,
@@ -75,14 +86,68 @@ class ManagementAccountsBuilder:
         self.expense_prefixes = []
         self._load_validation_config()
         
+        # Load formula templates
+        self.formula_templates_path = Path("config/formula_templates.yaml")
+        self.formula_templates = self._load_formula_templates()
+        self.balance_sheet_templates = self._load_balance_sheet_templates()
+        
         # Track the previous BDO sheet name for formula updates
         self._prev_bdo_sheet_name = None
         
         # Account code to row mapping in the NEW BDO sheet
         self._new_bdo_row_map = {}
         
+        # Label to row mapping in the NEW BDO sheet (for non-numeric account codes)
+        self._new_bdo_label_map = {}
+        
         # Account code to row mapping in the PREVIOUS BDO sheet (for row offset calculation)
         self._prev_bdo_row_map = {}
+    
+    def _load_formula_templates(self) -> Dict[int, Dict[str, Any]]:
+        """Load formula templates that define the account code mapping for each row."""
+        templates = {}
+        
+        if not self.formula_templates_path.exists():
+            logger.warning(f"Formula templates file not found: {self.formula_templates_path}")
+            return templates
+        
+        try:
+            with open(self.formula_templates_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            # Load P&L section templates
+            if 'profit_loss' in config:
+                for row_str, template in config['profit_loss'].items():
+                    if template:
+                        templates[int(row_str)] = template
+            
+            logger.info(f"Loaded {len(templates)} P&L formula templates from {self.formula_templates_path}")
+        except Exception as e:
+            logger.warning(f"Error loading formula templates: {e}")
+        
+        return templates
+    
+    def _load_balance_sheet_templates(self) -> Dict[int, Dict[str, Any]]:
+        """Load Balance Sheet formula templates."""
+        templates = {}
+        
+        if not self.formula_templates_path.exists():
+            return templates
+        
+        try:
+            with open(self.formula_templates_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            if 'balance_sheet' in config:
+                for row_str, template in config['balance_sheet'].items():
+                    if template:
+                        templates[int(row_str)] = template
+            
+            logger.info(f"Loaded {len(templates)} Balance Sheet formula templates")
+        except Exception as e:
+            logger.warning(f"Error loading Balance Sheet templates: {e}")
+        
+        return templates
     
     def _load_mappings(self) -> Dict[str, Tuple[List[str], str]]:
         """Load line item mappings from YAML config file."""
@@ -179,10 +244,10 @@ class ManagementAccountsBuilder:
         # Step 1: Copy ALL data from BDO file into new sheet
         self._copy_bdo_data_to_new_sheet(bdo_result)
         
-        # Step 2: Build row map from the NEW BDO sheet
+        # Step 2: Build row map from the NEW BDO sheet (including label map for special rows)
         new_bdo_sheet = self.workbook[self.config.bdo_sheet_name]
-        self._build_row_map(new_bdo_sheet, self._new_bdo_row_map)
-        logger.info(f"Built row map for new BDO sheet: {len(self._new_bdo_row_map)} accounts")
+        self._build_row_map(new_bdo_sheet, self._new_bdo_row_map, self._new_bdo_label_map)
+        logger.info(f"Built row map for new BDO sheet: {len(self._new_bdo_row_map)} accounts, {len(self._new_bdo_label_map)} labels")
         
         # Step 3: Update summary sheet - insert new column, copy style/formulas
         self._update_summary_sheet()
@@ -205,23 +270,42 @@ class ManagementAccountsBuilder:
         
         return self.output_path
     
-    def _build_row_map(self, sheet, row_map: dict):
+    def _build_row_map(self, sheet, row_map: dict, label_map: dict = None):
         """
         Build mapping of account codes to row numbers in a BDO sheet.
         This is critical for validating that formula row references are correct.
+        
+        Also builds a label map for non-numeric identifiers (like "SWAP").
         """
         row_map.clear()
+        if label_map is not None:
+            label_map.clear()
+        
         for row_idx in range(1, sheet.max_row + 1):
             code = sheet.cell(row=row_idx, column=1).value
+            label = sheet.cell(row=row_idx, column=2).value
+            
             if code and isinstance(code, (str, int, float)):
                 code_str = str(code).strip()
                 if code_str and code_str[0].isdigit():
                     row_map[code_str] = row_idx
+                elif code_str and label_map is not None:
+                    # Non-numeric code - store in label map
+                    label_map[code_str.lower()] = row_idx
+            
+            # Also map by label column (column B) for special rows like "SWAP"
+            if label and isinstance(label, str) and label_map is not None:
+                label_map[label.strip().lower()] = row_idx
     
     def _copy_bdo_data_to_new_sheet(self, bdo_result: BDOParseResult):
         """
-        Copy ALL data from the BDO file into a new sheet in Management Accounts.
-        The new sheet is inserted BEFORE the Management Cijfers sheet.
+        Create new BDO sheet by:
+        1. Cloning the previous BDO sheet (to preserve historical quarterly data)
+        2. Shifting columns: old D→C, E→D, F→E, G→F (dropping oldest quarter)
+        3. Updating column G with new quarter data from source Cijfers file
+        4. Updating column H to recalculate LTM sums
+        
+        This preserves the LTM calculation structure.
         """
         new_sheet_name = self.config.bdo_sheet_name
         
@@ -230,18 +314,31 @@ class ManagementAccountsBuilder:
             logger.warning(f"Sheet {new_sheet_name} already exists, will remove and recreate")
             del self.workbook[new_sheet_name]
         
-        # Get source data from the BDO file
-        if self.bdo_source_path and self.bdo_source_path.exists():
-            bdo_wb = openpyxl.load_workbook(self.bdo_source_path)
-            source_sheet = bdo_wb.active
-            logger.info(f"Copying from BDO file: {self.bdo_source_path}")
-        else:
+        # Load source Cijfers file for new quarter data
+        if not self.bdo_source_path or not self.bdo_source_path.exists():
             logger.warning("BDO source file not provided, will clone previous BDO sheet")
             self._clone_and_update_bdo_sheet(bdo_result)
             return
         
+        bdo_wb_values = openpyxl.load_workbook(self.bdo_source_path, data_only=True)
+        source_sheet = bdo_wb_values.active
+        logger.info(f"Loading new quarter data from: {self.bdo_source_path}")
+        
+        # Find the previous BDO sheet to clone
+        if not self._prev_bdo_sheet_name or self._prev_bdo_sheet_name not in self.workbook.sheetnames:
+            logger.warning("No previous BDO sheet found, copying directly from source")
+            bdo_wb_values.close()
+            self._copy_bdo_data_direct(bdo_result)
+            return
+        
+        # Load previous workbook with data_only=True to get calculated values
+        # The current self.workbook has formulas, but we need cached calculated values
+        prev_wb_values = openpyxl.load_workbook(str(self.previous_path), data_only=True)
+        prev_sheet_values = prev_wb_values[self._prev_bdo_sheet_name]
+        prev_sheet_formatting = self.workbook[self._prev_bdo_sheet_name]
+        
         # Find where to insert - before Management Cijfers sheet
-        insert_index = len(self.workbook.sheetnames)  # Default to end
+        insert_index = len(self.workbook.sheetnames)
         for i, name in enumerate(self.workbook.sheetnames):
             if 'Management Cijfers' in name or 'Cijfers' in name:
                 insert_index = i
@@ -250,39 +347,321 @@ class ManagementAccountsBuilder:
         # Create new sheet
         new_sheet = self.workbook.create_sheet(title=new_sheet_name, index=insert_index)
         
-        # Copy ALL cells including values, formulas, and formatting
-        for row in range(1, source_sheet.max_row + 1):
-            for col in range(1, source_sheet.max_column + 1):
-                source_cell = source_sheet.cell(row=row, column=col)
+        max_row = source_sheet.max_row
+        max_col = max(source_sheet.max_column, 8)
+        
+        # The source Cijfers file already contains:
+        # - Column A, B: Account codes and descriptions
+        # - Column C: Opening balance (for Balance Sheet) or None (for P&L)
+        # - Columns D, E, F: Historical quarterly data
+        # - Column G: Current quarter data
+        # - Column H: Calculated sum (C+D+E+F+G)
+        #
+        # We just need to copy all this directly and then append special rows from previous sheet
+        
+        # Copy all data from source file
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                source_val = source_sheet.cell(row=row, column=col).value
                 target_cell = new_sheet.cell(row=row, column=col)
-                
-                # Copy value (including formulas)
-                target_cell.value = source_cell.value
-                
-                # Copy formatting
-                if source_cell.has_style:
-                    target_cell.font = copy(source_cell.font)
-                    target_cell.alignment = copy(source_cell.alignment)
-                    target_cell.number_format = source_cell.number_format
-                    target_cell.border = copy(source_cell.border)
-                    target_cell.fill = copy(source_cell.fill)
+                target_cell.value = source_val
+        
+        # Copy formatting from previous sheet by matching account codes
+        prev_account_rows = {}
+        for row_idx in range(1, prev_sheet_values.max_row + 1):
+            code = prev_sheet_values.cell(row=row_idx, column=1).value
+            if code:
+                prev_account_rows[str(code).strip()] = row_idx
+        
+        for row in range(1, max_row + 1):
+            source_code = source_sheet.cell(row=row, column=1).value
+            source_code_str = str(source_code).strip() if source_code else None
+            prev_row = prev_account_rows.get(source_code_str) if source_code_str else None
+            
+            if prev_row:
+                for col in range(1, max_col + 1):
+                    prev_format_cell = prev_sheet_formatting.cell(row=prev_row, column=col)
+                    target_cell = new_sheet.cell(row=row, column=col)
+                    
+                    if prev_format_cell.has_style:
+                        target_cell.font = copy(prev_format_cell.font)
+                        target_cell.alignment = copy(prev_format_cell.alignment)
+                        target_cell.number_format = prev_format_cell.number_format
+                        target_cell.border = copy(prev_format_cell.border)
+                        target_cell.fill = copy(prev_format_cell.fill)
         
         # Copy column widths
-        for col_letter, dim in source_sheet.column_dimensions.items():
+        for col_letter, dim in prev_sheet_formatting.column_dimensions.items():
             new_sheet.column_dimensions[col_letter].width = dim.width
         
         # Copy row heights
-        for row_idx, dim in source_sheet.row_dimensions.items():
+        for row_idx, dim in prev_sheet_formatting.row_dimensions.items():
             new_sheet.row_dimensions[row_idx].height = dim.height
         
         # Copy merged cells
-        for merged_range in source_sheet.merged_cells.ranges:
+        for merged_range in prev_sheet_formatting.merged_cells.ranges:
             new_sheet.merge_cells(str(merged_range))
         
-        logger.info(f"Copied BDO data to new sheet: {new_sheet_name}")
-        logger.info(f"  Rows: {source_sheet.max_row}, Columns: {source_sheet.max_column}")
+        # Update column headers
+        new_sheet.cell(row=1, column=3).value = f"Eindbalans per {self._format_quarter_date(self.config.quarter, offset=-4)}"
+        new_sheet.cell(row=1, column=7).value = f"Mutaties {self.config.quarter}"
+        new_sheet.cell(row=1, column=8).value = f"Saldi per {self._format_quarter_date(self.config.quarter)}"
         
-        bdo_wb.close()
+        # Build account code to row map from source Cijfers file
+        source_account_map = {}
+        for row_idx in range(1, source_sheet.max_row + 1):
+            code = source_sheet.cell(row=row_idx, column=1).value
+            if code:
+                source_account_map[str(code)] = row_idx
+        
+        # Append special rows (SWAP, Afschrijving prepaid, IC interest) from previous sheet
+        # These are manual entries not in the Cijfers file but needed for LTM calculations
+        self._append_special_rows_from_previous(new_sheet, source_sheet.max_row)
+        
+        # Update special rows with calculated values from source accounts
+        self._update_special_rows(new_sheet, source_sheet, source_account_map)
+        
+        logger.info(f"Created new BDO sheet: {new_sheet_name}")
+        logger.info(f"  Cloned from: {self._prev_bdo_sheet_name}")
+        logger.info(f"  Updated column G with new quarter data from source file")
+        logger.info(f"  Recalculated column H (LTM sums)")
+        
+        bdo_wb_values.close()
+        prev_wb_values.close()
+    
+    def _format_quarter_date(self, quarter: str, offset: int = 0) -> str:
+        """Format a quarter string into a date string for column headers."""
+        import re
+        match = re.match(r'Q(\d)\s*(\d{4})', quarter)
+        if not match:
+            return quarter
+        
+        q_num, year = int(match.group(1)), int(match.group(2))
+        
+        # Apply offset (in quarters)
+        total_quarters = (year * 4 + q_num) + offset
+        new_year = (total_quarters - 1) // 4
+        new_q = ((total_quarters - 1) % 4) + 1
+        
+        # Quarter end dates
+        end_dates = {1: "31-03", 2: "30-06", 3: "30-09", 4: "31-12"}
+        return f"{end_dates[new_q]}-{new_year}"
+    
+    def _update_special_rows(self, new_sheet, source_sheet, source_account_map: dict):
+        """
+        Update special rows (SWAP, Afschrijving prepaid, IC interest, etc.) 
+        with calculated G column values from source account data.
+        Then recalculate H column (LTM sum).
+        """
+        # Define how to calculate each special row's G column
+        # Each entry: (label_pattern, calculation_function)
+        special_row_calcs = {
+            'rente': lambda src, acc_map: self._get_source_value(src, acc_map, ['4623001']),
+            'swap': lambda src, acc_map: self._get_source_value(src, acc_map, ['4643000']) + self._get_source_value(src, acc_map, ['1790000']),
+            'afschrijving swap': lambda src, acc_map: self._get_source_value(src, acc_map, ['1790000']) * -1 / 3,  # Quarterly portion
+            'afschrijving prepaid derivatives transaction': lambda src, acc_map: self._get_source_value(src, acc_map, ['1790000']) * -1,
+            'ic interest': lambda src, acc_map: self._get_source_value(src, acc_map, ['4663000']) + self._get_source_value(src, acc_map, ['4613000']),
+        }
+        
+        # Find and update special rows
+        for row_idx in range(1, new_sheet.max_row + 1):
+            label = new_sheet.cell(row=row_idx, column=1).value
+            if not label or not isinstance(label, str):
+                continue
+            
+            label_lower = label.strip().lower()
+            
+            for pattern, calc_func in special_row_calcs.items():
+                if label_lower == pattern or label_lower.startswith(pattern):
+                    try:
+                        g_value = calc_func(source_sheet, source_account_map)
+                        new_sheet.cell(row=row_idx, column=7).value = g_value
+                        
+                        # Recalculate H (LTM) as sum of D through G
+                        d_val = new_sheet.cell(row=row_idx, column=4).value or 0
+                        e_val = new_sheet.cell(row=row_idx, column=5).value or 0
+                        f_val = new_sheet.cell(row=row_idx, column=6).value or 0
+                        g_val = g_value or 0
+                        
+                        try:
+                            h_sum = float(d_val) + float(e_val) + float(f_val) + float(g_val)
+                            new_sheet.cell(row=row_idx, column=8).value = h_sum
+                        except (ValueError, TypeError):
+                            pass
+                        
+                        logger.debug(f"Updated special row {row_idx} ({label}): G={g_value}")
+                    except Exception as e:
+                        logger.warning(f"Error calculating special row {row_idx} ({label}): {e}")
+                    break
+    
+    def _get_source_value(self, source_sheet, account_map: dict, account_codes: list) -> float:
+        """Get sum of G column values for given account codes from source sheet."""
+        total = 0.0
+        for code in account_codes:
+            if code in account_map:
+                row_idx = account_map[code]
+                val = source_sheet.cell(row=row_idx, column=7).value
+                if val is not None:
+                    try:
+                        total += float(val)
+                    except (ValueError, TypeError):
+                        pass
+        return total
+    
+    def _copy_bdo_data_direct(self, bdo_result: BDOParseResult):
+        """
+        Fallback: Copy directly from BDO source file when no previous sheet exists.
+        """
+        new_sheet_name = self.config.bdo_sheet_name
+        
+        bdo_wb_values = openpyxl.load_workbook(self.bdo_source_path, data_only=True)
+        bdo_wb_formatting = openpyxl.load_workbook(self.bdo_source_path, data_only=False)
+        source_sheet_values = bdo_wb_values.active
+        source_sheet_formatting = bdo_wb_formatting.active
+        
+        insert_index = len(self.workbook.sheetnames)
+        for i, name in enumerate(self.workbook.sheetnames):
+            if 'Management Cijfers' in name or 'Cijfers' in name:
+                insert_index = i
+                break
+        
+        new_sheet = self.workbook.create_sheet(title=new_sheet_name, index=insert_index)
+        
+        max_row = source_sheet_values.max_row
+        max_col = source_sheet_values.max_column
+        
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                value_cell = source_sheet_values.cell(row=row, column=col)
+                format_cell = source_sheet_formatting.cell(row=row, column=col)
+                target_cell = new_sheet.cell(row=row, column=col)
+                
+                target_cell.value = value_cell.value
+                
+                if format_cell.has_style:
+                    target_cell.font = copy(format_cell.font)
+                    target_cell.alignment = copy(format_cell.alignment)
+                    target_cell.number_format = format_cell.number_format
+                    target_cell.border = copy(format_cell.border)
+                    target_cell.fill = copy(format_cell.fill)
+        
+        for col_letter, dim in source_sheet_formatting.column_dimensions.items():
+            new_sheet.column_dimensions[col_letter].width = dim.width
+        
+        for row_idx, dim in source_sheet_formatting.row_dimensions.items():
+            new_sheet.row_dimensions[row_idx].height = dim.height
+        
+        for merged_range in source_sheet_formatting.merged_cells.ranges:
+            new_sheet.merge_cells(str(merged_range))
+        
+        logger.info(f"Copied BDO data directly to new sheet: {new_sheet_name}")
+        
+        bdo_wb_values.close()
+        bdo_wb_formatting.close()
+    
+    def _append_special_rows_from_previous(self, target_sheet, start_row: int):
+        """
+        Append special manual rows (SWAP, prepaid derivatives, IC interest, etc.)
+        from the previous BDO sheet to the new sheet.
+        
+        These rows are not in the Cijfers file from BDO but are needed for
+        formula references in Management Cijfers.
+        
+        Column shifting: D→C (drop oldest), E→D, F→E, G→F, new G, recalc H
+        """
+        if not self._prev_bdo_sheet_name:
+            logger.warning("No previous BDO sheet to copy special rows from")
+            return
+        
+        # Load previous sheet with data_only=True to get calculated values
+        prev_wb_values = openpyxl.load_workbook(str(self.previous_path), data_only=True)
+        prev_sheet_values = prev_wb_values[self._prev_bdo_sheet_name]
+        prev_sheet_formatting = self.workbook[self._prev_bdo_sheet_name]
+        
+        # Special rows to copy: look for rows that start after the last numeric account code
+        # These are manual entries like SWAP, prepaid derivatives, etc.
+        # The order and blank rows matter to match the reference structure
+        special_rows_labels = [
+            'afschrijving swap',
+            'inkomsten swap',
+            None,  # Blank row in reference
+            'rente',
+            'swap',
+            'afschrijving prepaid derivatives transaction',
+            'ic interest'
+        ]
+        
+        # Find special rows in previous sheet, maintaining order from template
+        special_rows_map = {}
+        for row_idx in range(1, prev_sheet_values.max_row + 1):
+            col_a = prev_sheet_values.cell(row=row_idx, column=1).value
+            if col_a and isinstance(col_a, str):
+                col_a_lower = col_a.strip().lower()
+                if col_a_lower in special_rows_labels:
+                    special_rows_map[col_a_lower] = (row_idx, col_a)
+        
+        if not special_rows_map:
+            logger.info("No special rows found in previous BDO sheet to copy")
+            prev_wb_values.close()
+            return
+        
+        logger.info(f"Found {len(special_rows_map)} special rows in previous BDO sheet")
+        
+        # Add a blank row before special rows
+        target_row = start_row + 2
+        copied_count = 0
+        
+        # Copy special rows in the order specified (including blank rows)
+        for label_template in special_rows_labels:
+            if label_template is None:
+                # Insert blank row
+                target_row += 1
+                continue
+            
+            if label_template in special_rows_map:
+                prev_row_idx, label = special_rows_map[label_template]
+                
+                for col in range(1, prev_sheet_formatting.max_column + 1):
+                    target_cell = target_sheet.cell(row=target_row, column=col)
+                    
+                    if col <= 2:
+                        # Columns A and B: Copy label directly
+                        target_cell.value = prev_sheet_values.cell(row=prev_row_idx, column=col).value
+                    elif col == 3:
+                        # Column C: Gets old column D value (shift, drop oldest)
+                        target_cell.value = prev_sheet_values.cell(row=prev_row_idx, column=4).value
+                    elif col == 4:
+                        # Column D: Gets old column E value (shift)
+                        target_cell.value = prev_sheet_values.cell(row=prev_row_idx, column=5).value
+                    elif col == 5:
+                        # Column E: Gets old column F value (shift)
+                        target_cell.value = prev_sheet_values.cell(row=prev_row_idx, column=6).value
+                    elif col == 6:
+                        # Column F: Gets old column G value (shift)
+                        target_cell.value = prev_sheet_values.cell(row=prev_row_idx, column=7).value
+                    elif col == 7:
+                        # Column G: Will be updated by _update_special_rows()
+                        target_cell.value = None
+                    elif col == 8:
+                        # Column H: Will be recalculated after G is set
+                        target_cell.value = None
+                    else:
+                        target_cell.value = prev_sheet_values.cell(row=prev_row_idx, column=col).value
+                    
+                    # Copy formatting
+                    format_cell = prev_sheet_formatting.cell(row=prev_row_idx, column=col)
+                    if format_cell.has_style:
+                        target_cell.font = copy(format_cell.font)
+                        target_cell.alignment = copy(format_cell.alignment)
+                        target_cell.number_format = format_cell.number_format
+                        target_cell.border = copy(format_cell.border)
+                
+                logger.debug(f"Copied special row: {label} to row {target_row}")
+                target_row += 1
+                copied_count += 1
+        
+        prev_wb_values.close()
+        logger.info(f"Appended {copied_count} special rows to new BDO sheet (rows {start_row + 2}-{target_row - 1})")
     
     def _clone_and_update_bdo_sheet(self, bdo_result: BDOParseResult):
         """Fallback: Clone the previous BDO sheet and update with new data."""
@@ -381,9 +760,9 @@ class ManagementAccountsBuilder:
         
         Steps:
         1. Insert new column at LTM position (this shifts LTM to the right)
-        2. For P&L section: Copy from previous quarter column (Z) to new column
-        3. For Balance Sheet section: Copy from LTM column (now shifted right) to new column
-        4. Update all formulas to reference new BDO sheet with correct row numbers
+        2. For P&L section (row 22+): Build formulas from templates using account code lookup
+        3. For Balance Sheet section (rows 1-20): Copy from LTM column and update BDO refs
+        4. Build LTM formulas (same as quarter but with column H instead of G)
         5. Update column headers
         """
         # Find the summary sheet
@@ -412,7 +791,7 @@ class ManagementAccountsBuilder:
         if not ltm_col:
             ltm_col = self._find_last_data_column(summary_sheet) + 1
         
-        prev_quarter_col = ltm_col - 1  # Previous quarter column (for P&L section)
+        prev_quarter_col = ltm_col - 1  # Previous quarter column
         insert_position = ltm_col
         
         logger.info(f"LTM column: {get_column_letter(ltm_col)}, Previous quarter: {get_column_letter(prev_quarter_col)}")
@@ -424,53 +803,474 @@ class ManagementAccountsBuilder:
         new_quarter_col = insert_position  # The newly inserted blank column
         new_ltm_col = insert_position + 1  # Where old LTM data now is
         
-        logger.info(f"After insert: New quarter col={get_column_letter(new_quarter_col)}, LTM col={get_column_letter(new_ltm_col)}")
+        new_quarter_letter = get_column_letter(new_quarter_col)
+        new_ltm_letter = get_column_letter(new_ltm_col)
         
-        # Step 2: Populate the new quarter column with data
-        # For P&L rows (22+): Copy from previous quarter column (prev_quarter_col)
-        # For Balance Sheet rows (1-20): Copy from LTM column (new_ltm_col, which has the old LTM formulas)
+        logger.info(f"After insert: New quarter col={new_quarter_letter}, LTM col={new_ltm_letter}")
         
-        # First, copy Balance Sheet section from LTM (which has the data)
-        self._copy_section_formulas(summary_sheet, new_ltm_col, new_quarter_col, 
-                                     start_row=1, end_row=20, section_name="Balance Sheet")
+        # Step 2: Balance Sheet section (rows 1-20)
+        # In the Balance Sheet, only the LTM column has formulas - quarterly columns are empty
+        # The new quarter column should remain empty, we only update the LTM column
+        # Clear any data that might have been shifted into the new column
+        for row_idx in range(1, 21):
+            summary_sheet.cell(row=row_idx, column=new_quarter_col).value = None
         
-        # Then, copy P&L section from previous quarter column
-        self._copy_section_formulas(summary_sheet, prev_quarter_col, new_quarter_col, 
-                                     start_row=21, end_row=summary_sheet.max_row, section_name="P&L")
+        # Step 3: Build P&L formulas from templates (row 22 onwards)
+        # Pass previous column index to copy number formatting
+        self._build_pl_formulas_from_templates(summary_sheet, new_quarter_col, bdo_column='G',
+                                               prev_col_idx=prev_quarter_col)
         
-        # Step 3: Update formulas in the new quarter column to reference new BDO sheet
-        self._update_formulas_with_row_validation(summary_sheet, new_quarter_col)
+        # Step 4: Build LTM formulas (same structure but with column H)
+        self._build_pl_formulas_from_templates(summary_sheet, new_ltm_col, bdo_column='H',
+                                               prev_col_idx=new_quarter_col)
         
-        # Step 4: Update SUM formulas in the shifted LTM column
-        self._update_internal_sum_formulas(summary_sheet, new_ltm_col, new_quarter_col)
+        # Step 4b: Set manual values (Row 50 - Cash proceeds sale)
+        if self.config.cash_proceeds_sale:
+            cash_cell = summary_sheet.cell(row=50, column=new_quarter_col)
+            cash_cell.value = self.config.cash_proceeds_sale
+            # Copy number format from previous column
+            prev_cash_cell = summary_sheet.cell(row=50, column=prev_quarter_col)
+            if prev_cash_cell.number_format:
+                cash_cell.number_format = prev_cash_cell.number_format
+            logger.info(f"Set Row 50 (Cash proceeds sale) to {self.config.cash_proceeds_sale:,.0f}")
         
-        # Step 5: Update formulas in LTM column to reference new BDO sheet
-        self._update_formulas_with_row_validation(summary_sheet, new_ltm_col)
+        # Step 5: Build Balance Sheet formulas in LTM column
+        # Balance Sheet only exists in LTM column - build from templates
+        self._build_balance_sheet_formulas(summary_sheet, new_ltm_col, bdo_column='H')
         
-        # Step 6: Update headers
-        # Row 22: P&L header for new quarter column
+        # Step 6: Update headers and copy styling from previous columns
+        # Copy header styling from previous quarter column for new quarter (Row 22)
+        prev_header_cell = summary_sheet.cell(row=22, column=prev_quarter_col)
         header_cell = summary_sheet.cell(row=22, column=new_quarter_col)
         header_cell.value = self.config.quarter
-        header_cell.font = Font(bold=True)
-        header_cell.fill = PatternFill()  # Clear blue fill
+        # Copy ALL styling including fill (background color) from previous quarter header
+        if prev_header_cell.has_style:
+            header_cell.font = copy(prev_header_cell.font)
+            header_cell.alignment = copy(prev_header_cell.alignment)
+            header_cell.border = copy(prev_header_cell.border)
+            header_cell.fill = copy(prev_header_cell.fill)  # Copy background color
         
-        # Row 2: Balance sheet date header
-        date_cell = summary_sheet.cell(row=2, column=new_quarter_col)
-        date_cell.value = self.config.period_end
-        date_cell.number_format = 'YYYY-MM-DD'
-        date_cell.font = Font(bold=True)
+        # Row 2: Balance sheet date header - only in LTM column, quarter column stays empty
+        # The date cell in the new quarter column should remain None (cleared earlier)
+        # Update the LTM column with the current period end date
+        ltm_date_cell = summary_sheet.cell(row=2, column=new_ltm_col)
+        ltm_date_cell.value = self.config.period_end
+        # Copy styling from previous LTM date cell
+        prev_ltm_date_cell = summary_sheet.cell(row=2, column=new_quarter_col + 1) if new_quarter_col + 1 <= summary_sheet.max_column else None
+        if prev_ltm_date_cell and prev_ltm_date_cell.has_style:
+            ltm_date_cell.number_format = prev_ltm_date_cell.number_format or 'YYYY-MM-DD'
+            ltm_date_cell.font = copy(prev_ltm_date_cell.font)
+            ltm_date_cell.alignment = copy(prev_ltm_date_cell.alignment)
+            ltm_date_cell.border = copy(prev_ltm_date_cell.border)
+            ltm_date_cell.fill = copy(prev_ltm_date_cell.fill)
         
-        # LTM column headers (both row 2 and row 22)
+        # LTM column headers (row 22) - copy from previous LTM (which is now at new_ltm_col)
+        # The inserted column shifted the old LTM, so we copy its style
         blue_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
         ltm_header = summary_sheet.cell(row=22, column=new_ltm_col)
         ltm_header.value = f"LTM {self.config.quarter}"
-        ltm_header.font = Font(bold=True)
+        ltm_header.font = Font(bold=True, color="FFFFFF")  # White text on blue
         ltm_header.fill = blue_fill
+        ltm_header.alignment = copy(prev_header_cell.alignment) if prev_header_cell.has_style else None
+        
+        # Copy number formatting for all P&L rows from previous column
+        self._copy_number_formatting(summary_sheet, prev_quarter_col, new_quarter_col, 
+                                     start_row=22, end_row=summary_sheet.max_row)
+        self._copy_number_formatting(summary_sheet, new_quarter_col, new_ltm_col,
+                                     start_row=22, end_row=summary_sheet.max_row)
+        
+        # Step 7: Update LTM column SUM formulas to include new quarter column
+        # After inserting a column, SUM ranges shift but don't include the new column
+        self._update_ltm_sum_ranges(summary_sheet, new_ltm_col, new_quarter_col)
+        
+        # Step 8: Add new quarter column to column group (outline)
+        # The new column should be part of the group like previous quarters (outline_level=1)
+        # but remain visible (hidden=False)
+        new_col_letter = get_column_letter(new_quarter_col)
+        
+        # Add new quarter column to the group (outline_level=1, but visible)
+        summary_sheet.column_dimensions[new_col_letter].outlineLevel = 1
+        summary_sheet.column_dimensions[new_col_letter].hidden = False
+        logger.info(f"Added column {new_col_letter} to group (outline_level=1, hidden=False)")
         
         # Update title
         summary_sheet.cell(row=1, column=1).value = f"Management Accounts QSP ESS B.V. - {self.config.quarter}"
         
-        logger.info(f"Updated summary sheet columns: {get_column_letter(new_quarter_col)} and {get_column_letter(new_ltm_col)}")
+        logger.info(f"Updated summary sheet columns: {new_quarter_letter} and {new_ltm_letter}")
+    
+    def _copy_number_formatting(self, sheet, source_col: int, target_col: int, 
+                                 start_row: int, end_row: int):
+        """Copy number formatting from source column to target column for specified rows."""
+        for row_idx in range(start_row, end_row + 1):
+            source_cell = sheet.cell(row=row_idx, column=source_col)
+            target_cell = sheet.cell(row=row_idx, column=target_col)
+            
+            if source_cell.number_format and source_cell.number_format != 'General':
+                target_cell.number_format = source_cell.number_format
+    
+    def _update_ltm_sum_ranges(self, sheet, ltm_col: int, new_quarter_col: int):
+        """
+        Update SUM formulas in LTM column to include the new quarter column.
+        
+        After inserting a column, SUM ranges shift but don't extend to include
+        the new column. This method fixes that by updating ranges like:
+        =SUM(W50:Z50) -> =SUM(X50:AA50)
+        """
+        ltm_letter = get_column_letter(ltm_col)
+        new_q_letter = get_column_letter(new_quarter_col)
+        
+        updated_count = 0
+        for row_idx in range(1, sheet.max_row + 1):
+            cell = sheet.cell(row=row_idx, column=ltm_col)
+            
+            if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                formula = cell.value
+                
+                # Pattern to match SUM formulas like =SUM(W50:Z50)
+                # After insert, old range became shifted but excluded new column
+                # Need to update end column to include new quarter
+                
+                # Match SUM formulas that reference same row
+                pattern = rf'=SUM\(([A-Z]+){row_idx}:([A-Z]+){row_idx}\)'
+                match = re.match(pattern, formula)
+                
+                if match:
+                    start_col_letter = match.group(1)
+                    end_col_letter = match.group(2)
+                    
+                    start_col_idx = column_index_from_string(start_col_letter)
+                    end_col_idx = column_index_from_string(end_col_letter)
+                    
+                    # LTM should always be sum of 4 quarters
+                    # After insert: start should shift +1, end should be new quarter column
+                    # Example: =SUM(W50:Z50) should become =SUM(X50:AA50)
+                    
+                    # Only update if the range doesn't already include new quarter
+                    if end_col_idx < new_quarter_col:
+                        # Shift start by 1 to drop oldest quarter
+                        new_start = get_column_letter(start_col_idx + 1)
+                        new_formula = f"=SUM({new_start}{row_idx}:{new_q_letter}{row_idx})"
+                        cell.value = new_formula
+                        updated_count += 1
+        
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} LTM SUM formulas to include column {new_q_letter}")
+    
+    def _build_pl_formulas_from_templates(self, sheet, col_idx: int, bdo_column: str = 'G',
+                                          prev_col_idx: int = None):
+        """
+        Build P&L formulas for a column using formula templates.
+        
+        For each row defined in the templates:
+        - bdo_ref type: Look up account codes in BDO sheet, build formula with correct row numbers
+        - calc type: Replace {COL} placeholder with actual column letter
+        - manual type: Copy value from previous column (for Cash proceeds sale, etc.)
+        
+        Args:
+            sheet: The summary sheet
+            col_idx: Column index to write formulas to
+            bdo_column: BDO column to reference (G for quarter, H for LTM)
+            prev_col_idx: Previous column index (for copying manual values)
+        """
+        col_letter = get_column_letter(col_idx)
+        bdo_sheet_name = self.config.bdo_sheet_name
+        formulas_built = 0
+        
+        for row_idx, template in self.formula_templates.items():
+            formula_type = template.get('type', 'calc')
+            target_cell = sheet.cell(row=row_idx, column=col_idx)
+            
+            if formula_type == 'bdo_ref':
+                # Build formula from account codes
+                formula = self._build_bdo_ref_formula(template, bdo_sheet_name, bdo_column)
+                if formula:
+                    target_cell.value = formula
+                    formulas_built += 1
+                    
+            elif formula_type == 'bdo_ref_label':
+                # Build formula from label search
+                formula = self._build_bdo_ref_label_formula(template, bdo_sheet_name, bdo_column)
+                if formula:
+                    target_cell.value = formula
+                    formulas_built += 1
+            
+            elif formula_type == 'bdo_ref_conditional':
+                # Use different config for Q3 (column G) vs LTM (column H)
+                if bdo_column == 'G':
+                    sub_template = template.get('q_config', {})
+                else:
+                    sub_template = template.get('ltm_config', {})
+                
+                sub_type = sub_template.get('type', 'bdo_ref')
+                if sub_type == 'bdo_ref':
+                    formula = self._build_bdo_ref_formula(sub_template, bdo_sheet_name, bdo_column)
+                elif sub_type == 'bdo_ref_label':
+                    formula = self._build_bdo_ref_label_formula(sub_template, bdo_sheet_name, bdo_column)
+                else:
+                    formula = None
+                    
+                if formula:
+                    target_cell.value = formula
+                    formulas_built += 1
+                    
+            elif formula_type == 'calc':
+                # Replace {COL} with actual column letter
+                pattern = template.get('pattern', '')
+                formula = pattern.replace('{COL}', col_letter)
+                target_cell.value = formula
+                formulas_built += 1
+                
+            elif formula_type == 'manual':
+                # Manual entry - this value needs to be provided separately
+                # For now, don't set a value (will be handled by copy from source or external input)
+                pass
+            
+            elif formula_type == 'constant':
+                # Constant value (e.g., 0 for unused rows)
+                target_cell.value = template.get('value', 0)
+                formulas_built += 1
+            
+            # Copy number format from previous column to maintain formatting
+            if prev_col_idx:
+                prev_cell = sheet.cell(row=row_idx, column=prev_col_idx)
+                if prev_cell.number_format:
+                    target_cell.number_format = prev_cell.number_format
+        
+        logger.info(f"Built {formulas_built} P&L formulas for column {col_letter} (BDO col {bdo_column})")
+    
+    def _build_bdo_ref_formula(self, template: Dict[str, Any], bdo_sheet_name: str, 
+                                bdo_column: str) -> Optional[str]:
+        """
+        Build a formula that references BDO sheet cells by account codes.
+        
+        Example template:
+            account_codes: ["4100410", "4101010", "4101020"]
+            sign: "-"
+            operator: "-"
+        
+        Result: =-'BDO - Q3-25'!G91-'BDO - Q3-25'!G92-'BDO - Q3-25'!G93
+        """
+        account_codes = template.get('account_codes', [])
+        sign = template.get('sign', '-')
+        operator = template.get('operator', '-')
+        
+        if not account_codes:
+            return None
+        
+        refs = []
+        for code in account_codes:
+            row_num = self._new_bdo_row_map.get(code)
+            if row_num:
+                refs.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
+            else:
+                # Try to find by partial match or similar code
+                row_num = self._find_account_row(code)
+                if row_num:
+                    refs.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
+                else:
+                    logger.warning(f"Account code {code} not found in BDO sheet")
+        
+        if not refs:
+            return None
+        
+        # Build formula with sign and operator
+        if len(refs) == 1:
+            return f"={sign}{refs[0]}"
+        else:
+            return f"={sign}{operator.join(refs)}"
+    
+    def _build_bdo_ref_label_formula(self, template: Dict[str, Any], bdo_sheet_name: str,
+                                      bdo_column: str) -> Optional[str]:
+        """
+        Build a formula that references a BDO sheet cell by label search.
+        
+        Example template:
+            label_search: "SWAP"
+            sign: "-"
+        
+        Result: =-'BDO - Q3-25'!G133
+        
+        Searches in column A of the BDO sheet for exact or partial matches.
+        """
+        label_search = template.get('label_search', '')
+        sign = template.get('sign', '-')
+        
+        if not label_search:
+            return None
+        
+        label_search_lower = label_search.lower().strip()
+        
+        # First try exact match in label map
+        row_num = self._new_bdo_label_map.get(label_search_lower)
+        
+        if not row_num:
+            # Try exact match with the full text (case-insensitive)
+            for label, row in self._new_bdo_label_map.items():
+                if label == label_search_lower:
+                    row_num = row
+                    break
+        
+        if not row_num:
+            # Try partial match only if exact match not found
+            # Be careful with partial matches - "SWAP" shouldn't match "Swap fee"
+            # Only match if the label is at the start or is the complete text
+            for label, row in self._new_bdo_label_map.items():
+                # Match if label is exactly the search term (already checked above)
+                # or if search term is at the beginning followed by space or end
+                if label.startswith(label_search_lower + ' ') or label.startswith(label_search_lower + '\t'):
+                    row_num = row
+                    break
+        
+        if row_num:
+            return f"={sign}'{bdo_sheet_name}'!{bdo_column}{row_num}"
+        else:
+            logger.warning(f"Label '{label_search}' not found in BDO sheet")
+            return None
+    
+    def _find_account_row(self, account_code: str) -> Optional[int]:
+        """Find a row for an account code, trying partial matches if exact not found."""
+        # First try exact match
+        if account_code in self._new_bdo_row_map:
+            return self._new_bdo_row_map[account_code]
+        
+        # Try prefix match (e.g., "4100400" might be stored as "4100400.0")
+        for code, row in self._new_bdo_row_map.items():
+            if code.startswith(account_code) or account_code.startswith(code.split('.')[0]):
+                return row
+        
+        return None
+    
+    def _build_balance_sheet_formulas(self, sheet, col_idx: int, bdo_column: str = 'H'):
+        """
+        Build Balance Sheet formulas for the LTM column using templates.
+        
+        Balance Sheet section (rows 3-19) only has formulas in the LTM column.
+        Uses balance_sheet_templates to build formulas with correct BDO row references.
+        """
+        col_letter = get_column_letter(col_idx)
+        bdo_sheet_name = self.config.bdo_sheet_name
+        formulas_built = 0
+        
+        for row_idx, template in self.balance_sheet_templates.items():
+            formula_type = template.get('type', 'bdo_ref')
+            target_cell = sheet.cell(row=row_idx, column=col_idx)
+            
+            if formula_type == 'bdo_ref':
+                # Build formula from account codes
+                formula = self._build_balance_sheet_ref_formula(template, bdo_sheet_name, bdo_column)
+                if formula:
+                    target_cell.value = formula
+                    formulas_built += 1
+                    
+            elif formula_type == 'bdo_sum_range':
+                # Build SUM formula for a range of accounts
+                formula = self._build_balance_sheet_sum_formula(template, bdo_sheet_name, bdo_column)
+                if formula:
+                    target_cell.value = formula
+                    formulas_built += 1
+                    
+            elif formula_type == 'calc':
+                # Replace {COL} with actual column letter
+                pattern = template.get('pattern', '')
+                formula = pattern.replace('{COL}', col_letter)
+                target_cell.value = formula
+                formulas_built += 1
+        
+        logger.info(f"Built {formulas_built} Balance Sheet formulas in column {col_letter}")
+    
+    def _build_balance_sheet_ref_formula(self, template: Dict[str, Any], bdo_sheet_name: str,
+                                          bdo_column: str) -> Optional[str]:
+        """Build a Balance Sheet formula that references BDO cells by account codes."""
+        account_codes = template.get('account_codes', [])
+        sign = template.get('sign', '')
+        operator = template.get('operator', '+')
+        
+        if not account_codes:
+            return None
+        
+        refs = []
+        for code in account_codes:
+            row_num = self._find_account_row(code)
+            if row_num:
+                refs.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
+            else:
+                logger.debug(f"Balance Sheet: Account code {code} not found in BDO sheet")
+        
+        if not refs:
+            return None
+        
+        if len(refs) == 1:
+            return f"={sign}{refs[0]}"
+        else:
+            return f"={sign}{operator.join(refs)}"
+    
+    def _build_balance_sheet_sum_formula(self, template: Dict[str, Any], bdo_sheet_name: str,
+                                          bdo_column: str) -> Optional[str]:
+        """Build a Balance Sheet SUM formula for a range of accounts."""
+        start_account = template.get('start_account')
+        end_account = template.get('end_account')
+        count = template.get('count')  # Optional: number of rows in range
+        additional = template.get('additional', [])
+        
+        start_row = self._find_account_row(start_account) if start_account else None
+        
+        # Calculate end_row
+        if count and start_row:
+            # If count is specified, calculate end_row from start_row + count - 1
+            end_row = start_row + count - 1
+        elif end_account:
+            # Find end account row
+            end_row = self._find_account_row(end_account)
+        else:
+            end_row = None
+        
+        parts = []
+        
+        if start_row and end_row and end_row > start_row:
+            # Range with multiple cells
+            parts.append(f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row}:{bdo_column}{end_row})")
+        elif start_row and count == 1:
+            # Single cell SUM (for consistency with expected format)
+            parts.append(f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row})")
+        elif start_row:
+            parts.append(f"'{bdo_sheet_name}'!{bdo_column}{start_row}")
+        
+        # Add additional accounts
+        for code in additional:
+            row_num = self._find_account_row(code)
+            if row_num:
+                parts.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
+        
+        if not parts:
+            return None
+        
+        return "=" + "+".join(parts)
+    
+    def _update_balance_sheet_bdo_refs(self, sheet, col_idx: int, bdo_column: str = 'G'):
+        """
+        Update Balance Sheet section (rows 1-20) BDO references to point to new BDO sheet.
+        This preserves the existing formula structure but updates the sheet name.
+        """
+        bdo_sheet_name = self.config.bdo_sheet_name
+        updated_count = 0
+        
+        for row_idx in range(1, 21):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                old_formula = cell.value
+                if 'BDO' in old_formula:
+                    # Update BDO sheet name and column
+                    new_formula = re.sub(
+                        r"'BDO[^']+'\!([GH])(\d+)",
+                        lambda m: f"'{bdo_sheet_name}'!{bdo_column}{m.group(2)}",
+                        old_formula
+                    )
+                    if new_formula != old_formula:
+                        cell.value = new_formula
+                        updated_count += 1
+        
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} Balance Sheet BDO refs in column {get_column_letter(col_idx)}")
     
     def _copy_section_formulas(self, sheet, source_col: int, target_col: int, 
                                 start_row: int, end_row: int, section_name: str):

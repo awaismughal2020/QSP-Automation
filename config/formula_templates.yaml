@@ -1,0 +1,419 @@
+# Formula Templates for Management Cijfers
+#
+# This file maps Management Cijfers row numbers to their formula definitions.
+# 
+# Formula types:
+# 1. bdo_ref: References BDO sheet cells by account code
+#    - account_codes: List of account codes to look up in BDO sheet
+#    - sign: Sign prefix (- for negation, + for positive, or empty)
+#    - operator: How to combine multiple accounts (+ for addition, - for subtraction)
+#
+# 2. bdo_sum_range: SUM of a range of BDO rows (for rows with multiple accounts)
+#    - start_account: First account code in range
+#    - end_account: Last account code in range
+#    - additional: Optional additional account codes to add
+#
+# 3. calc: Internal calculation formula (SUM, etc.)
+#    - pattern: Formula pattern with {COL} placeholder for current column
+#
+# 4. constant: Fixed value (e.g., 0)
+#    - value: The constant value
+#
+# When generating a new quarterly column:
+# - For bdo_ref formulas: Look up each account code's row in the new BDO sheet,
+#   build the formula with correct row numbers
+# - For calc formulas: Replace {COL} with the actual column letter
+
+# Balance Sheet Section (rows 3-19)
+# NOTE: Balance Sheet formulas only exist in the LTM column (column H references)
+balance_sheet:
+  3:
+    label: "Deferred Tax Asset"
+    type: bdo_ref
+    account_codes: ["1790002"]
+    sign: ""
+    operator: "+"
+    
+  4:
+    label: "Real estate"
+    type: bdo_sum_range
+    start_account: "1600000"
+    end_account: "1610803"
+    count: 5
+    
+  5:
+    label: "Financial fixed assets"
+    type: bdo_ref
+    account_codes: ["1760000", "1760300", "1790000"]
+    sign: ""
+    operator: "+"
+    
+  6:
+    label: "Accounts receivable"
+    type: bdo_ref
+    account_codes: ["2000000", "2000300", "2040100"]
+    sign: ""
+    operator: "+"
+    
+  7:
+    label: "Service costs to be settled"
+    type: bdo_sum_range
+    start_account: "2502020"
+    end_account: "2502024"
+    count: 6
+    additional: ["2742000", "2741000", "2741001"]
+    
+  8:
+    label: "Prepaid expenses"
+    type: bdo_sum_range
+    start_account: "2040200"
+    end_account: "2040900"
+    count: 3
+    additional: ["2300001", "2040601"]
+    
+  9:
+    label: "Cash"
+    type: bdo_sum_range
+    start_account: "2400200"
+    end_account: "2400206"
+    count: 7
+    
+  10:
+    label: "Equity"
+    type: bdo_sum_range
+    start_account: "1000002"
+    end_account: "1160000"
+    count: 3
+    
+  11:
+    label: "AC Shareholder"
+    type: bdo_ref
+    account_codes: ["2000100"]
+    sign: ""
+    operator: "+"
+    
+  12:
+    label: "Bank loan"
+    type: bdo_ref
+    account_codes: ["1930001", "1930101"]
+    sign: ""
+    operator: "+"
+    
+  13:
+    label: "Amortised fee"
+    type: bdo_sum_range
+    start_account: "1930200"
+    count: 1
+    
+  14:
+    label: "Accounts payable"
+    type: bdo_ref
+    account_codes: ["2730000", "2740500", "2741004", "2741200", "2300000"]
+    sign: ""
+    operator: "+"
+    
+  15:
+    label: "Current account"
+    type: bdo_sum_range
+    start_account: "2730001"
+    end_account: "2650001"
+    count: 6
+    
+  16:
+    label: "VAT payable"
+    type: bdo_ref
+    account_codes: ["2512100"]
+    sign: ""
+    operator: "+"
+    
+  17:
+    label: "Deposits"
+    type: bdo_ref
+    account_codes: ["2740300"]
+    sign: ""
+    operator: "+"
+    
+  18:
+    label: "Rent Invoiced in advance"
+    type: bdo_ref
+    account_codes: ["2740100"]
+    sign: ""
+    operator: "+"
+    
+  19:
+    label: "Total (Equity Movement)"
+    type: calc
+    pattern: "=SUM({COL}3:{COL}18)"
+
+# P&L Section (rows 22-68)
+profit_loss:
+  # Header row is 22, data starts at 23
+  
+  # Revenue section
+  23:
+    label: "Gross Theoretical rental income"
+    type: bdo_ref
+    account_codes: ["8000003"]
+    sign: "-"
+    column: G
+    
+  24:
+    label: "(Financial vacancy)"
+    type: bdo_ref
+    account_codes: ["8000004"]
+    sign: "-"
+    column: G
+    
+  25:
+    label: "Gross rental income"
+    type: calc
+    pattern: "=SUM({COL}23:{COL}24)"
+    
+  26:
+    label: "Vacancy %"
+    type: calc
+    pattern: "={COL}25/{COL}23-1"
+    
+  # Service costs section
+  27:
+    label: "Service costs charged (100% occupancy)"
+    type: bdo_ref
+    account_codes: ["8400600"]
+    sign: "-"
+    column: G
+    
+  28:
+    label: "(Vacancy costs)"
+    type: bdo_ref
+    account_codes: ["8400700"]
+    sign: "-"
+    column: G
+    
+  29:
+    label: "(Service costs)"
+    type: bdo_ref
+    account_codes: ["8400800"]
+    sign: "-"
+    column: G
+    
+  30:
+    label: "Service charges"
+    type: calc
+    pattern: "=SUM({COL}27:{COL}29)"
+    
+  # Property related expenses
+  32:
+    label: "(Maintenance & repair costs actual)"
+    type: bdo_ref
+    account_codes: ["4100400"]
+    sign: "-"
+    column: G
+    
+  33:
+    label: "(Owners society costs (VVE))"
+    type: bdo_ref
+    account_codes: ["4101000"]
+    sign: "-"
+    column: G
+    
+  34:
+    label: "(Insurance costs)"
+    type: bdo_ref
+    account_codes: ["4310400"]
+    sign: "-"
+    column: G
+    
+  35:
+    label: "(Landlord tax costs)"
+    type: constant
+    value: 0
+    
+  36:
+    label: "(Property tax)"
+    type: bdo_ref
+    account_codes: ["4100900"]
+    sign: "-"
+    column: G
+    
+  37:
+    label: "(Water collection, sewerage costs)"
+    type: bdo_ref
+    account_codes: ["4100410", "4101010", "4101020"]
+    sign: "-"
+    column: G
+    operator: "-"
+    
+  38:
+    label: "(Agent costs)"
+    type: bdo_ref
+    account_codes: ["4312600"]
+    sign: "-"
+    column: G
+    
+  39:
+    label: "(Brokerage costs)"
+    type: bdo_ref
+    account_codes: ["4310800"]
+    sign: "-"
+    column: G
+    
+  40:
+    label: "(Other costs)"
+    type: bdo_ref
+    account_codes: ["4501200", "4501300", "4300200", "4300500", "4310700", "4311000", "4311900", "4319800", "4101300"]
+    sign: "-"
+    column: G
+    operator: "-"
+    
+  41:
+    label: "(Accountant costs)"
+    type: bdo_ref
+    account_codes: ["4310600"]
+    sign: "-"
+    column: G
+    
+  42:
+    label: "(Advisory costs)"
+    type: bdo_ref
+    account_codes: ["4311800"]
+    sign: "-"
+    column: G
+    
+  43:
+    label: "(Intercompany costs)"
+    type: constant
+    value: 0
+    
+  44:
+    label: "Property related expenses"
+    type: calc
+    pattern: "=SUM({COL}32:{COL}43)"
+    
+  45:
+    label: "Net rental income"
+    type: calc
+    pattern: "={COL}25+{COL}30+{COL}44"
+    
+  # Management fees
+  46:
+    label: "(Management fees)"
+    type: bdo_ref
+    account_codes: ["4051400"]
+    sign: "-"
+    column: G
+    
+  47:
+    label: "(Management fee Shareholder)"
+    type: bdo_ref
+    account_codes: ["4310500"]
+    sign: "-"
+    column: G
+    
+  48:
+    label: "EBITDA rental operation"
+    type: calc
+    pattern: "={COL}47+{COL}46+{COL}45"
+    
+  # Sales section
+  50:
+    label: "Cash proceeds sale"
+    type: manual
+    # This is manually entered, not a formula
+    
+  51:
+    label: "(Cost of sales)"
+    type: calc
+    pattern: "=-({COL}50-{COL}53)"
+    
+  53:
+    label: "EBITDA from Sales"
+    type: bdo_ref
+    account_codes: ["4730200"]
+    sign: "-"
+    column: G
+    
+  55:
+    label: "Total EBITDA"
+    type: calc
+    pattern: "={COL}53+{COL}48"
+    
+  56:
+    label: "(Depreciation)"
+    type: bdo_ref
+    account_codes: ["4730000"]
+    sign: "-"
+    column: G
+    
+  57:
+    label: "EBIT"
+    type: calc
+    pattern: "={COL}56+{COL}55"
+    
+  # Interest and tax section
+  60:
+    label: "(Net interest expenses - SFA)"
+    type: bdo_ref
+    account_codes: ["4611000", "4613000", "4620200", "4623001", "4642000"]
+    sign: "-"
+    column: G
+    operator: "-"
+    
+  61:
+    label: "(Prepaid derivatives transaction- SFA)"
+    # Q3: Uses account 1790000 (Swap fee)
+    # LTM: Uses special row "Afschrijving prepaid derivatives transaction"
+    type: bdo_ref_conditional
+    q_config:
+      type: bdo_ref
+      account_codes: ["1790000"]
+      sign: ""
+    ltm_config:
+      type: bdo_ref_label
+      label_search: "Afschrijving prepaid derivatives transaction"
+      sign: "-"
+    
+  64:
+    label: "(Net interest expenses - Hedge)"
+    # Q3: SWAP = 4643000 + 1790000
+    # LTM: Uses special row "SWAP"
+    type: bdo_ref_conditional
+    q_config:
+      type: bdo_ref
+      account_codes: ["4643000", "1790000"]
+      sign: "-"
+      operator: "-"
+    ltm_config:
+      type: bdo_ref_label
+      label_search: "SWAP"
+      sign: "-"
+    
+  65:
+    label: "(Net interest income - DMRRP INV I)"
+    type: bdo_ref
+    account_codes: ["4663000"]
+    sign: "-"
+    column: G
+    
+  66:
+    label: "EBT"
+    type: calc
+    pattern: "=SUM({COL}57:{COL}65)"
+    
+  67:
+    label: "(Delta DTA & CIT)"
+    type: bdo_ref
+    account_codes: ["9500000", "9510000"]
+    sign: "-"
+    column: G
+    operator: "-"
+    
+  68:
+    label: "Direct result"
+    type: calc
+    pattern: "={COL}67+{COL}66"
+
+# LTM column uses same formulas but with column H instead of G
+# The LTM formulas should reference the current quarter's BDO sheet with column H
+ltm_column: H
+quarter_column: G
+
