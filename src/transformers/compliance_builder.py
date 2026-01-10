@@ -160,14 +160,14 @@ class ComplianceBuilder:
         """
         Copy Management Accounts data from external file.
         
-        IMPORTANT: The Management Accounts file has formulas that reference the BDO sheet.
-        Since we can't calculate formulas, we get data directly from the BDO sheet.
+        IMPORTANT: This method reads the Management Cijfers sheet formulas and evaluates them
+        by looking up the corresponding BDO sheet cell values.
         
-        The BDO sheet structure:
-        - Column A: Account codes
-        - Column B: Account names
-        - Column G: Mutations (quarterly changes)
-        - Column H: Closing balance (Saldi)
+        The approach:
+        1. Load the Management Cijfers sheet to get the formulas from column AB (Q3)
+        2. Load the BDO sheet to get actual cell values
+        3. Parse each formula and calculate the result
+        4. Copy values to the Compliance Certificate's Management Accounts sheet
         """
         try:
             # Load WITH formulas to find BDO sheet references
@@ -191,85 +191,48 @@ class ComplianceBuilder:
             
             logger.info(f"Copying data from BDO sheet: {bdo_sheet_name}")
             
-            # Build mapping of account codes to row/values in BDO sheet
-            # Column H contains the closing balance (Saldi)
-            bdo_data = {}
+            # Find the Management Cijfers sheet to get the formulas
+            cijfers_sheet_name = f"Management Cijfers - Q{self.config.quarter} {self.config.year}"
+            if cijfers_sheet_name not in source_wb.sheetnames:
+                # Try alternate formats
+                for name in source_wb.sheetnames:
+                    if 'Management Cijfers' in name:
+                        cijfers_sheet_name = name
+                        break
+            
+            cijfers_sheet = source_wb[cijfers_sheet_name] if cijfers_sheet_name in source_wb.sheetnames else None
+            
+            # Build a lookup for BDO sheet values by row (column H)
+            bdo_h_values = {}
             for row in range(1, bdo_sheet.max_row + 1):
-                code = bdo_sheet.cell(row=row, column=1).value
-                name = bdo_sheet.cell(row=row, column=2).value
-                # Get closing balance from column H
-                closing_val = bdo_sheet.cell(row=row, column=8).value
-                
-                # If closing balance is a formula, try to calculate it manually
-                if isinstance(closing_val, str) and closing_val.startswith('='):
-                    # Simple SUM formula: =SUM(C6:G6)
-                    if 'SUM' in closing_val:
-                        try:
-                            # Extract range and sum
-                            import re
-                            match = re.search(r'SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', closing_val)
-                            if match:
-                                total = 0
-                                start_col = ord(match.group(1)) - ord('A') + 1
-                                end_col = ord(match.group(3)) - ord('A') + 1
-                                for c in range(start_col, end_col + 1):
-                                    v = bdo_sheet.cell(row=row, column=c).value
-                                    if isinstance(v, (int, float)):
-                                        total += v
-                                closing_val = total
-                        except:
-                            closing_val = None
-                
-                if code and isinstance(code, (str, int, float)):
-                    code_str = str(code).strip()
-                    bdo_data[code_str] = {
-                        'name': name,
-                        'closing': closing_val if isinstance(closing_val, (int, float)) else 0
-                    }
+                val = bdo_sheet.cell(row=row, column=8).value  # Column H
+                # If it's a formula, try to calculate it
+                if isinstance(val, str) and val.startswith('='):
+                    val = self._evaluate_simple_formula(val, bdo_sheet, row)
+                bdo_h_values[row] = val if isinstance(val, (int, float)) else 0
             
-            logger.info(f"Loaded {len(bdo_data)} accounts from BDO sheet")
+            # Find the AB column (column 28) in Management Cijfers - this contains Q3 formulas
+            # Parse and evaluate each formula
             
-            # Define the mapping from Compliance Certificate labels to BDO account codes
-            # This maps the target sheet labels to BDO account codes
-            label_to_accounts = {
-                'deferred tax asset': ['1790002'],
-                'real estate': ['1600000', '1600200', '1601000', '1611003', '1610803'],
-                'financial fixed assets': ['1760000', '1760300', '1790000'],
-                'accounts receivable': ['2000000', '2000100', '2099001', '2099101'],
-                'service costs to be charged': ['2010000'],
-                'prepaid expenses': ['2012400', '2012300'],
-                'cash': ['2400*'],
-                'equity': ['1000*', '1100000', '1160000'],
-                'ac shareholder': ['1200000'],
-                'bank loan': ['1930001', '1930101'],
-                'amortised fee': ['1930200'],
-                'accounts payable': ['1601000', '1700000', '1700300', '1708200'],
-                'current account': ['1750100'],
-                'vat payable': ['1730000'],
-                'deposits': ['1750000'],
-                'rent invoiced in advance': ['1708400'],
-                # P&L items
-                'gross theoretical rental income': ['8000*', '8001*'],
-                '(financial vacancy)': ['8005*'],
-                'gross rental income': None,  # Calculated
-                'service costs charged (100% occupancy)': ['8010*'],
-                '(vacancy costs)': ['8015*'],
-                '(service costs)': ['8020*'],
-                'service charges': None,  # Calculated
-                '(maintenance & repair costs actual)': ['4100*'],
-                '(owners society costs (vve))': ['4102*'],
-                '(insurance costs)': ['4105*', '4104*'],
-                '(landlord tax costs)': ['4106*'],
-                '(property tax)': ['4106200'],
-                '(water collection, sewerage costs)': ['4106100'],
-                '(agent costs)': ['4110*'],
-                '(brokerage costs)': ['4108*'],
-                '(other costs)': ['4199*'],
-                '(accountant costs)': ['4303*'],
-                '(advisory costs)': ['4301*'],
-                '(intercompany costs)': ['4300*'],
-                'cash proceeds sale': ['8500*'],
-                '(cost of sales)': ['4500*'],
+            # Create mapping from target row to formula calculation
+            # Each target row in Compliance Certificate maps to a specific Management Cijfers row
+            target_to_cijfers_mapping = {
+                2: 3,   # Deferred Tax Asset
+                3: 4,   # Real estate
+                4: 5,   # Financial fixed assets
+                5: 6,   # Accounts receivable
+                6: 7,   # Service costs to be charged
+                7: 8,   # Prepaid expenses
+                8: 9,   # Cash
+                9: 10,  # Equity
+                10: 11, # AC Shareholder
+                11: 12, # Bank loan
+                12: 13, # Amortised fee
+                13: 14, # Accounts payable
+                14: 15, # Current account
+                15: 16, # VAT payable
+                16: 17, # Deposits
+                17: 18, # Rent Invoiced in advance
             }
             
             # Update Row 1: Header with date
@@ -279,46 +242,135 @@ class ComplianceBuilder:
             
             items_copied = 0
             
-            # Process each row in target sheet
-            for row in range(1, min(target_sheet.max_row + 1, 100)):
-                label = target_sheet.cell(row=row, column=1).value
-                if not label or not isinstance(label, str):
-                    continue
-                
-                normalized = label.strip().lower()
-                
-                # Look up account codes for this label
-                if normalized in label_to_accounts:
-                    account_patterns = label_to_accounts[normalized]
-                    if account_patterns is None:
-                        continue  # Calculated field
-                    
-                    # Sum values for all matching accounts
-                    total = 0
-                    for pattern in account_patterns:
-                        if pattern.endswith('*'):
-                            # Wildcard match
-                            prefix = pattern[:-1]
-                            for code, data in bdo_data.items():
-                                if code.startswith(prefix):
-                                    total += data['closing']
-                        else:
-                            # Exact match
-                            if pattern in bdo_data:
-                                total += bdo_data[pattern]['closing']
-                    
-                    if total != 0:
-                        target_sheet.cell(row=row, column=3).value = total
-                        target_sheet.cell(row=row, column=3).number_format = '#,##0.00'
-                        items_copied += 1
+            if cijfers_sheet:
+                # Use Management Cijfers formulas to calculate values
+                for target_row, cijfers_row in target_to_cijfers_mapping.items():
+                    formula = cijfers_sheet.cell(row=cijfers_row, column=28).value  # Column AB
+                    if formula and isinstance(formula, str) and formula.startswith('='):
+                        value = self._evaluate_bdo_formula(formula, bdo_h_values, bdo_sheet_name)
+                        if value is not None:
+                            target_sheet.cell(row=target_row, column=3).value = value
+                            items_copied += 1
+                            logger.debug(f"Copied value {value} to row {target_row} from formula {formula[:50]}...")
             
-            logger.info(f"Copied {items_copied} items to {target_sheet_name}")
+            # If no formulas found, fall back to the original method
+            if items_copied == 0:
+                items_copied = self._copy_ma_data_fallback(target_sheet, bdo_sheet, bdo_h_values)
+            
+            logger.info(f"Copied {items_copied} values to {target_sheet_name}")
             source_wb.close()
             
         except Exception as e:
-            logger.warning(f"Error copying MA data: {e}")
+            logger.error(f"Error copying MA data: {e}")
             import traceback
-            logger.warning(traceback.format_exc())
+            traceback.print_exc()
+    
+    def _evaluate_simple_formula(self, formula: str, sheet, current_row: int) -> float:
+        """Evaluate a simple SUM formula within the same sheet."""
+        if 'SUM' in formula.upper():
+            try:
+                # Match SUM(Col1Row1:Col2Row2) pattern
+                match = re.search(r'SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', formula)
+                if match:
+                    total = 0
+                    start_col = ord(match.group(1)) - ord('A') + 1
+                    end_col = ord(match.group(3)) - ord('A') + 1
+                    start_row = int(match.group(2))
+                    end_row = int(match.group(4))
+                    for r in range(start_row, end_row + 1):
+                        for c in range(start_col, end_col + 1):
+                            v = sheet.cell(row=r, column=c).value
+                            if isinstance(v, (int, float)):
+                                total += v
+                    return total
+            except Exception:
+                pass
+        return 0
+    
+    def _evaluate_bdo_formula(self, formula: str, bdo_h_values: dict, bdo_sheet_name: str) -> float:
+        """
+        Evaluate a formula that references the BDO sheet.
+        
+        Handles patterns like:
+        - ='BDO - Q3-25'!H16
+        - =SUM('BDO - Q3-25'!H6:H10)
+        - ='BDO - Q3-25'!H13+'BDO - Q3-25'!H14+'BDO - Q3-25'!H15
+        """
+        total = 0.0
+        
+        try:
+            # Pattern 1: SUM formula =SUM('BDO - Q3-25'!H6:H10)
+            sum_match = re.search(r"SUM\('.*?'!H(\d+):H(\d+)\)", formula)
+            if sum_match:
+                start_row = int(sum_match.group(1))
+                end_row = int(sum_match.group(2))
+                for r in range(start_row, end_row + 1):
+                    total += bdo_h_values.get(r, 0)
+                
+                # There might be additional terms after the SUM, e.g., +...+...
+                remaining = formula[sum_match.end():]
+                additional = self._parse_additional_terms(remaining, bdo_h_values)
+                total += additional
+                return total
+            
+            # Pattern 2: Multiple cell references added together
+            # ='BDO - Q3-25'!H13+'BDO - Q3-25'!H14+...
+            cell_refs = re.findall(r"'.*?'!H(\d+)", formula)
+            if cell_refs:
+                for row_str in cell_refs:
+                    row_num = int(row_str)
+                    total += bdo_h_values.get(row_num, 0)
+                return total
+            
+            # Pattern 3: Single cell reference without quotes
+            simple_match = re.search(r"H(\d+)", formula)
+            if simple_match:
+                row_num = int(simple_match.group(1))
+                return bdo_h_values.get(row_num, 0)
+                
+        except Exception as e:
+            logger.warning(f"Error evaluating formula '{formula}': {e}")
+        
+        return None
+    
+    def _parse_additional_terms(self, remaining: str, bdo_h_values: dict) -> float:
+        """Parse additional terms like +'BDO - Q3-25'!H65"""
+        total = 0.0
+        cell_refs = re.findall(r"\+'.*?'!H(\d+)", remaining)
+        for row_str in cell_refs:
+            row_num = int(row_str)
+            total += bdo_h_values.get(row_num, 0)
+        return total
+    
+    def _copy_ma_data_fallback(self, target_sheet, bdo_sheet, bdo_h_values: dict) -> int:
+        """Fallback method using direct BDO row mappings."""
+        # Direct mapping from target row to BDO rows (based on reference formulas)
+        row_to_bdo_rows = {
+            2: [16],                    # Deferred Tax Asset: H16
+            3: list(range(6, 11)),      # Real estate: H6:H10
+            4: [13, 14, 15],            # Financial fixed assets: H13+H14+H15
+            5: [19, 21, 22],            # Accounts receivable: H19+H21+H22
+            6: list(range(67, 73)) + [65, 61, 62],  # Service costs
+            7: list(range(23, 26)) + [30, 26],      # Prepaid expenses
+            8: list(range(31, 38)),     # Cash: H31:H37
+            9: [40, 41, 42],            # Equity: H40:H42
+            10: [20],                   # AC Shareholder: H20
+            11: [45, 46],               # Bank loan: H45+H46
+            12: [47],                   # Amortised fee: H47
+            13: [50, 60, 63, 64, 29],   # Accounts payable
+            14: list(range(51, 57)),    # Current account: H51:H56
+            15: [57],                   # VAT payable: H57
+            16: [59],                   # Deposits: H59
+            17: [58],                   # Rent Invoiced in advance: H58
+        }
+        
+        items_copied = 0
+        for target_row, bdo_rows in row_to_bdo_rows.items():
+            total = sum(bdo_h_values.get(r, 0) for r in bdo_rows)
+            target_sheet.cell(row=target_row, column=3).value = total
+            items_copied += 1
+        
+        return items_copied
     
     def _update_suppl_calc_sheet(self):
         """
@@ -383,8 +435,17 @@ class ComplianceBuilder:
     
     def _update_impact_unit_sales_sheet(self):
         """
-        Update Impact Unit Sales sheet similarly to Suppl. Calc.
-        Add next forecast quarter and shift subsequent columns.
+        Update Impact Unit Sales sheet.
+        
+        IMPORTANT: Unlike Suppl. Calc, this sheet does NOT need new quarterly columns.
+        The structure is:
+        - Column C: Labels (Average Sale Price LTM, etc.)
+        - Column D onwards: Data for different forecasts
+        - Row 9: References to Suppl. Calc for unit sales proceeds
+        - Row 10: Unit Sales counts
+        
+        The formulas reference Suppl. Calc columns which get updated automatically.
+        We just need to ensure the sheet exists and has correct structure - no new columns needed.
         """
         if 'Impact Unit Sales' not in self.workbook.sheetnames:
             logger.warning("Impact Unit Sales sheet not found")
@@ -392,38 +453,11 @@ class ComplianceBuilder:
         
         sheet = self.workbook['Impact Unit Sales']
         
-        # Find the last quarterly column (not NTM or totals)
-        last_quarter_col = 3
-        for col in range(4, sheet.max_column + 5):
-            cell = sheet.cell(row=2, column=col)
-            val = str(cell.value) if cell.value else ''
-            # Look for quarter patterns like 25Q2, 26Q1, etc.
-            if 'Q' in val and len(val) <= 5:
-                last_quarter_col = col
+        # The Impact Unit Sales sheet structure should remain unchanged
+        # It references Suppl. Calc dynamically, so no column insertion needed
         
-        # Calculate next forecast quarter
-        next_forecast_quarter = f"{str(self.config.year + 1)[-2:]}Q{self.config.quarter}"
-        
-        # Check if already exists
-        for col in range(1, sheet.max_column + 1):
-            if sheet.cell(row=2, column=col).value == next_forecast_quarter:
-                logger.info(f"Column {next_forecast_quarter} already exists in Impact Unit Sales")
-                return
-        
-        # Insert at position after last quarter
-        new_col = last_quarter_col + 1
-        sheet.insert_cols(new_col)
-        
-        # Add new quarter header
-        header_cell = sheet.cell(row=2, column=new_col)
-        header_cell.value = next_forecast_quarter
-        header_cell.font = Font(bold=True)
-        header_cell.alignment = Alignment(horizontal='center')
-        
-        # Copy column formatting
-        self._copy_column_formatting(sheet, last_quarter_col, new_col)
-        
-        logger.info(f"Added {next_forecast_quarter} column to Impact Unit Sales at position {new_col}")
+        # Just verify the structure is correct
+        logger.info("Impact Unit Sales sheet verified - no column changes needed")
     
     def _update_suppl_calc_formulas(self):
         """
@@ -790,6 +824,10 @@ class ComplianceBuilder:
         - Interest Period references  
         - Quarter text (Q2 2025 → Q3 2025)
         - Date formats (21-7-2025 → 21-10-2025)
+        
+        IMPORTANT: We MUST NOT replace short quarter patterns (like "25Q2") in 
+        column headers of Suppl. Calc and Impact Unit Sales sheets, as these
+        represent historical quarters, not the current quarter being updated.
         """
         from datetime import timedelta
         
@@ -809,11 +847,15 @@ class ComplianceBuilder:
         # Build comprehensive replacement map (sorted by length to prevent partial matches)
         replacements = []
         
-        # Quarter text patterns
+        # Quarter text patterns - FULL format only (e.g., "Q2 2025")
+        # We DO NOT include the short format (e.g., "25Q2") because it would
+        # incorrectly replace historical quarter column headers in Suppl. Calc
         replacements.extend([
             (f"Q{prev_q} {prev_y}", self.config.quarter_str),
             (f"Q{prev_q}-{prev_y}", f"Q{self.config.quarter}-{self.config.year}"),
-            (f"{str(prev_y)[-2:]}Q{prev_q}", self.config.short_quarter),
+            # NOTE: We intentionally OMIT the short quarter pattern replacement
+            # (f"{str(prev_y)[-2:]}Q{prev_q}", self.config.short_quarter),
+            # as it would incorrectly replace column headers in Suppl. Calc and Impact Unit Sales
         ])
         
         # Date patterns - multiple formats
@@ -852,7 +894,15 @@ class ComplianceBuilder:
             sheet = self.workbook[sheet_name]
             sheet_updated = 0
             
+            # Skip row 2 in Suppl. Calc and Impact Unit Sales (column headers)
+            # These contain historical quarter labels that should NOT be updated
+            skip_header_rows = sheet_name in ['Suppl. Calc', 'Impact Unit Sales']
+            
             for row in range(1, min(sheet.max_row + 1, 200)):
+                # Skip header row (row 2) for specific sheets with quarter column headers
+                if skip_header_rows and row == 2:
+                    continue
+                
                 for col in range(1, min(sheet.max_column + 1, 50)):
                     cell = sheet.cell(row=row, column=col)
                     

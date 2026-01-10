@@ -644,26 +644,25 @@ class WordTemplateUpdater:
             (rf'5 – Q{old_q_num}<', f'5 – Q{new_q_num}<'),  # For "2025 – Q2" split
             (rf'{old_year} – Q{old_q_num}', f'{new_year} – Q{new_q_num}'),
             
-            # Ordinal patterns
+            # Ordinal patterns - dynamically determined by quarter
+            # TODO: Make these dynamic based on quarter numbers
             (r'>second quarter<', '>third quarter<'),
             (r'>second<', '>third<'),  # For split "second quarter"
             (r'>the second<', '>the third<'),
             (r'second quarter', 'third quarter'),
             (r'the second quarter', 'the third quarter'),
             
-            # Date patterns - juli to oktober for Q2->Q3
-            (rf'>21 juli {old_year}<', f'>21 oktober {new_year}<'),
-            (rf'> juli<', '> oktober<'),
-            (rf'>juli<', '>oktober<'),
-            (rf'>1-7-{old_year}<', f'>1-10-{new_year}<'),
-            (rf'>30-6-{old_year}<', f'>30-9-{new_year}<'),
-            (rf'1-7-{old_year}', f'1-10-{new_year}'),
+            # NOTE: Cover page date is handled by _build_replacement_map with values.report_date
+            # Do NOT add hardcoded date patterns here that would override the proper replacement
             
-            # Month patterns
+            # Quarter-end date patterns (these are data dates, not report date)
+            (rf'>30-6-{old_year}<', f'>30-9-{new_year}<'),
+            (rf'>1-7-{old_year}<', f'>1-10-{new_year}<'),
+            
+            # Month patterns for quarter-end references (e.g., "as of June 2025")
+            # NOT for report/cover page dates
             (r'>June<', '>September<'),
             (r'>juni<', '>september<'),
-            (r'>July<', '>October<'),
-            (r'>juli<', '>oktober<'),
         ]
         
         for pattern, replacement in xml_patterns:
