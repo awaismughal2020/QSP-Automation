@@ -187,6 +187,9 @@ class QuarterlyReportOrchestrator:
             results['output_files'].append(str(ma_output))
             
             # Step 4b: Build Compliance Certificate
+            # IMPORTANT: The Q{n} Management Accounts sheet in the Compliance Certificate
+            # should contain the PREVIOUS quarter's LTM data (i.e., Q{n-1} closing balances).
+            # So we pass the INPUT Management Accounts file (previous quarter), not the OUTPUT.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -198,7 +201,8 @@ class QuarterlyReportOrchestrator:
                 str(compliance_output),
                 compliance_config
             )
-            compliance_builder.build(bdo_result, str(ma_output))
+            # Pass the INPUT (previous quarter) Management Accounts file for Q{n} MA sheet data
+            compliance_builder.build(bdo_result, str(self.config.previous_management_accounts))
             results['steps']['compliance_certificate'] = {
                 'status': 'success',
                 'output': str(compliance_output)
@@ -285,28 +289,80 @@ class QuarterlyReportOrchestrator:
             logger.info("Step 7: Updating Word template")
             word_output = self.config.output_dir / f"Quarterly QSP - {self.config.quarter_str} - Draft.docx"
             
-            # Calculate maintenance amount from BDO data (account 4100400)
-            maintenance_amount = 0.0
-            for code, entry in bdo_result.accounts.items():
-                if code.startswith('4100'):  # Maintenance accounts
-                    maintenance_amount += abs(entry.closing_balance)
-            maintenance_amount_k = maintenance_amount / 1000  # Convert to thousands
+            # Extract values from BDO data for Management Accounts
+            # Key account codes from formula_templates.yaml:
+            # - 8000003: GTRI (Gross Theoretical Rental Income)
+            # - 8000004: Financial vacancy amount
+            # - 4100400: Maintenance & repair costs
             
-            # Calculate unit sales proceeds from sales tracker
+            gtri_amount = 0.0
+            vacancy_amount = 0.0
+            maintenance_amount = 0.0
+            
+            for code, entry in bdo_result.accounts.items():
+                # GTRI - usually negative in BDO (income account)
+                if code == '8000003':
+                    gtri_amount = abs(entry.closing_balance - entry.opening_balance) / 1000  # Q3 mutations in thousands
+                # Financial vacancy - positive (reduces income)
+                elif code == '8000004':
+                    vacancy_amount = abs(entry.closing_balance - entry.opening_balance) / 1000
+                # Maintenance costs - account 4100400
+                elif code.startswith('4100'):
+                    maintenance_amount += abs(entry.closing_balance - entry.opening_balance) / 1000
+            
+            # Calculate gross rental income (GTRI - vacancy)
+            gross_rental_income = gtri_amount - vacancy_amount
+            
+            # Calculate vacancy percentage
+            vacancy_pct = (vacancy_amount / gtri_amount * 100) if gtri_amount > 0 else 0.0
+            
+            # Calculate unit sales proceeds from sales tracker (in thousands)
             unit_sales_proceeds = sales_data.quarter_proceeds / 1000 if sales_data.quarter_proceeds else 0
+            
+            # Rent roll total (annual, in thousands)
+            rent_roll_k = rent_roll.total_annual_rent / 1000
+            
+            logger.info(f"Page 4 KPIs extracted:")
+            logger.info(f"  GTRI (Q3): €{gtri_amount:,.0f}k")
+            logger.info(f"  Gross rental income: €{gross_rental_income:,.0f}k")
+            logger.info(f"  Financial vacancy: {vacancy_pct:.1f}% (€{vacancy_amount:,.0f}k)")
+            logger.info(f"  Rent roll (annual): €{rent_roll_k:,.0f}k")
+            logger.info(f"  Maintenance: €{maintenance_amount:,.0f}k")
+            logger.info(f"  Unit sales: {sales_data.quarter_units_sold} units, €{unit_sales_proceeds:,.0f}k")
             
             report_values = ReportValues(
                 report_date=datetime.now().strftime("%d %B %Y"),
-                gtri=rent_roll.total_annual_rent / 1000,
-                gross_rental_income=(rent_roll.total_annual_rent * (1 - rent_roll.vacancy_rate)) / 1000 / 4,
-                rent_roll_annual=rent_roll.total_annual_rent / 1000,
-                financial_vacancy_pct=rent_roll.vacancy_rate * 100,
+                # Page 4 - from BDO/Management Accounts
+                gtri=gtri_amount,  # Q3 GTRI in thousands
+                gtri_ltm=gtri_amount * 4,  # Approximate LTM (4 quarters)
+                gross_rental_income=gross_rental_income,  # Q3 gross rental in thousands
+                gross_rental_income_ltm=gross_rental_income * 4,
+                financial_vacancy_pct=vacancy_pct,
+                financial_vacancy_amount=vacancy_amount,
+                # Page 4 - from Rent Roll
+                rent_roll_annual=rent_roll_k,
+                rent_roll_units=rent_roll.total_units,
+                # Page 4 - from Sales Tracker
                 units_sold_quarter=sales_data.quarter_units_sold,
-                maintenance_amount=maintenance_amount_k,
+                unit_sales_proceeds=unit_sales_proceeds,
+                # Page 4/6 - Maintenance and CAPEX
+                maintenance_amount=maintenance_amount,
+                maintenance_ltm=maintenance_amount * 4,  # Approximate LTM
                 capex_amount=0,  # CAPEX is entered manually per mainPlan.pdf
+                capex_ltm=0,
+                # Narratives
                 unit_sales_narrative=f"{sales_data.quarter_units_sold} unit(s) sold for €{unit_sales_proceeds:,.0f}k" if sales_data.quarter_units_sold > 0 else "No unit sales this quarter.",
                 maintenance_detail="",
-                sustainability_detail=""
+                sustainability_detail="",
+                # Previous quarter values (for replacement matching)
+                # These would ideally be extracted from the previous report
+                # For now, setting to 0 will rely on context-aware replacement
+                prev_gtri=0,
+                prev_gross_rental_income=0,
+                prev_vacancy_pct=0,
+                prev_rent_roll=0,
+                prev_maintenance=0,
+                prev_unit_sales_proceeds=0,
             )
             word_updater = WordTemplateUpdater(str(self.config.word_template), str(word_output))
             word_updater.update_with_python_docx(

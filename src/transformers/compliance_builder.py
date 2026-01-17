@@ -82,6 +82,29 @@ class ComplianceBuilder:
         self.output_path = Path(output_path)
         self.config = config
         self.workbook = None
+    
+    def _get_previous_period_end(self):
+        """
+        Calculate the PREVIOUS quarter's period end date.
+        
+        For a Q3 2025 report, returns June 30, 2025 (end of Q2).
+        For a Q4 2025 report, returns September 30, 2025 (end of Q3).
+        """
+        prev_q = self.config.quarter - 1
+        prev_y = self.config.year
+        if prev_q == 0:
+            prev_q = 4
+            prev_y -= 1
+        
+        # Calculate period end for previous quarter
+        month = prev_q * 3
+        # March=31, June=30, September=30, December=31
+        if month in [3, 12]:
+            day = 31
+        else:  # 6, 9
+            day = 30
+        
+        return datetime(prev_y, month, day)
         
     def build(self, bdo_result: BDOParseResult, management_accounts_path: Optional[str] = None) -> Path:
         """
@@ -158,65 +181,74 @@ class ComplianceBuilder:
     
     def _copy_ma_data(self, target_sheet_name: str, source_path: str):
         """
-        Copy Management Accounts data from external file.
+        Copy Management Accounts data from the PREVIOUS quarter's file.
         
-        IMPORTANT: This method reads the Management Cijfers sheet formulas and evaluates them
-        by looking up the corresponding BDO sheet cell values.
+        IMPORTANT: The Q{n} Management Accounts sheet in the Compliance Certificate
+        should contain the PREVIOUS quarter's (Q{n-1}) LTM data, not the current quarter's.
+        
+        For example:
+        - Q3 Compliance Certificate -> Q3 Management Accounts sheet -> Q2 LTM data (June 30)
+        - Q4 Compliance Certificate -> Q4 Management Accounts sheet -> Q3 LTM data (Sept 30)
         
         The approach:
-        1. Load the Management Cijfers sheet to get the formulas from column AB (Q3)
-        2. Load the BDO sheet to get actual cell values
-        3. Parse each formula and calculate the result
-        4. Copy values to the Compliance Certificate's Management Accounts sheet
+        1. Load the PREVIOUS quarter's Management Accounts file with data_only=True
+           (to get Excel's cached/calculated values directly)
+        2. Find the LTM column (which contains the previous quarter's closing balances)
+        3. Copy the cached values to the Compliance Certificate's Management Accounts sheet
+        
+        Using cached values is more reliable than re-evaluating formulas, as the input
+        file has been opened and calculated in Excel.
         """
         try:
-            # Load WITH formulas to find BDO sheet references
-            source_wb = openpyxl.load_workbook(source_path, data_only=False)
+            # Load with data_only=True to get CACHED Excel values (not formulas)
+            # This is critical - the Excel file has been calculated, so we get accurate values
+            source_wb = openpyxl.load_workbook(source_path, data_only=True)
             
-            # Find the BDO sheet for current quarter
-            bdo_sheet_name = f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}"
-            if bdo_sheet_name not in source_wb.sheetnames:
-                # Try alternate formats
-                for name in source_wb.sheetnames:
-                    if f'Q{self.config.quarter}' in name and 'BDO' in name:
-                        bdo_sheet_name = name
-                        break
-            
-            if bdo_sheet_name not in source_wb.sheetnames:
-                logger.warning(f"BDO sheet {bdo_sheet_name} not found. Available: {source_wb.sheetnames[-5:]}")
-                return
-            
-            bdo_sheet = source_wb[bdo_sheet_name]
             target_sheet = self.workbook[target_sheet_name]
             
-            logger.info(f"Copying data from BDO sheet: {bdo_sheet_name}")
+            # Find the Management Cijfers sheet
+            cijfers_sheet = None
+            for name in source_wb.sheetnames:
+                if 'Management Cijfers' in name:
+                    cijfers_sheet = source_wb[name]
+                    logger.info(f"Using Management Cijfers sheet: {name} (reading cached values)")
+                    break
             
-            # Find the Management Cijfers sheet to get the formulas
-            cijfers_sheet_name = f"Management Cijfers - Q{self.config.quarter} {self.config.year}"
-            if cijfers_sheet_name not in source_wb.sheetnames:
-                # Try alternate formats
-                for name in source_wb.sheetnames:
-                    if 'Management Cijfers' in name:
-                        cijfers_sheet_name = name
+            if cijfers_sheet is None:
+                logger.warning("Management Cijfers sheet not found in source file")
+                source_wb.close()
+                return
+            
+            # DYNAMICALLY find the LTM column in Management Cijfers
+            # Search row 22 from RIGHT TO LEFT to find the most recent LTM column
+            ltm_column = None
+            for col in range(cijfers_sheet.max_column, 0, -1):
+                cell_val = cijfers_sheet.cell(row=22, column=col).value
+                if cell_val:
+                    cell_str = str(cell_val)
+                    # Accept any LTM header at the rightmost position
+                    if 'LTM' in cell_str:
+                        ltm_column = col
+                        logger.info(f"Found LTM column at {get_column_letter(col)} ({col}) via row 22 header: '{cell_val}'")
                         break
             
-            cijfers_sheet = source_wb[cijfers_sheet_name] if cijfers_sheet_name in source_wb.sheetnames else None
+            # If not found in row 22, try Balance Sheet section
+            if ltm_column is None:
+                # Find the rightmost column with data in row 3 (Deferred Tax Asset)
+                for col in range(cijfers_sheet.max_column, 0, -1):
+                    cell_val = cijfers_sheet.cell(row=3, column=col).value
+                    if cell_val is not None and isinstance(cell_val, (int, float)):
+                        ltm_column = col
+                        logger.info(f"Found LTM column at {get_column_letter(col)} ({col}) via row 3 value")
+                        break
             
-            # Build a lookup for BDO sheet values by row (column H)
-            bdo_h_values = {}
-            for row in range(1, bdo_sheet.max_row + 1):
-                val = bdo_sheet.cell(row=row, column=8).value  # Column H
-                # If it's a formula, try to calculate it
-                if isinstance(val, str) and val.startswith('='):
-                    val = self._evaluate_simple_formula(val, bdo_sheet, row)
-                bdo_h_values[row] = val if isinstance(val, (int, float)) else 0
+            if ltm_column is None:
+                logger.warning("Could not find LTM column dynamically, falling back to column 27 (AA)")
+                ltm_column = 27
             
-            # Find the AB column (column 28) in Management Cijfers - this contains Q3 formulas
-            # Parse and evaluate each formula
-            
-            # Create mapping from target row to formula calculation
-            # Each target row in Compliance Certificate maps to a specific Management Cijfers row
-            target_to_cijfers_mapping = {
+            # Create mapping from target row to source row
+            # Target row in Compliance Certificate -> Source row in Management Cijfers
+            target_to_source_mapping = {
                 2: 3,   # Deferred Tax Asset
                 3: 4,   # Real estate
                 4: 5,   # Financial fixed assets
@@ -235,29 +267,29 @@ class ComplianceBuilder:
                 17: 18, # Rent Invoiced in advance
             }
             
-            # Update Row 1: Header with date
-            period_end = self.config.period_end
-            target_sheet.cell(row=1, column=3).value = period_end
+            # Update Row 1: Header with PREVIOUS quarter's end date
+            prev_period_end = self._get_previous_period_end()
+            target_sheet.cell(row=1, column=3).value = prev_period_end
             target_sheet.cell(row=1, column=3).number_format = 'YYYY-MM-DD'
+            logger.info(f"Set header date to previous quarter end: {prev_period_end}")
+            
+            # Update Row 21: P&L section title to show PREVIOUS quarter's LTM
+            # (since this sheet contains previous quarter's data)
+            prev_ltm_title = f"LTM {self.config.prev_quarter_str}"
+            target_sheet.cell(row=21, column=3).value = prev_ltm_title
+            logger.info(f"Set P&L title (row 21) to: {prev_ltm_title}")
             
             items_copied = 0
             
-            if cijfers_sheet:
-                # Use Management Cijfers formulas to calculate values
-                for target_row, cijfers_row in target_to_cijfers_mapping.items():
-                    formula = cijfers_sheet.cell(row=cijfers_row, column=28).value  # Column AB
-                    if formula and isinstance(formula, str) and formula.startswith('='):
-                        value = self._evaluate_bdo_formula(formula, bdo_h_values, bdo_sheet_name)
-                        if value is not None:
-                            target_sheet.cell(row=target_row, column=3).value = value
-                            items_copied += 1
-                            logger.debug(f"Copied value {value} to row {target_row} from formula {formula[:50]}...")
+            # Copy CACHED values directly from the LTM column
+            for target_row, source_row in target_to_source_mapping.items():
+                value = cijfers_sheet.cell(row=source_row, column=ltm_column).value
+                if value is not None:
+                    target_sheet.cell(row=target_row, column=3).value = value
+                    items_copied += 1
+                    logger.debug(f"Copied value {value} to row {target_row} from source row {source_row}")
             
-            # If no formulas found, fall back to the original method
-            if items_copied == 0:
-                items_copied = self._copy_ma_data_fallback(target_sheet, bdo_sheet, bdo_h_values)
-            
-            logger.info(f"Copied {items_copied} values to {target_sheet_name}")
+            logger.info(f"Copied {items_copied} cached values to {target_sheet_name}")
             source_wb.close()
             
         except Exception as e:
@@ -437,15 +469,22 @@ class ComplianceBuilder:
         """
         Update Impact Unit Sales sheet.
         
-        IMPORTANT: Unlike Suppl. Calc, this sheet does NOT need new quarterly columns.
+        IMPORTANT: When we add a new quarter column to Suppl. Calc, the Impact Unit Sales
+        sheet's references to Suppl. Calc must shift forward by one column.
+        
+        For a Q3 2025 report:
+        - The current quarter is Q3 2025 (25Q3)
+        - The forecast should start at the NEXT quarter: Q4 2025 (25Q4)
+        - Row 9 references like ='Suppl. Calc'!O2 need to shift to ='Suppl. Calc'!P2
+        
         The structure is:
         - Column C: Labels (Average Sale Price LTM, etc.)
         - Column D onwards: Data for different forecasts
-        - Row 9: References to Suppl. Calc for unit sales proceeds
+        - Row 9: References to Suppl. Calc for quarter labels
         - Row 10: Unit Sales counts
         
-        The formulas reference Suppl. Calc columns which get updated automatically.
-        We just need to ensure the sheet exists and has correct structure - no new columns needed.
+        We shift all Suppl. Calc column references forward by one to correctly
+        start the forecast at the next quarter (not the current quarter).
         """
         if 'Impact Unit Sales' not in self.workbook.sheetnames:
             logger.warning("Impact Unit Sales sheet not found")
@@ -453,11 +492,53 @@ class ComplianceBuilder:
         
         sheet = self.workbook['Impact Unit Sales']
         
-        # The Impact Unit Sales sheet structure should remain unchanged
-        # It references Suppl. Calc dynamically, so no column insertion needed
+        # Shift Suppl. Calc references forward by one column
+        # This ensures the forecast horizon starts at the NEXT quarter, not the current quarter
+        # E.g., for Q3 2025 report: O->P, P->Q, Q->R, R->S (so forecast starts at 25Q4, not 25Q3)
         
-        # Just verify the structure is correct
-        logger.info("Impact Unit Sales sheet verified - no column changes needed")
+        updated_count = 0
+        
+        for row in range(1, sheet.max_row + 1):
+            for col in range(1, sheet.max_column + 1):
+                cell = sheet.cell(row=row, column=col)
+                cell_value = cell.value
+                
+                if cell_value is None:
+                    continue
+                
+                if isinstance(cell_value, str) and cell_value.startswith('='):
+                    original_value = cell_value
+                    new_value = original_value
+                    
+                    # Find and update Suppl. Calc column references
+                    # Pattern: 'Suppl. Calc'!O2 -> 'Suppl. Calc'!P2
+                    # We need to shift all column letters forward by one
+                    suppl_calc_pattern = r"'Suppl\. Calc'!(\$?)([A-Z]+)(\$?)(\d+)"
+                    
+                    def shift_column(match):
+                        dollar1 = match.group(1)
+                        col_letter = match.group(2)
+                        dollar2 = match.group(3)
+                        row_num = match.group(4)
+                        
+                        # Convert column letter to index, add 1, convert back
+                        from openpyxl.utils import column_index_from_string
+                        col_idx = column_index_from_string(col_letter)
+                        new_col_letter = get_column_letter(col_idx + 1)
+                        
+                        return f"'Suppl. Calc'!{dollar1}{new_col_letter}{dollar2}{row_num}"
+                    
+                    new_value = re.sub(suppl_calc_pattern, shift_column, new_value)
+                    
+                    if new_value != original_value:
+                        cell.value = new_value
+                        updated_count += 1
+                        logger.debug(f"Row {row}, Col {col}: '{original_value}' -> '{new_value}'")
+        
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} Suppl. Calc references in Impact Unit Sales (shifted forward by 1 column)")
+        else:
+            logger.info("Impact Unit Sales sheet - no Suppl. Calc references found to update")
     
     def _update_suppl_calc_formulas(self):
         """
@@ -897,6 +978,12 @@ class ComplianceBuilder:
             # Skip row 2 in Suppl. Calc and Impact Unit Sales (column headers)
             # These contain historical quarter labels that should NOT be updated
             skip_header_rows = sheet_name in ['Suppl. Calc', 'Impact Unit Sales']
+            
+            # SKIP the Management Accounts sheet entirely - it contains PREVIOUS quarter's
+            # data and should keep the previous quarter's references (e.g., "LTM Q2 2025")
+            if 'Management Accounts' in sheet_name:
+                logger.debug(f"Skipping date/text updates for {sheet_name} (contains previous quarter data)")
+                continue
             
             for row in range(1, min(sheet.max_row + 1, 200)):
                 # Skip header row (row 2) for specific sheets with quarter column headers

@@ -5,10 +5,21 @@ Updates the quarterly report Word template with:
 - Global find/replace for quarter references
 - Specific value updates on designated pages
 - Date updates
+- PAGE 4: Numeric KPI population (GTRI, gross rental income, vacancy, maintenance, etc.)
+- PAGE 5-6: Actions and CAPEX values
+
+NUMERIC POPULATION (Page 4):
+The Word document contains financial KPIs embedded in narrative text like:
+"GTRI of the portfolio amounted to €3,200k"
+"Financial vacancy was 5.4%"
+etc.
+
+These values must be extracted from the generated Excel outputs and injected
+into the Word document, replacing the previous quarter's values.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 import subprocess
 import re
@@ -23,21 +34,56 @@ class ReportValues:
     # Page 1
     report_date: str  # e.g., "14 October 2025"
     
-    # Page 4 - Executive Summary
-    gtri: float  # Gross Theoretical Rental Income (€k)
-    gross_rental_income: float  # Actual rental income (€k)
-    rent_roll_annual: float  # Annual rent roll (€k)
-    financial_vacancy_pct: float  # Vacancy percentage
-    units_sold_quarter: int  # Units sold this quarter
-    maintenance_amount: float  # Maintenance spend (€k)
-    capex_amount: float  # CAPEX spend (€k)
+    # Page 4 - Executive Summary (from Management Accounts / BDO)
+    gtri: float  # Gross Theoretical Rental Income (€k) - quarterly
+    gtri_ltm: float = 0.0  # GTRI LTM (€k) - for annual references
+    gross_rental_income: float = 0.0  # Actual rental income (€k) - quarterly
+    gross_rental_income_ltm: float = 0.0  # Gross rental income LTM (€k)
+    financial_vacancy_pct: float = 0.0  # Vacancy percentage
+    financial_vacancy_amount: float = 0.0  # Vacancy in €k
+    
+    # Page 4 - From Rent Roll
+    rent_roll_annual: float = 0.0  # Annual rent roll total (€k)
+    rent_roll_units: int = 0  # Number of units in rent roll
+    
+    # Page 4 - From Sales Tracker
+    units_sold_quarter: int = 0  # Units sold this quarter
+    unit_sales_proceeds: float = 0.0  # Proceeds from sales (€k)
+    
+    # Page 4/6 - Maintenance and CAPEX
+    maintenance_amount: float = 0.0  # Maintenance spend (€k) - quarterly
+    maintenance_ltm: float = 0.0  # Maintenance LTM (€k)
+    capex_amount: float = 0.0  # CAPEX spend (€k) - quarterly
+    capex_ltm: float = 0.0  # CAPEX LTM (€k)
     
     # Page 5 - Unit Sales narrative
-    unit_sales_narrative: str  # Free text about unit sales actions
+    unit_sales_narrative: str = ""  # Free text about unit sales actions
     
     # Page 6
-    maintenance_detail: str  # Maintenance description
-    sustainability_detail: str  # Sustainability/CAPEX description
+    maintenance_detail: str = ""  # Maintenance description
+    sustainability_detail: str = ""  # Sustainability/CAPEX description
+    
+    # Previous quarter values (for finding/replacing)
+    prev_gtri: float = 0.0
+    prev_gross_rental_income: float = 0.0
+    prev_vacancy_pct: float = 0.0
+    prev_rent_roll: float = 0.0
+    prev_maintenance: float = 0.0
+    prev_unit_sales_proceeds: float = 0.0
+
+
+@dataclass 
+class NumericValueMapping:
+    """Maps a KPI to its context pattern and value formatter."""
+    kpi_name: str
+    # Regex pattern to find the value in context (must have a capture group for the number)
+    context_pattern: str
+    # How to format the new value
+    formatter: str  # 'euro_k', 'euro_m', 'percent', 'integer'
+    # Which ReportValues attribute to use
+    value_attr: str
+    # Optional: previous value attribute for better matching
+    prev_value_attr: Optional[str] = None
 
 
 class WordTemplateUpdater:
@@ -330,13 +376,7 @@ class WordTemplateUpdater:
         # Copy template to output location
         shutil.copy2(self.template_path, self.output_path)
         
-        # Build replacement map for text boxes
-        text_replacements = self._build_replacement_map(values, previous_quarter, current_quarter)
-        
-        # Step 1: Update text boxes via direct XML manipulation
-        self._update_text_boxes_xml(text_replacements)
-        
-        # Step 2: Update regular paragraphs/tables via python-docx
+        # Step 1: Update regular paragraphs/tables via python-docx (basic text replacements)
         doc = Document(self.output_path)
         
         old_date_patterns = self._get_old_date_patterns(previous_quarter)
@@ -362,6 +402,15 @@ class WordTemplateUpdater:
                 self._process_paragraph(para, values, previous_quarter, current_quarter)
         
         doc.save(self.output_path)
+        
+        # Step 2: After python-docx saves, apply direct XML manipulation for:
+        # - Text boxes (which python-docx can't access)
+        # - Fragmented text replacements
+        # - Context-aware numeric replacements (€ values split across multiple XML elements)
+        # This must happen AFTER python-docx saves, otherwise doc.save() overwrites our changes
+        text_replacements = self._build_replacement_map(values, previous_quarter, current_quarter)
+        self._update_text_boxes_xml(text_replacements, values)
+        
         logger.info(f"Generated updated report: {self.output_path}")
         return self.output_path
     
@@ -370,6 +419,11 @@ class WordTemplateUpdater:
         Build comprehensive replacement map for all text that needs updating.
         
         Returns list of (old_text, new_text) tuples, sorted longest-first.
+        
+        INCLUDES: 
+        - Quarter text replacements (Q2 -> Q3)
+        - Date replacements
+        - NUMERIC VALUE REPLACEMENTS (Page 4 KPIs)
         """
         replacements = []
         
@@ -380,6 +434,11 @@ class WordTemplateUpdater:
         old_year = old_parts[1] if len(old_parts) == 2 else ''
         new_q_num = new_parts[0][1] if len(new_parts) == 2 else ''
         new_year = new_parts[1] if len(new_parts) == 2 else ''
+        
+        # === NUMERIC VALUE REPLACEMENTS (Page 4 KPIs) ===
+        # These replace last quarter's numeric values with new quarter's values
+        numeric_replacements = self._build_numeric_replacements(values)
+        replacements.extend(numeric_replacements)
         
         # Quarter text replacements
         replacements.extend([
@@ -447,7 +506,131 @@ class WordTemplateUpdater:
         
         return replacements
     
-    def _update_text_boxes_xml(self, replacements: List[Tuple[str, str]]):
+    def _build_numeric_replacements(self, values: ReportValues) -> List[Tuple[str, str]]:
+        """
+        Build replacement tuples for numeric values in the Word document.
+        
+        The Word document contains financial KPIs embedded in narrative text.
+        We need to find patterns like "€3,200k" or "5.4%" and replace them
+        with the new quarter's values.
+        
+        This method generates replacement pairs for common numeric formats
+        that might appear in the document.
+        """
+        replacements = []
+        
+        # Helper functions for formatting
+        def format_euro_k(value: float, decimals: int = 0) -> List[str]:
+            """Generate multiple format variations for Euro amounts in thousands."""
+            formats = []
+            if value == 0:
+                return formats
+            
+            abs_val = abs(value)
+            
+            # Various formatting styles that might appear in the document
+            if decimals == 0:
+                formats.extend([
+                    f"€{abs_val:,.0f}k",
+                    f"€{abs_val:,.0f} k",
+                    f"€ {abs_val:,.0f}k",
+                    f"€{abs_val:,.0f}",  # Without k suffix
+                    f"€{int(abs_val):,}k",
+                    f"€{int(abs_val):,}",
+                ])
+            else:
+                formats.extend([
+                    f"€{abs_val:,.{decimals}f}k",
+                    f"€{abs_val:,.{decimals}f} k", 
+                    f"€ {abs_val:,.{decimals}f}k",
+                    f"€{abs_val:,.{decimals}f}",
+                ])
+            
+            # European format with dot as thousand separator
+            if abs_val >= 1000:
+                euro_fmt = f"{abs_val:,.0f}".replace(',', '.')
+                formats.extend([
+                    f"€{euro_fmt}k",
+                    f"€{euro_fmt}",
+                ])
+            
+            return formats
+        
+        def format_euro_m(value: float) -> List[str]:
+            """Generate format variations for Euro amounts in millions."""
+            formats = []
+            if value == 0:
+                return formats
+            
+            abs_val = abs(value)
+            formats.extend([
+                f"€{abs_val:.1f}m",
+                f"€{abs_val:.1f} m",
+                f"€ {abs_val:.1f}m",
+                f"€{abs_val:.2f}m",
+            ])
+            return formats
+        
+        def format_percent(value: float) -> List[str]:
+            """Generate format variations for percentages."""
+            formats = []
+            abs_val = abs(value)
+            formats.extend([
+                f"{abs_val:.1f}%",
+                f"{abs_val:.1f} %",
+                f"{abs_val:.2f}%",
+                f"{int(abs_val)}%",
+            ])
+            return formats
+        
+        # === PAGE 4 NUMERIC REPLACEMENTS ===
+        # These are the key KPIs that need to be updated
+        
+        # 1. GTRI (Gross Theoretical Rental Income) - quarterly value
+        # Format: typically "€3,200k" or "€3.2m"
+        if values.gtri > 0:
+            gtri_k = values.gtri  # Already in thousands
+            
+            # If we have previous GTRI value, create direct replacement
+            if values.prev_gtri > 0:
+                for old_fmt in format_euro_k(values.prev_gtri, 0):
+                    for new_fmt in format_euro_k(gtri_k, 0)[:1]:  # Just use first format
+                        replacements.append((old_fmt, new_fmt))
+        
+        # 2. Gross Rental Income - quarterly value
+        if values.gross_rental_income > 0 and values.prev_gross_rental_income > 0:
+            for old_fmt in format_euro_k(values.prev_gross_rental_income, 0):
+                for new_fmt in format_euro_k(values.gross_rental_income, 0)[:1]:
+                    replacements.append((old_fmt, new_fmt))
+        
+        # 3. Financial Vacancy percentage
+        if values.prev_vacancy_pct > 0:
+            for old_fmt in format_percent(values.prev_vacancy_pct):
+                for new_fmt in format_percent(values.financial_vacancy_pct)[:1]:
+                    replacements.append((old_fmt, new_fmt))
+        
+        # 4. Rent Roll total
+        if values.prev_rent_roll > 0 and values.rent_roll_annual > 0:
+            for old_fmt in format_euro_k(values.prev_rent_roll, 0):
+                for new_fmt in format_euro_k(values.rent_roll_annual, 0)[:1]:
+                    replacements.append((old_fmt, new_fmt))
+        
+        # 5. Maintenance amount
+        if values.prev_maintenance > 0 and values.maintenance_amount > 0:
+            for old_fmt in format_euro_k(values.prev_maintenance, 0):
+                for new_fmt in format_euro_k(values.maintenance_amount, 0)[:1]:
+                    replacements.append((old_fmt, new_fmt))
+        
+        # 6. Unit sales proceeds
+        if values.prev_unit_sales_proceeds > 0 and values.unit_sales_proceeds > 0:
+            for old_fmt in format_euro_k(values.prev_unit_sales_proceeds, 0):
+                for new_fmt in format_euro_k(values.unit_sales_proceeds, 0)[:1]:
+                    replacements.append((old_fmt, new_fmt))
+        
+        logger.info(f"Built {len(replacements)} numeric value replacements")
+        return replacements
+    
+    def _update_text_boxes_xml(self, replacements: List[Tuple[str, str]], values: ReportValues = None):
         """
         Update text in text boxes by directly manipulating the docx XML.
         
@@ -457,6 +640,8 @@ class WordTemplateUpdater:
         IMPORTANT: Word XML often splits text across multiple <w:t> elements,
         e.g., "Q2 2025" might be stored as ["Q2", " 2025"]. We handle this
         by using regex patterns that account for XML tags between text fragments.
+        
+        Also applies context-aware numeric value replacements for Page 4 KPIs.
         """
         import zipfile
         import os
@@ -481,6 +666,7 @@ class WordTemplateUpdater:
                 xml_files.append(f)
         
         updated_count = 0
+        numeric_updates = 0
         for xml_file in xml_files:
             if xml_file.exists():
                 with open(xml_file, 'r', encoding='utf-8') as f:
@@ -492,10 +678,18 @@ class WordTemplateUpdater:
                 # E.g., "Q2 2025" might be: <w:t>Q2</w:t></w:r><w:r><w:t> 2025</w:t>
                 content = self._apply_fragmented_replacements(content, replacements)
                 
+                # Apply context-aware numeric replacements for Page 4 KPIs
+                if values:
+                    content, num_count = self._apply_context_numeric_replacements(content, values)
+                    numeric_updates += num_count
+                
                 if content != original_content:
                     with open(xml_file, 'w', encoding='utf-8') as f:
                         f.write(content)
                     updated_count += 1
+        
+        if numeric_updates > 0:
+            logger.info(f"Applied {numeric_updates} context-aware numeric replacements")
         
         logger.info(f"Updated {updated_count} XML files in docx")
         
@@ -509,6 +703,199 @@ class WordTemplateUpdater:
         
         # Cleanup temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def _apply_context_numeric_replacements(self, content: str, values: ReportValues) -> Tuple[str, int]:
+        """
+        Apply context-aware numeric value replacements in the Word XML.
+        
+        This method finds numeric values (€ amounts, percentages) that appear near
+        specific KPI context words (GTRI, rental income, vacancy, etc.) and replaces
+        them with the new quarter's values.
+        
+        Word XML fragments numbers across multiple <w:t> elements, e.g.:
+        "€3,200k" might be: <w:t>€</w:t><w:t>3,</w:t><w:t>200</w:t><w:t>k</w:t>
+        
+        Returns:
+            (updated_content, count_of_replacements)
+        """
+        updates_made = 0
+        
+        # Define KPI contexts and their new values
+        # Format: (context_keywords, new_value, value_format)
+        kpi_mappings = [
+            # GTRI - appears as "GTRI of the portfolio amounted to €X,XXXk"
+            (['GTRI', 'Gross Theoretical Rental Income'], values.gtri, 'euro_k'),
+            
+            # Gross rental income - "Gross rental income was €X,XXXk"
+            (['Gross rental income', 'gross rental income'], values.gross_rental_income, 'euro_k'),
+            
+            # Financial vacancy - "Financial vacancy was X.X%" or "vacancy of X.X%"
+            (['Financial vacancy', 'vacancy'], values.financial_vacancy_pct, 'percent'),
+            
+            # Rent roll - "rent roll total of €X,XXXk" 
+            (['rent roll', 'Rent roll', 'huurlijst'], values.rent_roll_annual, 'euro_k'),
+            
+            # Maintenance - "Maintenance expenses of €XXXk"
+            (['Maintenance', 'maintenance', 'repair costs'], values.maintenance_amount, 'euro_k'),
+            
+            # Unit sales proceeds - "Unit sales proceeds of €XXXk"
+            (['Unit sales proceeds', 'sale proceeds', 'proceeds'], values.unit_sales_proceeds, 'euro_k'),
+            
+            # CAPEX - "CAPEX of €XXXk"
+            (['CAPEX', 'capex', 'capital expenditure'], values.capex_amount, 'euro_k'),
+        ]
+        
+        for keywords, new_value, value_format in kpi_mappings:
+            if new_value <= 0:
+                continue
+                
+            # Find context regions containing the keywords
+            for keyword in keywords:
+                # Find all occurrences of the keyword in XML content
+                keyword_positions = []
+                pos = 0
+                while True:
+                    pos = content.find(keyword, pos)
+                    if pos == -1:
+                        break
+                    keyword_positions.append(pos)
+                    pos += 1
+                
+                for kw_pos in keyword_positions:
+                    # Look for Euro amounts or percentages - need ~1200 chars as numbers can be highly fragmented
+                    search_region = content[kw_pos:kw_pos + 1500]
+                    
+                    if value_format == 'euro_k':
+                        # Pattern to find Euro amounts (handles XML fragmentation)
+                        # Matches: €X,XXX or €X.XXX or just the number parts
+                        
+                        # First try to find the complete value in one <w:t> tag
+                        euro_pattern = r'>€([\d,\.]+)([km]?)</w:t>'
+                        match = re.search(euro_pattern, search_region)
+                        if match:
+                            old_val = match.group(0)
+                            suffix = match.group(2) or 'k'
+                            new_formatted = f'>€{new_value:,.0f}{suffix}</w:t>'
+                            
+                            # Only replace if this is in the original content at the right location
+                            full_pos = kw_pos + match.start()
+                            if content[full_pos:full_pos + len(old_val)] == old_val:
+                                content = content[:full_pos] + new_formatted + content[full_pos + len(old_val):]
+                                updates_made += 1
+                                logger.debug(f"Replaced '{old_val}' with '{new_formatted}' near '{keyword}'")
+                                break
+                        
+                        # Handle fragmented case: €</w:t>...<w:t>X,XXX</w:t>
+                        # Word often splits numbers like "3,200.6" into: "3," | "20" | "0" | "." | "6"
+                        # Strategy: Find the full region, replace in middle section, then swap back
+                        
+                        # Find the Euro sign and everything up to the 'k' or 'm' suffix
+                        full_value_pattern = r'(>€</w:t>)(.*?)(>k</w:t>|>m</w:t>)'
+                        match = re.search(full_value_pattern, search_region, re.DOTALL | re.IGNORECASE)
+                        
+                        if match:
+                            middle_section = match.group(2)  # Everything between € and k
+                            
+                            # Find all number/dot fragments in the middle section
+                            frag_pattern = r'>([\d,\.]+)</w:t>'
+                            fragments = list(re.finditer(frag_pattern, middle_section))
+                            
+                            if fragments:
+                                new_num = f'{new_value:,.0f}'
+                                
+                                # Rebuild middle section: first fragment gets new value, rest become empty
+                                new_middle = middle_section
+                                for i, frag in enumerate(fragments):
+                                    old_text = f'>{frag.group(1)}</w:t>'
+                                    if i == 0:
+                                        # First fragment gets the new value
+                                        new_middle = new_middle.replace(old_text, f'>{new_num}</w:t>', 1)
+                                        logger.debug(f"Replaced fragment '{frag.group(1)}' with '{new_num}' near '{keyword}'")
+                                    else:
+                                        # Subsequent fragments become empty
+                                        new_middle = new_middle.replace(old_text, '></w:t>', 1)
+                                        logger.debug(f"Cleared fragment '{frag.group(1)}' near '{keyword}'")
+                                
+                                # Calculate absolute position and replace the middle section
+                                abs_start = kw_pos + match.start(2)
+                                abs_end = kw_pos + match.end(2)
+                                content = content[:abs_start] + new_middle + content[abs_end:]
+                                updates_made += 1
+                                break
+                    
+                    elif value_format == 'percent':
+                        # Pattern to find percentages: X.X% or X%
+                        # Handle both complete (>5.4%</w:t>) and fragmented (>5.</w:t>...<w:t>4</w:t>...<w:t>%</w:t>)
+                        
+                        # First try complete pattern
+                        pct_pattern = r'>([\d,\.]+)\s*(%)</w:t>'
+                        match = re.search(pct_pattern, search_region)
+                        if match:
+                            old_val = match.group(0)
+                            new_formatted = f'>{new_value:.1f}%</w:t>'
+                            
+                            full_pos = kw_pos + match.start()
+                            if content[full_pos:full_pos + len(old_val)] == old_val:
+                                content = content[:full_pos] + new_formatted + content[full_pos + len(old_val):]
+                                updates_made += 1
+                                logger.debug(f"Replaced percentage '{old_val}' with '{new_formatted}' near '{keyword}'")
+                                break
+                        
+                        # Try fragmented pattern: >X.</w:t>...<w:t>Y</w:t>
+                        # where X.Y is the percentage value (the % might be in same or separate element)
+                        # Pattern: ">4.</w:t>...<w:t>1</w:t>" 
+                        frag_pct_pattern = r'(>)(\d+)\.</w:t>.*?<w:t[^>]*>(\d+)</w:t>'
+                        match = re.search(frag_pct_pattern, search_region, re.DOTALL)
+                        if match:
+                            old_int = match.group(2)
+                            old_decimal = match.group(3)
+                            
+                            new_int = str(int(new_value))
+                            new_decimal = str(int(round((new_value % 1) * 10)))  # Get first decimal digit
+                            
+                            logger.debug(f"Found fragmented percentage {old_int}.{old_decimal}% near '{keyword}', replacing with {new_int}.{new_decimal}%")
+                            
+                            # Replace integer part first (e.g., >4.</w:t> -> >4.</w:t>)
+                            # match.start(1) gives position of the '>' which precedes the integer
+                            int_pos = kw_pos + match.start(1)
+                            old_int_full = f'>{old_int}.</w:t>'
+                            new_int_full = f'>{new_int}.</w:t>'
+                            
+                            logger.debug(f"Looking for '{old_int_full}' at position {int_pos}, found: '{content[int_pos:int_pos + len(old_int_full)]}'")
+                            
+                            if content[int_pos:int_pos + len(old_int_full)] == old_int_full:
+                                content = content[:int_pos] + new_int_full + content[int_pos + len(old_int_full):]
+                                updates_made += 1
+                                logger.debug(f"Replaced fragmented percentage integer '{old_int}.' with '{new_int}.' near '{keyword}'")
+                                
+                                # Now find and replace the decimal part
+                                # Need to re-search after replacement
+                                search_region_new = content[kw_pos:kw_pos + 800]
+                                frag_pct_pattern2 = r'(>)(\d+)\.</w:t>.*?<w:t[^>]*>(\d+)</w:t>'
+                                match_new = re.search(frag_pct_pattern2, search_region_new, re.DOTALL)
+                                
+                                if match_new:
+                                    # Position of the decimal in the new search region
+                                    dec_pos = kw_pos + match_new.start(3)
+                                    old_dec_full = f'>{old_decimal}</w:t>'
+                                    new_dec_full = f'>{new_decimal}</w:t>'
+                                    
+                                    # Need to find the actual position - the decimal is after the integer part
+                                    # Search for the decimal value pattern after the integer
+                                    dec_search_start = int_pos + len(new_int_full)
+                                    dec_search_region = content[dec_search_start:dec_search_start + 300]
+                                    dec_pattern = rf'<w:t[^>]*>({old_decimal})</w:t>'
+                                    dec_match = re.search(dec_pattern, dec_search_region)
+                                    
+                                    if dec_match:
+                                        actual_dec_pos = dec_search_start + dec_match.start(1)
+                                        if content[actual_dec_pos:actual_dec_pos + len(old_decimal)] == old_decimal:
+                                            content = content[:actual_dec_pos] + new_decimal + content[actual_dec_pos + len(old_decimal):]
+                                            updates_made += 1
+                                            logger.debug(f"Replaced fragmented percentage decimal '{old_decimal}' with '{new_decimal}' near '{keyword}'")
+                            break
+        
+        return content, updates_made
     
     def _apply_fragmented_replacements(self, content: str, replacements: List[Tuple[str, str]]) -> str:
         """
@@ -567,46 +954,52 @@ class WordTemplateUpdater:
         
         # CRITICAL: Handle fragmented pattern where "in Q" is followed by "2" in next run
         # Pattern: <w:t>in Q</w:t></w:r>...<w:t>2</w:t> → replace 2 with 3
-        # This is a common fragmentation in Word
-        def replace_fragmented_q_num(match):
-            """Replace the quarter number in fragmented 'in Q' + '2' pattern."""
-            return match.group(0).replace(f'>{old_q_num}</w:t>', f'>{new_q_num}</w:t>')
+        #
+        # IMPORTANT: Use a restrictive pattern that only matches the IMMEDIATELY NEXT <w:t> element
+        # to prevent accidentally matching "2" that's part of year "2025" (which can be stored as "20"|"2"|"5")
+        #
+        # KEY FIX: Use (?:(?!</w:rPr>).)* instead of .*? in <w:rPr> to prevent backtracking
+        # from consuming multiple </w:rPr> closings (which would skip over multiple runs)
         
-        # Match: 'in Q</w:t>' followed eventually by '>2</w:t>'
-        fragmented_pattern = rf'(in Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        # Pattern for matching immediately next <w:t> after closing </w:r>
+        # The (?:(?!</w:rPr>).)* is a negative lookahead that prevents matching </w:rPr>
+        next_wt_pattern = r'</w:t></w:r><w:r[^>]*>(?:<w:rPr>(?:(?!</w:rPr>).)*</w:rPr>)?<w:t[^>]*>'
+        
+        # Match: 'in Q</w:t>' followed by IMMEDIATE next <w:t> containing the quarter number
+        fragmented_pattern = rf'(in Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Also handle '% in Q</w:t>' pattern
-        fragmented_pattern2 = rf'(% in Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern2 = rf'(% in Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern2, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle 'In Q</w:t>' (capital I)
-        fragmented_pattern3 = rf'(In Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern3 = rf'(In Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern3, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle ' Q</w:t>' followed by number (space before Q)
-        fragmented_pattern4 = rf'( Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern4 = rf'( Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern4, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle 'Actions Q</w:t>' followed by number
-        fragmented_pattern5 = rf'(Actions Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern5 = rf'(Actions Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern5, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle '– Q</w:t>' followed by number (for Portfolio highlights)
-        fragmented_pattern6 = rf'(– Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern6 = rf'(– Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern6, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle '- Q</w:t>' followed by number (dash variant)
-        fragmented_pattern7 = rf'(- Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern7 = rf'(- Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern7, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle 's Q</w:t>' followed by number (for 'highlights Q2')
-        fragmented_pattern8 = rf'(s Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern8 = rf'(s Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern8, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # Handle single 'Q</w:t>' followed by number in separate element
         # This catches cases where "Q" and "2" are completely split
-        fragmented_pattern9 = rf'(>Q</w:t></w:r>.*?<w:t[^>]*>){old_q_num}(</w:t>)'
+        fragmented_pattern9 = rf'(>Q{next_wt_pattern}){old_q_num}(</w:t>)'
         content = re.sub(fragmented_pattern9, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
         
         # XML tag pattern that may appear between text fragments
