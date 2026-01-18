@@ -82,12 +82,31 @@ class ReportValues:
 
 def extract_values_from_management_accounts(ma_path: str, quarter: int, year: int) -> dict:
     """
-    Extract financial values from Management Accounts Excel file.
+    Extract ALL financial values from Management Accounts Excel file.
     
-    The Management Cijfers sheet contains:
-    - Column AA (index 27) for Q3 2025 quarterly values
-    - Column AB (index 28) for Q3 2025 LTM values
-    - Each subsequent quarter advances by 1 column
+    ALL values are extracted from Management Cijfers sheet using FULLY DYNAMIC column selection.
+    The column is automatically calculated based on quarter and year - NO HARDCODING.
+    
+    Column Calculation Formula (fully dynamic):
+        quarterly_column = 27 + ((year * 4 + quarter) - (2025 * 4 + 3))
+    
+    Examples (automatically calculated):
+        Q3 2025 → Column AA (index 27)  [base reference]
+        Q4 2025 → Column AB (index 28)  [auto-calculated]
+        Q1 2026 → Column AC (index 29)  [auto-calculated]
+        Q2 2026 → Column AD (index 30)  [auto-calculated]
+        ... and so on for ALL future quarters
+    
+    Row mappings in Management Cijfers (rows are fixed, columns are dynamic):
+        - Row 23: Gross Theoretical rental income (GTRI)
+        - Row 24: (Financial vacancy) amount
+        - Row 25: Gross rental income (calculated: GTRI - vacancy)
+        - Row 26: Vacancy % (calculated)
+        - Row 32: (Maintenance & repair costs actual)
+        - Row 50: Cash proceeds sale (unit sale proceeds)
+    
+    LTM (Last Twelve Months) values are extracted from the column immediately
+    to the right of the quarterly column (quarterly_column + 1).
     
     Args:
         ma_path: Path to Management Accounts Excel file
@@ -96,11 +115,16 @@ def extract_values_from_management_accounts(ma_path: str, quarter: int, year: in
         
     Returns:
         Dictionary with extracted values in €k
+        
+    Note: This function is FULLY DYNAMIC and will automatically work for Q4 2025,
+    Q1 2026, and all future quarters without any code changes. The base reference
+    (Q3 2025 = Column AA) is only used as a calculation anchor point.
     """
     import openpyxl
+    from openpyxl.utils import get_column_letter
     
     try:
-        # Load with data_only=True to get calculated values
+        # Load with data_only=True to get calculated values (formulas evaluated)
         wb = openpyxl.load_workbook(ma_path, data_only=True)
         
         # Find Management Cijfers sheet
@@ -108,6 +132,7 @@ def extract_values_from_management_accounts(ma_path: str, quarter: int, year: in
         for name in wb.sheetnames:
             if 'Management Cijfers' in name:
                 cijfers_sheet = wb[name]
+                logger.info(f"Found Management Cijfers sheet: {name}")
                 break
         
         if cijfers_sheet is None:
@@ -115,67 +140,195 @@ def extract_values_from_management_accounts(ma_path: str, quarter: int, year: in
             wb.close()
             return {}
         
-        # Calculate column indices dynamically
-        # Base: Q3 2025 = Column AA (index 27)
+        # Calculate column index DYNAMICALLY (fully automatic for any quarter/year)
+        # Base reference: Q3 2025 = Column AA (index 27) - used only as anchor point
         # Formula: column = 27 + ((year * 4 + quarter) - (2025 * 4 + 3))
-        base_quarter_total = 2025 * 4 + 3  # Q3 2025 = 8103
+        # This automatically calculates: Q4 2025 → AB, Q1 2026 → AC, Q2 2026 → AD, etc.
+        base_quarter_total = 2025 * 4 + 3  # Q3 2025 = 8103 (reference anchor)
         target_quarter_total = year * 4 + quarter
         quarterly_column = 27 + (target_quarter_total - base_quarter_total)
-        ltm_column = quarterly_column + 1
+        ltm_column = quarterly_column + 1  # LTM is always 1 column to the right
         
-        logger.info(f"Extracting values from columns {quarterly_column} (quarterly) and {ltm_column} (LTM)")
-        
-        # Find BDO sheet for direct value extraction
-        bdo_sheet = None
-        expected_bdo_name = f"BDO - Q{quarter}-{str(year)[-2:]}"
-        for name in wb.sheetnames:
-            if expected_bdo_name in name:
-                bdo_sheet = wb[name]
-                break
+        col_letter = get_column_letter(quarterly_column)
+        ltm_letter = get_column_letter(ltm_column)
+        logger.info(f"Q{quarter} {year}: Extracting ALL values from column {col_letter} ({quarterly_column})")
         
         values = {}
         
-        # Extract from BDO sheet (more reliable for calculated values)
-        if bdo_sheet:
-            # Row 76: GTRI (stored as negative, take absolute)
-            gtri_q = bdo_sheet.cell(row=76, column=7).value  # Column G
-            gtri_ltm = bdo_sheet.cell(row=76, column=8).value  # Column H
-            values['gtri'] = abs(gtri_q) / 1000 if gtri_q else 0
-            values['gtri_ltm'] = abs(gtri_ltm) / 1000 if gtri_ltm else 0
+        # Helper function to extract value from cell, handling formulas
+        def get_cell_value(sheet, row, col, wb_formulas=None, wb_data=None):
+            """Get cell value, handling formulas by parsing and evaluating."""
+            val = sheet.cell(row=row, column=col).value
             
-            # Row 77: Financial vacancy (stored as positive)
-            vac_q = bdo_sheet.cell(row=77, column=7).value
-            vac_ltm = bdo_sheet.cell(row=77, column=8).value
-            values['vacancy_amount'] = abs(vac_q) / 1000 if vac_q else 0
-            values['vacancy_amount_ltm'] = abs(vac_ltm) / 1000 if vac_ltm else 0
+            # If value is None and we have formulas workbook, try to parse formula
+            if val is None and wb_formulas:
+                formula_sheet = None
+                for name in wb_formulas.sheetnames:
+                    if 'Management Cijfers' in name:
+                        formula_sheet = wb_formulas[name]
+                        break
+                
+                if formula_sheet:
+                    formula = formula_sheet.cell(row=row, column=col).value
+                    if formula and isinstance(formula, str) and formula.startswith('='):
+                        import re
+                        from openpyxl.utils import column_index_from_string
+                        
+                        # Parse formula like: =-'BDO - Q3-25'!G76
+                        match = re.match(r"=-?'([^']+)'!([A-Z]+\d+)", formula)
+                        if match:
+                            ref_sheet_name = match.group(1)
+                            ref_cell = match.group(2)
+                            
+                            # Find referenced sheet in data workbook
+                            if wb_data:
+                                for sheet_name in wb_data.sheetnames:
+                                    if ref_sheet_name in sheet_name:
+                                        ref_sheet = wb_data[sheet_name]
+                                        # Parse cell reference (e.g., G76)
+                                        col_letter = ''.join(filter(str.isalpha, ref_cell))
+                                        row_num = int(''.join(filter(str.isdigit, ref_cell)))
+                                        col_num = column_index_from_string(col_letter)
+                                        
+                                        # Get value from referenced cell
+                                        ref_val = ref_sheet.cell(row=row_num, column=col_num).value
+                                        if ref_val is not None:
+                                            # Apply negation (formula starts with -)
+                                            return -ref_val
+                        # Pattern: =SUM(AA23:AA24)
+                        elif 'SUM' in formula:
+                            match = re.search(r'SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', formula)
+                            if match:
+                                start_col = column_index_from_string(match.group(1))
+                                start_row = int(match.group(2))
+                                end_col = column_index_from_string(match.group(3))
+                                end_row = int(match.group(4))
+                                
+                                # Sum the range - recursively get values for each cell
+                                total = 0
+                                for r in range(start_row, end_row + 1):
+                                    for c in range(start_col, end_col + 1):
+                                        # Recursively get cell value (handles formulas)
+                                        cell_val = get_cell_value(sheet, r, c, wb_formulas, wb_data)
+                                        if cell_val is not None:
+                                            total += cell_val
+                                return total
             
-            # Row 88: Maintenance (stored as positive)
-            maint_q = bdo_sheet.cell(row=88, column=7).value
-            maint_ltm = bdo_sheet.cell(row=88, column=8).value
-            values['maintenance'] = abs(maint_q) / 1000 if maint_q else 0
-            values['maintenance_ltm'] = abs(maint_ltm) / 1000 if maint_ltm else 0
-            
-            logger.info(f"Extracted from BDO: GTRI={values['gtri']:.1f}k, Vacancy={values['vacancy_amount']:.1f}k")
+            return val
         
-        # Calculate derived values
-        values['gross_rental'] = values.get('gtri', 0) - values.get('vacancy_amount', 0)
-        values['gross_rental_ltm'] = values.get('gtri_ltm', 0) - values.get('vacancy_amount_ltm', 0)
+        # Load formulas workbook for parsing if needed
+        wb_formulas = None
+        try:
+            wb_formulas = openpyxl.load_workbook(ma_path, data_only=False)
+        except:
+            pass
         
-        # Vacancy percentage
-        if values.get('gtri', 0) > 0:
-            values['vacancy_pct'] = (values.get('vacancy_amount', 0) / values['gtri']) * 100
+        # Extract ALL values from Management Cijfers using the dynamically calculated column
+        # Row 23: GTRI (stored as negative in formulas, take absolute)
+        gtri_val = get_cell_value(cijfers_sheet, 23, quarterly_column, wb_formulas, wb)
+        values['gtri'] = abs(gtri_val) / 1000 if gtri_val else 0
+        
+        # Row 24: Financial vacancy amount (stored as positive)
+        vac_val = get_cell_value(cijfers_sheet, 24, quarterly_column, wb_formulas, wb)
+        values['vacancy_amount'] = abs(vac_val) / 1000 if vac_val else 0
+        
+        # Row 25: Gross rental income (calculated value)
+        gross_rental_val = get_cell_value(cijfers_sheet, 25, quarterly_column, wb_formulas, wb)
+        values['gross_rental'] = abs(gross_rental_val) / 1000 if gross_rental_val else 0
+        
+        # Row 26: Vacancy percentage (calculated value, may be decimal like 0.054 or percentage like 5.4)
+        vac_pct_val = get_cell_value(cijfers_sheet, 26, quarterly_column, wb_formulas, wb)
+        if vac_pct_val is not None:
+            # If value is < 1, it's a decimal (0.054), multiply by 100
+            # If value is >= 1, it's already a percentage (5.4)
+            if abs(vac_pct_val) < 1:
+                values['vacancy_pct'] = abs(vac_pct_val) * 100
+            else:
+                values['vacancy_pct'] = abs(vac_pct_val)
         else:
-            values['vacancy_pct'] = 0
+            # Calculate from amount if percentage not available
+            if values.get('gtri', 0) > 0:
+                values['vacancy_pct'] = (values.get('vacancy_amount', 0) / values['gtri']) * 100
+            else:
+                values['vacancy_pct'] = 0
         
-        # Extract cash proceeds from Management Cijfers row 50
-        cash_proceeds = cijfers_sheet.cell(row=50, column=quarterly_column).value
+        # Row 32: Maintenance & repair costs
+        maint_val = get_cell_value(cijfers_sheet, 32, quarterly_column, wb_formulas, wb)
+        values['maintenance'] = abs(maint_val) / 1000 if maint_val else 0
+        
+        # Row 50: Cash proceeds sale (unit sale proceeds)
+        cash_proceeds = get_cell_value(cijfers_sheet, 50, quarterly_column, wb_formulas, wb)
         values['unit_sales_proceeds'] = abs(cash_proceeds) / 1000 if cash_proceeds else 0
+        
+        # Extract LTM values from LTM column (quarterly_column + 1)
+        gtri_ltm_val = get_cell_value(cijfers_sheet, 23, ltm_column, wb_formulas, wb)
+        values['gtri_ltm'] = abs(gtri_ltm_val) / 1000 if gtri_ltm_val else 0
+        
+        vac_ltm_val = get_cell_value(cijfers_sheet, 24, ltm_column, wb_formulas, wb)
+        values['vacancy_amount_ltm'] = abs(vac_ltm_val) / 1000 if vac_ltm_val else 0
+        
+        gross_rental_ltm_val = get_cell_value(cijfers_sheet, 25, ltm_column, wb_formulas, wb)
+        values['gross_rental_ltm'] = abs(gross_rental_ltm_val) / 1000 if gross_rental_ltm_val else 0
+        
+        maint_ltm_val = get_cell_value(cijfers_sheet, 32, ltm_column, wb_formulas, wb)
+        values['maintenance_ltm'] = abs(maint_ltm_val) / 1000 if maint_ltm_val else 0
+        
+        # Close formulas workbook if opened
+        if wb_formulas:
+            wb_formulas.close()
+        
+        # Fallback: If values are still None/zero (formulas not calculated), try BDO sheet directly
+        if values['gtri'] == 0 or values['vacancy_amount'] == 0:
+            logger.warning("Some values from Management Cijfers are None, trying BDO sheet as fallback")
+            expected_bdo_name = f"BDO - Q{quarter}-{str(year)[-2:]}"
+            for name in wb.sheetnames:
+                if expected_bdo_name in name:
+                    bdo_sheet = wb[name]
+                    logger.info(f"Using BDO sheet as fallback: {name}")
+                    
+                    if values['gtri'] == 0:
+                        gtri_q = bdo_sheet.cell(row=76, column=7).value
+                        values['gtri'] = abs(gtri_q) / 1000 if gtri_q else 0
+                        gtri_ltm = bdo_sheet.cell(row=76, column=8).value
+                        values['gtri_ltm'] = abs(gtri_ltm) / 1000 if gtri_ltm else 0
+                    
+                    if values['vacancy_amount'] == 0:
+                        vac_q = bdo_sheet.cell(row=77, column=7).value
+                        values['vacancy_amount'] = abs(vac_q) / 1000 if vac_q else 0
+                        vac_ltm = bdo_sheet.cell(row=77, column=8).value
+                        values['vacancy_amount_ltm'] = abs(vac_ltm) / 1000 if vac_ltm else 0
+                    
+                    if values['maintenance'] == 0:
+                        maint_q = bdo_sheet.cell(row=88, column=7).value
+                        values['maintenance'] = abs(maint_q) / 1000 if maint_q else 0
+                        maint_ltm = bdo_sheet.cell(row=88, column=8).value
+                        values['maintenance_ltm'] = abs(maint_ltm) / 1000 if maint_ltm else 0
+                    
+                    # Recalculate derived values
+                    values['gross_rental'] = values.get('gtri', 0) - values.get('vacancy_amount', 0)
+                    values['gross_rental_ltm'] = values.get('gtri_ltm', 0) - values.get('vacancy_amount_ltm', 0)
+                    if values.get('gtri', 0) > 0:
+                        values['vacancy_pct'] = (values.get('vacancy_amount', 0) / values['gtri']) * 100
+                    break
+        
+        # Log all extracted values
+        logger.info(f"=== All Values from Management Cijfers Column {col_letter} (Q{quarter} {year}) ===")
+        logger.info(f"  Gross Theoretical rental income: €{values['gtri']:,.1f}k")
+        logger.info(f"  Gross rental income: €{values['gross_rental']:,.1f}k")
+        logger.info(f"  Financial vacancy: {values['vacancy_pct']:.1f}% (€{values['vacancy_amount']:,.1f}k)")
+        logger.info(f"  Maintenance: €{values['maintenance']:,.1f}k")
+        logger.info(f"  Unit sale proceeds: €{values['unit_sales_proceeds']:,.0f}k")
+        logger.info(f"  LTM GTRI: €{values['gtri_ltm']:,.1f}k")
+        logger.info(f"  LTM Gross rental: €{values['gross_rental_ltm']:,.1f}k")
+        logger.info(f"  LTM Maintenance: €{values['maintenance_ltm']:,.1f}k")
         
         wb.close()
         return values
         
     except Exception as e:
         logger.error(f"Error extracting values from Management Accounts: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
@@ -785,14 +938,18 @@ class WordTemplateUpdater:
                 # E.g., "Q2 2025" might be: <w:t>Q2</w:t></w:r><w:r><w:t> 2025</w:t>
                 content = self._apply_fragmented_replacements(content, replacements)
                 
-                # Apply context-aware numeric replacements for Page 4 KPIs
+                # Apply numeric value replacements for Page 4 KPIs
                 if values:
-                    content, num_count = self._apply_context_numeric_replacements(content, values)
-                    numeric_updates += num_count
-                    
-                    # Apply fragmented euro value replacements
+                    # Apply fragmented euro value replacements FIRST
+                    # This handles Portfolio Highlights values (4 + . + 1 + % as separate elements)
+                    # before _apply_context_numeric_replacements modifies body text
                     content, frag_count = self._apply_fragmented_euro_replacements(content, values)
                     numeric_updates += frag_count
+                    
+                    # Apply context-aware numeric replacements
+                    # This handles body text values (4. + 1 as combined elements)
+                    content, num_count = self._apply_context_numeric_replacements(content, values)
+                    numeric_updates += num_count
                     
                     # Apply fragmented date replacements (e.g., "1- 7 -202 5" -> "1- 10 -202 5")
                     content = self._apply_fragmented_date_replacements(content, replacements)
@@ -934,17 +1091,21 @@ class WordTemplateUpdater:
                 
             # Find context regions containing the keywords
             for keyword in keywords:
-                # Find all occurrences of the keyword in XML content
-                keyword_positions = []
-                pos = 0
-                while True:
-                    pos = content.find(keyword, pos)
-                    if pos == -1:
-                        break
-                    keyword_positions.append(pos)
-                    pos += 1
+                # Process keywords one at a time, starting search from beginning each time
+                # This handles cases where content changes after replacement
+                search_start = 0
+                max_iterations = 20  # Safety limit to prevent infinite loops
+                iterations = 0
                 
-                for kw_pos in keyword_positions:
+                while iterations < max_iterations:
+                    iterations += 1
+                    kw_pos = content.find(keyword, search_start)
+                    if kw_pos == -1:
+                        break
+                    
+                    # Track if we made a replacement for this keyword occurrence
+                    made_replacement = False
+                    
                     # Look for Euro amounts or percentages - need ~1200 chars as numbers can be highly fragmented
                     search_region = content[kw_pos:kw_pos + 1500]
                     
@@ -965,46 +1126,46 @@ class WordTemplateUpdater:
                             if content[full_pos:full_pos + len(old_val)] == old_val:
                                 content = content[:full_pos] + new_formatted + content[full_pos + len(old_val):]
                                 updates_made += 1
+                                made_replacement = True
                                 logger.debug(f"Replaced '{old_val}' with '{new_formatted}' near '{keyword}'")
-                                break
                         
                         # Handle fragmented case: €</w:t>...<w:t>X,XXX</w:t>
                         # Word often splits numbers like "3,200.6" into: "3," | "20" | "0" | "." | "6"
                         # Strategy: Find the full region, replace in middle section, then swap back
-                        
-                        # Find the Euro sign and everything up to the 'k' or 'm' suffix
-                        full_value_pattern = r'(>€</w:t>)(.*?)(>k</w:t>|>m</w:t>)'
-                        match = re.search(full_value_pattern, search_region, re.DOTALL | re.IGNORECASE)
-                        
-                        if match:
-                            middle_section = match.group(2)  # Everything between € and k
+                        if not made_replacement:
+                            # Find the Euro sign and everything up to the 'k' or 'm' suffix
+                            full_value_pattern = r'(>€</w:t>)(.*?)(>k</w:t>|>m</w:t>)'
+                            match = re.search(full_value_pattern, search_region, re.DOTALL | re.IGNORECASE)
                             
-                            # Find all number/dot fragments in the middle section
-                            frag_pattern = r'>([\d,\.]+)</w:t>'
-                            fragments = list(re.finditer(frag_pattern, middle_section))
-                            
-                            if fragments:
-                                new_num = f'{new_value:,.0f}'
+                            if match:
+                                middle_section = match.group(2)  # Everything between € and k
                                 
-                                # Rebuild middle section: first fragment gets new value, rest become empty
-                                new_middle = middle_section
-                                for i, frag in enumerate(fragments):
-                                    old_text = f'>{frag.group(1)}</w:t>'
-                                    if i == 0:
-                                        # First fragment gets the new value
-                                        new_middle = new_middle.replace(old_text, f'>{new_num}</w:t>', 1)
-                                        logger.debug(f"Replaced fragment '{frag.group(1)}' with '{new_num}' near '{keyword}'")
-                                    else:
-                                        # Subsequent fragments become empty
-                                        new_middle = new_middle.replace(old_text, '></w:t>', 1)
-                                        logger.debug(f"Cleared fragment '{frag.group(1)}' near '{keyword}'")
+                                # Find all number/dot fragments in the middle section
+                                frag_pattern = r'>([\d,\.]+)</w:t>'
+                                fragments = list(re.finditer(frag_pattern, middle_section))
                                 
-                                # Calculate absolute position and replace the middle section
-                                abs_start = kw_pos + match.start(2)
-                                abs_end = kw_pos + match.end(2)
-                                content = content[:abs_start] + new_middle + content[abs_end:]
-                                updates_made += 1
-                                break
+                                if fragments:
+                                    new_num = f'{new_value:,.0f}'
+                                    
+                                    # Rebuild middle section: first fragment gets new value, rest become empty
+                                    new_middle = middle_section
+                                    for i, frag in enumerate(fragments):
+                                        old_text = f'>{frag.group(1)}</w:t>'
+                                        if i == 0:
+                                            # First fragment gets the new value
+                                            new_middle = new_middle.replace(old_text, f'>{new_num}</w:t>', 1)
+                                            logger.debug(f"Replaced fragment '{frag.group(1)}' with '{new_num}' near '{keyword}'")
+                                        else:
+                                            # Subsequent fragments become empty
+                                            new_middle = new_middle.replace(old_text, '></w:t>', 1)
+                                            logger.debug(f"Cleared fragment '{frag.group(1)}' near '{keyword}'")
+                                    
+                                    # Calculate absolute position and replace the middle section
+                                    abs_start = kw_pos + match.start(2)
+                                    abs_end = kw_pos + match.end(2)
+                                    content = content[:abs_start] + new_middle + content[abs_end:]
+                                    updates_made += 1
+                                    made_replacement = True
                     
                     elif value_format == 'percent':
                         # Pattern to find percentages: X.X% or X%
@@ -1021,50 +1182,35 @@ class WordTemplateUpdater:
                             if content[full_pos:full_pos + len(old_val)] == old_val:
                                 content = content[:full_pos] + new_formatted + content[full_pos + len(old_val):]
                                 updates_made += 1
+                                made_replacement = True
                                 logger.debug(f"Replaced percentage '{old_val}' with '{new_formatted}' near '{keyword}'")
-                                break
                         
                         # Try fragmented pattern: >X.</w:t>...<w:t>Y</w:t>
-                        # where X.Y is the percentage value (the % might be in same or separate element)
-                        # Pattern: ">4.</w:t>...<w:t>1</w:t>" 
-                        frag_pct_pattern = r'(>)(\d+)\.</w:t>.*?<w:t[^>]*>(\d+)</w:t>'
-                        match = re.search(frag_pct_pattern, search_region, re.DOTALL)
-                        if match:
-                            old_int = match.group(2)
-                            old_decimal = match.group(3)
-                            
-                            new_int = str(int(new_value))
-                            new_decimal = str(int(round((new_value % 1) * 10)))  # Get first decimal digit
-                            
-                            logger.debug(f"Found fragmented percentage {old_int}.{old_decimal}% near '{keyword}', replacing with {new_int}.{new_decimal}%")
-                            
-                            # Replace integer part first (e.g., >4.</w:t> -> >4.</w:t>)
-                            # match.start(1) gives position of the '>' which precedes the integer
-                            int_pos = kw_pos + match.start(1)
-                            old_int_full = f'>{old_int}.</w:t>'
-                            new_int_full = f'>{new_int}.</w:t>'
-                            
-                            logger.debug(f"Looking for '{old_int_full}' at position {int_pos}, found: '{content[int_pos:int_pos + len(old_int_full)]}'")
-                            
-                            if content[int_pos:int_pos + len(old_int_full)] == old_int_full:
-                                content = content[:int_pos] + new_int_full + content[int_pos + len(old_int_full):]
-                                updates_made += 1
-                                logger.debug(f"Replaced fragmented percentage integer '{old_int}.' with '{new_int}.' near '{keyword}'")
+                        if not made_replacement:
+                            # where X.Y is the percentage value (the % might be in same or separate element)
+                            # Pattern: ">4.</w:t>...<w:t>1</w:t>" 
+                            frag_pct_pattern = r'(>)(\d+)\.</w:t>.*?<w:t[^>]*>(\d+)</w:t>'
+                            match = re.search(frag_pct_pattern, search_region, re.DOTALL)
+                            if match:
+                                old_int = match.group(2)
+                                old_decimal = match.group(3)
                                 
-                                # Now find and replace the decimal part
-                                # Need to re-search after replacement
-                                search_region_new = content[kw_pos:kw_pos + 800]
-                                frag_pct_pattern2 = r'(>)(\d+)\.</w:t>.*?<w:t[^>]*>(\d+)</w:t>'
-                                match_new = re.search(frag_pct_pattern2, search_region_new, re.DOTALL)
+                                new_int = str(int(new_value))
+                                new_decimal = str(int(round((new_value % 1) * 10)))  # Get first decimal digit
                                 
-                                if match_new:
-                                    # Position of the decimal in the new search region
-                                    dec_pos = kw_pos + match_new.start(3)
-                                    old_dec_full = f'>{old_decimal}</w:t>'
-                                    new_dec_full = f'>{new_decimal}</w:t>'
+                                logger.debug(f"Found fragmented percentage {old_int}.{old_decimal}% near '{keyword}', replacing with {new_int}.{new_decimal}%")
+                                
+                                int_pos = kw_pos + match.start(1)
+                                old_int_full = f'>{old_int}.</w:t>'
+                                new_int_full = f'>{new_int}.</w:t>'
+                                
+                                if content[int_pos:int_pos + len(old_int_full)] == old_int_full:
+                                    content = content[:int_pos] + new_int_full + content[int_pos + len(old_int_full):]
+                                    updates_made += 1
+                                    made_replacement = True
+                                    logger.debug(f"Replaced fragmented percentage integer '{old_int}.' with '{new_int}.' near '{keyword}'")
                                     
-                                    # Need to find the actual position - the decimal is after the integer part
-                                    # Search for the decimal value pattern after the integer
+                                    # Now find and replace the decimal part
                                     dec_search_start = int_pos + len(new_int_full)
                                     dec_search_region = content[dec_search_start:dec_search_start + 300]
                                     dec_pattern = rf'<w:t[^>]*>({old_decimal})</w:t>'
@@ -1076,7 +1222,10 @@ class WordTemplateUpdater:
                                             content = content[:actual_dec_pos] + new_decimal + content[actual_dec_pos + len(old_decimal):]
                                             updates_made += 1
                                             logger.debug(f"Replaced fragmented percentage decimal '{old_decimal}' with '{new_decimal}' near '{keyword}'")
-                            break
+                    
+                    # Move search_start past this keyword occurrence
+                    # Always move past the current position to avoid infinite loops
+                    search_start = kw_pos + len(keyword)
         
         return content, updates_made
     
@@ -1122,19 +1271,29 @@ class WordTemplateUpdater:
         # The pattern should capture the first numeric fragment that will hold the new value
         
         value_replacements = [
-            # Gross rental income: "€ 3,0 6 7 . 5 k" -> new value
-            # Pattern: >3,0</w:t>...<w:t>6</w:t>...<w:t>7</w:t>...<w:t>.</w:t>...<w:t>5</w:t>
+            # === Portfolio Highlights Section ===
+            # GTRI: "€" + "3," + "20" + "0" + "." + "6" + "k" -> new GTRI value
+            # Exact fragmentation from template: € | 3, | 20 | 0 | . | 6
+            (r'>(3,)</w:t>(.*?<w:t[^>]*>)(20)</w:t>(.*?<w:t[^>]*>)(0)</w:t>(.*?<w:t[^>]*>)(\.)</w:t>',
+             values.gtri, 'gtri_portfolio'),
+            
+            # Gross rental income: "€" + "3,0" + "6" + "7" + "." + "5" + "k"
             (r'>(3,0)</w:t>(.*?<w:t[^>]*>)(6)(</w:t>.*?<w:t[^>]*>)(7)(</w:t>.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(5)</w:t>',
              values.gross_rental_income, 'gross_rental'),
             
-            # Rent roll yields: " yields €12, 940 . 2 k" -> new LTM value  
-            # The structure is: " yields €12," + "940" + "." + "2"
-            # Pattern: > yields €12,</w:t>...<w:t>940</w:t>...<w:t>.</w:t>...<w:t>2</w:t>
+            # Financial vacancy percentage pattern 1: "4" + "." + "1" + "%" -> "5.4%"
+            (r'>(4)</w:t>(.*?<w:t[^>]*>)(\.)</w:t>(.*?<w:t[^>]*>)(1)</w:t>(.*?<w:t[^>]*>)(%)</w:t>',
+             values.financial_vacancy_pct, 'vacancy_pct'),
+            
+            # Financial vacancy percentage pattern 2: "4." + "1" + "%" (4. together) -> "5.4%"
+            (r'>(4\.)</w:t>(.*?<w:t[^>]*>)(1)</w:t>(.*?<w:t[^>]*>)(%)',
+             values.financial_vacancy_pct, 'vacancy_pct_combined'),
+            
+            # Rent roll yields: " yields €12," + "940" + "." + "2" -> new LTM value  
             (r'>( yields €12,)</w:t>(.*?<w:t[^>]*>)(940)(</w:t>.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(2)</w:t>',
              values.gtri_ltm, 'rent_roll_yields'),
             
-            # Unit sale proceeds: "€ 762 . 5 k" -> new value
-            # Pattern: >762</w:t>...<w:t>.</w:t>...<w:t>5</w:t>
+            # Unit sale proceeds: "762" + "." + "5" -> new value
             (r'>(762)</w:t>(.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(5)</w:t>',
              values.unit_sales_proceeds, 'unit_sales'),
         ]
@@ -1143,37 +1302,86 @@ class WordTemplateUpdater:
             if new_value <= 0:
                 continue
             
-            match = re.search(pattern, content, re.DOTALL)
-            if match:
-                # Format new value
-                new_formatted = f'{new_value:,.1f}'
+            # Find all matches and process them
+            # Use re.sub with count or process one at a time with fresh search
+            while True:
+                match = re.search(pattern, content, re.DOTALL)
+                if not match:
+                    break
+                # Format new value based on type
+                if 'pct' in desc:
+                    new_formatted = f'{new_value:.1f}'
+                else:
+                    new_formatted = f'{new_value:,.1f}'
                 
                 old_full = match.group(0)
                 first_group = match.group(1)
                 
-                # Handle rent_roll_yields specially - transform structure to match expected
-                # Uploaded: " yields €12," + "940" + "." + "2" + "k"
-                # Expected: " yields €" + "13,317" + "." + "9" + "k"
+                # Handle different replacement types
                 if desc == 'rent_roll_yields':
                     int_part = int(new_value)
                     dec_part = int(round((new_value - int_part) * 10))
                     
-                    # Replace " yields €12," with " yields €"
                     new_full = old_full.replace(f'>{first_group}</w:t>', '> yields €</w:t>', 1)
-                    # Replace "940" with the formatted integer part
                     new_full = re.sub(r'>(940)</w:t>', f'>{int_part:,}</w:t>', new_full)
-                    # Keep "." as is
-                    # Replace "2" with the decimal digit
                     new_full = re.sub(r'>(2)</w:t>', f'>{dec_part}</w:t>', new_full)
+                    
+                elif desc == 'gtri_portfolio':
+                    # GTRI: "3," + "20" + "0" + "." -> "3,273.6"
+                    int_part = int(new_value)
+                    dec_part = int(round((new_value - int_part) * 10))
+                    
+                    # Replace "3," with new thousands part (without period, we add decimal at end)
+                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part:,}.</w:t>', 1)
+                    # Replace "20" with decimal digit
+                    new_full = re.sub(r'>(20)</w:t>', f'>{dec_part}</w:t>', new_full)
+                    # Clear "0" - keep the tag structure but remove digit
+                    new_full = re.sub(r'>(0)</w:t>', '></w:t>', new_full)
+                    # Clear "." since we already added decimal point above
+                    new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
+                    
+                elif desc == 'vacancy_pct':
+                    # Vacancy percentage: "4" + "." + "1" + "%" -> "5.4%"
+                    int_part = int(new_value)
+                    dec_part = int(round((new_value - int_part) * 10))
+                    
+                    # Replace the entire fragmented pattern at once to avoid creating new matches
+                    # Extract positions of key elements in the match
+                    # Simply put the whole value in the first element and clear others
+                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part}.{dec_part}</w:t>', 1)
+                    # Clear the original "." 
+                    new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
+                    # Clear the "1" completely (don't replace with 4 which creates new match)
+                    new_full = re.sub(r'>(1)</w:t>', '></w:t>', new_full)
+                    
+                elif desc == 'vacancy_pct_combined':
+                    # Vacancy percentage: "4." + "1" + "%" -> "5.4%"
+                    int_part = int(new_value)
+                    dec_part = int(round((new_value - int_part) * 10))
+                    
+                    # Put the whole value in the first element
+                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part}.{dec_part}</w:t>', 1)
+                    # Clear "1" completely
+                    new_full = re.sub(r'>(1)</w:t>', '></w:t>', new_full)
+                    
+                elif desc == 'unit_sales':
+                    # Unit sales proceeds: "762" + "." + "5" -> "204" (new value)
+                    # Put the rounded value in the first element and clear others
+                    new_int = int(round(new_value))
+                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{new_int}</w:t>', 1)
+                    # Clear "." 
+                    new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
+                    # Clear "5" 
+                    new_full = re.sub(r'>(5)</w:t>', '></w:t>', new_full)
+                    
                 else:
-                    # Replace first numeric group with new value
+                    # Default: Replace first numeric group with new value
                     new_full = old_full.replace(f'>{first_group}</w:t>', f'>{new_formatted}</w:t>', 1)
                     
-                    # Clear subsequent numeric fragments (replace digits with empty)
+                    # Clear subsequent numeric fragments
                     first_close = new_full.find('</w:t>')
                     if first_close > 0:
                         rest = new_full[first_close:]
-                        # Clear numeric fragments
                         rest = re.sub(r'>(\d+)</w:t>', '></w:t>', rest)
                         rest = re.sub(r'>( ?\d+)</w:t>', '></w:t>', rest)
                         rest = re.sub(r'>(\.)</w:t>', '></w:t>', rest)

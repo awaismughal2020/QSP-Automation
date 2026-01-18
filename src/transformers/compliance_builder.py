@@ -82,7 +82,7 @@ class ComplianceBuilder:
         self.output_path = Path(output_path)
         self.config = config
         self.workbook = None
-    
+        
     def _get_previous_period_end(self):
         """
         Calculate the PREVIOUS quarter's period end date.
@@ -1145,6 +1145,12 @@ class ComplianceBuilder:
         
         logger.info(f"Updated {updated_count} cells in SFA CC ({formula_count} formulas)")
         
+        # Update G44 (Proceeds from disposals) to reference Q3 Management Accounts C49
+        ma_sheet_name = f"Q{self.config.quarter} Management Accounts"
+        g44_formula = f"='{ma_sheet_name}'!C49"
+        sheet.cell(row=44, column=7).value = g44_formula
+        logger.info(f"Set G44 to {g44_formula}")
+        
         # Update signature page dates (typically in rows 82+)
         self._update_signature_page_dates(sheet)
         
@@ -1363,6 +1369,14 @@ class ComplianceBuilder:
                 logger.info(f"Updated {target_col_letter}3 from 'Forecast' to 'Actual'")
             
             logger.info(f"Copied {values_copied} actual values to Suppl. Calc column {target_col_letter}")
+            
+            # Set formula rows - these should never be replaced with values
+            # These are summary/total formulas that must always reference their column
+            self._set_suppl_calc_formula_rows(suppl_sheet, target_column)
+            
+            # Update formulas and shift columns for next quarter
+            self._update_suppl_calc_quarter_formulas(suppl_sheet, target_column)
+            
             ma_wb_formulas.close()
             ma_wb_data.close()
             
@@ -1370,6 +1384,246 @@ class ComplianceBuilder:
             logger.error(f"Error copying actual values to Suppl. Calc: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _set_suppl_calc_formula_rows(self, suppl_sheet, target_column: int):
+        """
+        Set formula rows in Suppl. Calc that should never be replaced with values.
+        
+        These are summary/total rows that must always contain formulas:
+        - Row 8: =X6+X5+X7
+        - Row 13: =SUM(X10:X12)
+        - Row 26: =SUM(X17:X25)
+        - Row 27: =X26+X13+X8
+        - Row 29: =X27+X28
+        - Row 31: =X29
+        - Row 35: =X33+X32+X31
+        - Row 43: =SUM(X41:X42)
+        
+        Args:
+            suppl_sheet: The Suppl. Calc worksheet
+            target_column: Column index to set formulas for
+        """
+        col_letter = get_column_letter(target_column)
+        
+        # Define formula templates for each row
+        formula_rows = {
+            8: f"={col_letter}6+{col_letter}5+{col_letter}7",
+            13: f"=SUM({col_letter}10:{col_letter}12)",
+            26: f"=SUM({col_letter}17:{col_letter}25)",
+            27: f"={col_letter}26+{col_letter}13+{col_letter}8",
+            29: f"={col_letter}27+{col_letter}28",
+            31: f"={col_letter}29",
+            35: f"={col_letter}33+{col_letter}32+{col_letter}31",
+            43: f"=SUM({col_letter}41:{col_letter}42)",
+        }
+        
+        for row, formula in formula_rows.items():
+            suppl_sheet.cell(row=row, column=target_column).value = formula
+        
+        logger.info(f"Set {len(formula_rows)} formula rows in column {col_letter}")
+        
+        # Also set formulas for all subsequent quarterly columns (P, Q, R, S)
+        # to ensure they maintain formula structure
+        for col in range(target_column + 1, 20):  # Up to S(19)
+            c_letter = get_column_letter(col)
+            for row, _ in formula_rows.items():
+                # Generate the formula for this column
+                if row == 8:
+                    formula = f"={c_letter}6+{c_letter}5+{c_letter}7"
+                elif row == 13:
+                    formula = f"=SUM({c_letter}10:{c_letter}12)"
+                elif row == 26:
+                    formula = f"=SUM({c_letter}17:{c_letter}25)"
+                elif row == 27:
+                    formula = f"={c_letter}26+{c_letter}13+{c_letter}8"
+                elif row == 29:
+                    formula = f"={c_letter}27+{c_letter}28"
+                elif row == 31:
+                    formula = f"={c_letter}29"
+                elif row == 35:
+                    formula = f"={c_letter}33+{c_letter}32+{c_letter}31"
+                elif row == 43:
+                    formula = f"=SUM({c_letter}41:{c_letter}42)"
+                
+                suppl_sheet.cell(row=row, column=col).value = formula
+    
+    def _update_suppl_calc_quarter_formulas(self, suppl_sheet, target_column: int):
+        """
+        Update Suppl. Calc sheet formulas for quarter progression.
+        
+        This handles:
+        1. Updating Column T formulas to reference the new actual column (O→P, P→Q, etc.)
+        2. Shifting empty S column to have R column data
+        3. Updating Row 6 formula pattern
+        4. Setting proper formulas for rows 31-35 (not values)
+        
+        Args:
+            suppl_sheet: The Suppl. Calc worksheet
+            target_column: Current quarter's column index (O=15 for Q3)
+        """
+        from openpyxl.utils import get_column_letter
+        
+        target_col_letter = get_column_letter(target_column)
+        prev_col_letter = get_column_letter(target_column - 1) if target_column > 1 else 'N'
+        
+        # === 1. Update Column T (and subsequent NTM columns) formulas ===
+        # Column T is typically column 20, but for NTM calculations, update SUM ranges
+        # The NTM column sums from O:R (or the 4 quarterly columns)
+        # After Q3 actual data, formulas should reference P onwards for forecasts
+        
+        # Find the NTM/Total column (usually T=20)
+        ntm_column = 20  # Column T
+        
+        # Update NTM column formulas to reflect the new range
+        # After adding actual to O, the SUM should shift: SUM(O6:R6) stays the same
+        # but individual cell references like O5*$V$6 in forecast columns should shift
+        logger.info("Updating Suppl. Calc formulas for quarter progression")
+        
+        # === 2. Copy R column data to S column ===
+        # S is column 19, R is column 18
+        # Even if S has some data (headers, row 7), it may be missing most values
+        s_column = 19
+        r_column = 18
+        
+        # Check how many data rows in S are empty vs R
+        # If S is mostly empty compared to R, copy R to S
+        r_data_count = 0
+        s_data_count = 0
+        for check_row in range(5, 46):  # Data rows
+            if suppl_sheet.cell(row=check_row, column=r_column).value is not None:
+                r_data_count += 1
+            if suppl_sheet.cell(row=check_row, column=s_column).value is not None:
+                s_data_count += 1
+        
+        s_needs_copy = s_data_count < r_data_count * 0.5  # S has less than half the data of R
+        
+        if s_needs_copy:
+            logger.info(f"Column S has {s_data_count} cells vs R's {r_data_count} - copying R to S")
+            # Copy R to S for all data rows, adjusting formulas
+            for row in range(4, suppl_sheet.max_row + 1):
+                r_val = suppl_sheet.cell(row=row, column=r_column).value
+                s_val = suppl_sheet.cell(row=row, column=s_column).value
+                
+                # Only copy if R has data and S is empty
+                if r_val is not None and s_val is None:
+                    # If it's a formula, adjust references from R to S
+                    if isinstance(r_val, str) and r_val.startswith('='):
+                        # Smart formula adjustment: R references become S references
+                        # Also need to update Q references to R for relative formulas
+                        new_formula = r_val
+                        # Replace cell references: Q→R, R→S in formulas
+                        import re
+                        # Replace R column references with S
+                        new_formula = re.sub(r'\bR(\d+)', r'S\1', new_formula)
+                        # Replace Q column references with R (for formulas like =Q41-350000)
+                        new_formula = re.sub(r'\bQ(\d+)', r'R\1', new_formula)
+                        suppl_sheet.cell(row=row, column=s_column).value = new_formula
+                    else:
+                        suppl_sheet.cell(row=row, column=s_column).value = r_val
+            
+            # Update S column header (row 2) - should be next quarter after R
+            r_header = suppl_sheet.cell(row=2, column=r_column).value
+            if r_header:
+                # Parse header like "26Q2" and increment to "26Q3"
+                if 'Q' in str(r_header):
+                    year_part = str(r_header).split('Q')[0]
+                    q_part = int(str(r_header).split('Q')[1])
+                    new_q = q_part + 1
+                    new_year = year_part
+                    if new_q > 4:
+                        new_q = 1
+                        new_year = str(int(year_part) + 1)
+                    suppl_sheet.cell(row=2, column=s_column).value = f"{new_year}Q{new_q}"
+            
+            # Update S3 header
+            suppl_sheet.cell(row=3, column=s_column).value = "Forecast"
+        else:
+            s_needs_copy = False
+        
+        # === 3. Update Row 6 formula pattern ===
+        # Row 6 formula in forecast columns: =P5*$W$6, =Q5*$W$6, etc.
+        # The reference column (W) contains the -3.5% growth rate
+        # Find the column with the growth rate value (should be one after NTM column + 2)
+        # NTM is at T(20), so the rate is at W(23) for Q3, moves to X(24) for Q4, etc.
+        
+        # Find where row 6 has the -3.5% value (or similar rate)
+        rate_col = None
+        for col in range(ntm_column + 1, ntm_column + 10):
+            val = suppl_sheet.cell(row=6, column=col).value
+            if val is not None and isinstance(val, (int, float)) and val != 0:
+                rate_col = col
+                break
+        
+        if rate_col is None:
+            # Default to W (23) if not found
+            rate_col = 23
+        
+        rate_col_letter = get_column_letter(rate_col)
+        logger.info(f"Row 6 rate column: {rate_col_letter} (value: {suppl_sheet.cell(row=6, column=rate_col).value})")
+        
+        # Update formulas for columns P through S to use the correct rate column
+        for col in range(16, 20):  # P(16) to S(19)
+            col_letter = get_column_letter(col)
+            expected_formula = f"={col_letter}5*${rate_col_letter}$6"
+            suppl_sheet.cell(row=6, column=col).value = expected_formula
+            logger.debug(f"Updated {col_letter}6 formula to {expected_formula}")
+        
+        # Make sure S6 has the formula if S was copied
+        if s_needs_copy:
+            suppl_sheet.cell(row=6, column=s_column).value = f"=S5*${rate_col_letter}$6"
+        
+        # === 4. Set proper formulas for rows 31-35 ===
+        # These should have formulas, not values
+        # O31 = "=O29"
+        # O32 = "=-(N41*(1.75%)+(N41*4%*30%))/4"  <- references previous column (N for O)
+        # O33 = "=-(N41*70%*2.6%)/4"  <- references previous column
+        # O35 = "=O33+O32+O31"
+        
+        # Set formulas for the target column (current quarter)
+        suppl_sheet.cell(row=31, column=target_column).value = f"={target_col_letter}29"
+        suppl_sheet.cell(row=32, column=target_column).value = f"=-({prev_col_letter}41*(1.75%)+({prev_col_letter}41*4%*30%))/4"
+        suppl_sheet.cell(row=33, column=target_column).value = f"=-({prev_col_letter}41*70%*2.6%)/4"
+        suppl_sheet.cell(row=35, column=target_column).value = f"={target_col_letter}33+{target_col_letter}32+{target_col_letter}31"
+        
+        logger.info(f"Updated rows 31-35 in column {target_col_letter} with proper formulas")
+        
+        # Also update formulas for subsequent columns (P, Q, R, S) to maintain consistency
+        for col in range(target_column + 1, 20):  # Up to S(19)
+            col_letter = get_column_letter(col)
+            prev_letter = get_column_letter(col - 1)
+            
+            # Update row 31
+            suppl_sheet.cell(row=31, column=col).value = f"={col_letter}29"
+            # Update row 32 - references previous column for row 41
+            suppl_sheet.cell(row=32, column=col).value = f"=-({prev_letter}41*(1.75%)+({prev_letter}41*4%*30%))/4"
+            # Update row 33 - references previous column for row 41
+            suppl_sheet.cell(row=33, column=col).value = f"=-({prev_letter}41*70%*2.6%)/4"
+            # Update row 35 - sum of 31, 32, 33
+            suppl_sheet.cell(row=35, column=col).value = f"={col_letter}33+{col_letter}32+{col_letter}31"
+            
+            logger.debug(f"Updated rows 31-35 formulas in column {col_letter}")
+        
+        # === 5. Update Column T (NTM) SUM ranges ===
+        # After adding actual data to O, NTM SUM should start from P (next forecast column)
+        # Change =SUM(O5:R5) or =SUM(O5:S5) to =SUM(P5:S5)
+        # The new start column is one after the target (actual) column
+        new_sum_start = get_column_letter(target_column + 1)  # P for Q3
+        
+        for row in range(4, 42):  # Rows 4 to 41 as specified
+            t_val = suppl_sheet.cell(row=row, column=ntm_column).value
+            if t_val and isinstance(t_val, str) and '=SUM(' in t_val:
+                # Update SUM range: change start from O to P, end to S
+                # Pattern: =SUM(O5:R5) or =SUM(O5:S5) -> =SUM(P5:S5)
+                new_formula = re.sub(
+                    r'=SUM\([A-Z]+(\d+):[A-Z]+(\d+)\)',
+                    f'=SUM({new_sum_start}\\1:S\\2)',
+                    t_val
+                )
+                if new_formula != t_val:
+                    suppl_sheet.cell(row=row, column=ntm_column).value = new_formula
+                    logger.debug(f"Updated T{row}: {t_val} -> {new_formula}")
+        
+        logger.info("Completed Suppl. Calc formula updates")
     
     def _update_signature_page_dates(self, sheet):
         """
