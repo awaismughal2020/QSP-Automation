@@ -187,9 +187,8 @@ class QuarterlyReportOrchestrator:
             results['output_files'].append(str(ma_output))
             
             # Step 4b: Build Compliance Certificate
-            # IMPORTANT: The Q{n} Management Accounts sheet in the Compliance Certificate
-            # should contain the PREVIOUS quarter's LTM data (i.e., Q{n-1} closing balances).
-            # So we pass the INPUT Management Accounts file (previous quarter), not the OUTPUT.
+            # The Q{n} Management Accounts sheet should contain CURRENT quarter's LTM data.
+            # We pass the newly generated Management Accounts file (ma_output).
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -201,8 +200,8 @@ class QuarterlyReportOrchestrator:
                 str(compliance_output),
                 compliance_config
             )
-            # Pass the INPUT (previous quarter) Management Accounts file for Q{n} MA sheet data
-            compliance_builder.build(bdo_result, str(self.config.previous_management_accounts))
+            # Pass the newly generated Management Accounts file for Q{n} MA sheet data (LTM Q{n})
+            compliance_builder.build(bdo_result, str(ma_output))
             results['steps']['compliance_certificate'] = {
                 'status': 'success',
                 'output': str(compliance_output)

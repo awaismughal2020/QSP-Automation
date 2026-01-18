@@ -138,7 +138,11 @@ class ComplianceBuilder:
         # Step 5: Update SFA CC formulas (if needed)
         self._update_sfa_cc_sheet()
         
-        # Step 6: Update all dates and text references throughout workbook
+        # Step 6: Copy actual values from Management Cijfers to Suppl. Calc
+        if management_accounts_path:
+            self._copy_actual_values_to_suppl_calc(management_accounts_path)
+        
+        # Step 7: Update all dates and text references throughout workbook
         self._update_all_dates_and_text()
         
         # Save output
@@ -181,43 +185,73 @@ class ComplianceBuilder:
     
     def _copy_ma_data(self, target_sheet_name: str, source_path: str):
         """
-        Copy Management Accounts data from the PREVIOUS quarter's file.
+        Copy Management Accounts data from the CURRENT quarter's file.
         
-        IMPORTANT: The Q{n} Management Accounts sheet in the Compliance Certificate
-        should contain the PREVIOUS quarter's (Q{n-1}) LTM data, not the current quarter's.
+        The Q{n} Management Accounts sheet in the Compliance Certificate
+        should contain the CURRENT quarter's (Q{n}) LTM data.
         
         For example:
-        - Q3 Compliance Certificate -> Q3 Management Accounts sheet -> Q2 LTM data (June 30)
-        - Q4 Compliance Certificate -> Q4 Management Accounts sheet -> Q3 LTM data (Sept 30)
+        - Q3 Compliance Certificate -> Q3 Management Accounts sheet -> Q3 LTM data (Sept 30)
+        - Q4 Compliance Certificate -> Q4 Management Accounts sheet -> Q4 LTM data (Dec 31)
         
         The approach:
-        1. Load the PREVIOUS quarter's Management Accounts file with data_only=True
+        1. Load the CURRENT quarter's Management Accounts file with data_only=True
            (to get Excel's cached/calculated values directly)
-        2. Find the LTM column (which contains the previous quarter's closing balances)
+        2. Find the LTM column (which contains the current quarter's closing balances)
         3. Copy the cached values to the Compliance Certificate's Management Accounts sheet
         
         Using cached values is more reliable than re-evaluating formulas, as the input
         file has been opened and calculated in Excel.
         """
         try:
-            # Load with data_only=True to get CACHED Excel values (not formulas)
-            # This is critical - the Excel file has been calculated, so we get accurate values
-            source_wb = openpyxl.load_workbook(source_path, data_only=True)
+            # First try to load with data_only=True to get CACHED Excel values
+            source_wb_data = openpyxl.load_workbook(source_path, data_only=True)
+            
+            # Also load with data_only=False to get formulas (for fallback evaluation)
+            source_wb_formulas = openpyxl.load_workbook(source_path, data_only=False)
             
             target_sheet = self.workbook[target_sheet_name]
             
-            # Find the Management Cijfers sheet
-            cijfers_sheet = None
-            for name in source_wb.sheetnames:
+            # Find the Management Cijfers sheet in both workbooks
+            cijfers_sheet_data = None
+            cijfers_sheet_formulas = None
+            bdo_sheet = None
+            bdo_sheet_name = None
+            
+            for name in source_wb_data.sheetnames:
                 if 'Management Cijfers' in name:
-                    cijfers_sheet = source_wb[name]
-                    logger.info(f"Using Management Cijfers sheet: {name} (reading cached values)")
+                    cijfers_sheet_data = source_wb_data[name]
+                    cijfers_sheet_formulas = source_wb_formulas[name]
+                    logger.info(f"Using Management Cijfers sheet: {name}")
                     break
             
-            if cijfers_sheet is None:
+            # Find the BDO sheet for formula evaluation fallback
+            # Look for the current quarter's BDO sheet (e.g., "BDO - Q3-25" for Q3 2025)
+            expected_bdo_name = f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}"
+            for name in source_wb_formulas.sheetnames:
+                if name == expected_bdo_name:
+                    bdo_sheet = source_wb_formulas[name]
+                    bdo_sheet_name = name
+                    logger.info(f"Found BDO sheet for formula evaluation: {name}")
+                    break
+            
+            # Fallback: search for any BDO sheet with current quarter
+            if bdo_sheet is None:
+                for name in source_wb_formulas.sheetnames:
+                    if 'BDO -' in name and f"Q{self.config.quarter}-" in name:
+                        bdo_sheet = source_wb_formulas[name]
+                        bdo_sheet_name = name
+                        logger.info(f"Found BDO sheet (fallback): {name}")
+                        break
+            
+            if cijfers_sheet_data is None:
                 logger.warning("Management Cijfers sheet not found in source file")
-                source_wb.close()
+                source_wb_data.close()
+                source_wb_formulas.close()
                 return
+            
+            # Use the data workbook's sheet for values (if available)
+            cijfers_sheet = cijfers_sheet_data
             
             # DYNAMICALLY find the LTM column in Management Cijfers
             # Search row 22 from RIGHT TO LEFT to find the most recent LTM column
@@ -248,54 +282,444 @@ class ComplianceBuilder:
             
             # Create mapping from target row to source row
             # Target row in Compliance Certificate -> Source row in Management Cijfers
-            target_to_source_mapping = {
-                2: 3,   # Deferred Tax Asset
-                3: 4,   # Real estate
-                4: 5,   # Financial fixed assets
-                5: 6,   # Accounts receivable
-                6: 7,   # Service costs to be charged
-                7: 8,   # Prepaid expenses
-                8: 9,   # Cash
-                9: 10,  # Equity
-                10: 11, # AC Shareholder
-                11: 12, # Bank loan
-                12: 13, # Amortised fee
-                13: 14, # Accounts payable
-                14: 15, # Current account
-                15: 16, # VAT payable
-                16: 17, # Deposits
-                17: 18, # Rent Invoiced in advance
-            }
+            # The CC sheet has rows offset by -1 compared to Management Cijfers
+            # Balance Sheet section: rows 2-17 -> source rows 3-18
+            # P&L section: rows 22-67 -> source rows 23-68
+            target_to_source_mapping = {}
             
-            # Update Row 1: Header with PREVIOUS quarter's end date
-            prev_period_end = self._get_previous_period_end()
-            target_sheet.cell(row=1, column=3).value = prev_period_end
+            # Balance Sheet section (target rows 2-17 -> source rows 3-18)
+            for target_row in range(2, 18):
+                target_to_source_mapping[target_row] = target_row + 1
+            
+            # P&L section (target rows 22-67 -> source rows 23-68)
+            # Skip row 21 as it's the title which we set separately
+            for target_row in range(22, 68):
+                target_to_source_mapping[target_row] = target_row + 1
+            
+            # Bank account overview section (target rows 72-78 -> source rows 107-113)
+            # Skip row 71 as it's the header which we set separately
+            for target_row in range(72, 79):
+                target_to_source_mapping[target_row] = target_row + 35
+            
+            # Update Row 1: Header with CURRENT quarter's end date
+            period_end = self.config.period_end
+            target_sheet.cell(row=1, column=3).value = period_end
             target_sheet.cell(row=1, column=3).number_format = 'YYYY-MM-DD'
-            logger.info(f"Set header date to previous quarter end: {prev_period_end}")
+            logger.info(f"Set header date to current quarter end: {period_end}")
             
-            # Update Row 21: P&L section title to show PREVIOUS quarter's LTM
-            # (since this sheet contains previous quarter's data)
-            prev_ltm_title = f"LTM {self.config.prev_quarter_str}"
-            target_sheet.cell(row=21, column=3).value = prev_ltm_title
-            logger.info(f"Set P&L title (row 21) to: {prev_ltm_title}")
+            # Update Row 21: P&L section title to show CURRENT quarter's LTM
+            # (since this sheet contains current quarter's data)
+            ltm_title = f"LTM {self.config.quarter_str}"
+            target_sheet.cell(row=21, column=3).value = ltm_title
+            logger.info(f"Set P&L title (row 21) to: {ltm_title}")
+            
+            # Update Row 71: Bank account overview header with current quarter end date
+            # Format as "Per DD-M-YYYY" (e.g., "Per 30-9-2025")
+            bank_header = f"Per {period_end.day}-{period_end.month}-{period_end.year}"
+            target_sheet.cell(row=71, column=3).value = bank_header
+            logger.info(f"Set bank account header (row 71) to: {bank_header}")
             
             items_copied = 0
             
-            # Copy CACHED values directly from the LTM column
+            # First pass: Evaluate and store all values from source
+            # We need to do this because some formulas reference other rows in the same column
+            evaluated_values = {}
+            
+            def evaluate_cell(source_row: int) -> float:
+                """Recursively evaluate a cell's value, handling internal references."""
+                if source_row in evaluated_values:
+                    return evaluated_values[source_row]
+                
+                # Try cached value first (from data_only workbook)
+                value = cijfers_sheet_data.cell(row=source_row, column=ltm_column).value
+                if value is not None and isinstance(value, (int, float)):
+                    evaluated_values[source_row] = float(value)
+                    return float(value)
+                
+                # Get the cell value from formulas workbook
+                formula = cijfers_sheet_formulas.cell(row=source_row, column=ltm_column).value
+                
+                # Handle None
+                if formula is None:
+                    evaluated_values[source_row] = None
+                    return None
+                
+                # Handle numeric values (e.g., 0 entered directly)
+                if isinstance(formula, (int, float)):
+                    evaluated_values[source_row] = float(formula)
+                    return float(formula)
+                
+                # Handle text values (like "LTM Q3 2025")
+                if isinstance(formula, str) and not formula.startswith('='):
+                    evaluated_values[source_row] = formula
+                    return None
+                
+                # Evaluate the formula
+                result = self._evaluate_formula_with_internal_refs(
+                    formula, bdo_sheet, bdo_sheet_name, ltm_column, 
+                    cijfers_sheet_formulas, evaluate_cell
+                )
+                evaluated_values[source_row] = result
+                return result
+            
+            # Evaluate all source rows
             for target_row, source_row in target_to_source_mapping.items():
-                value = cijfers_sheet.cell(row=source_row, column=ltm_column).value
+                evaluate_cell(source_row)
+            
+            # Second pass: Copy evaluated values to target sheet
+            for target_row, source_row in target_to_source_mapping.items():
+                value = evaluated_values.get(source_row)
+                
                 if value is not None:
                     target_sheet.cell(row=target_row, column=3).value = value
                     items_copied += 1
                     logger.debug(f"Copied value {value} to row {target_row} from source row {source_row}")
             
-            logger.info(f"Copied {items_copied} cached values to {target_sheet_name}")
-            source_wb.close()
+            logger.info(f"Copied {items_copied} values to {target_sheet_name}")
+            source_wb_data.close()
+            source_wb_formulas.close()
             
         except Exception as e:
             logger.error(f"Error copying MA data: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _evaluate_formula_with_internal_refs(self, formula: str, bdo_sheet, bdo_sheet_name: str,
+                                               ltm_column: int, cijfers_sheet, evaluate_cell_func):
+        """
+        Evaluate a formula that may contain:
+        - BDO sheet references (='BDO - Q3-25'!H16)
+        - Internal column references (=SUM(AB23:AB24))
+        - Negation formulas (=-'BDO - Q3-25'!H76)
+        - Division formulas (=AB25/AB23-1)
+        - Column range sums (=SUM(X50:AA50))
+        - Complex internal formulas (=-(AB50-AB53))
+        
+        Args:
+            formula: The formula string to evaluate
+            bdo_sheet: The BDO worksheet
+            bdo_sheet_name: Name of the BDO sheet
+            ltm_column: The LTM column index in Management Cijfers
+            cijfers_sheet: The Management Cijfers worksheet (formulas version)
+            evaluate_cell_func: Function to recursively evaluate cells
+        """
+        import re
+        from openpyxl.utils import column_index_from_string, get_column_letter
+        
+        if not formula or not isinstance(formula, str) or not formula.startswith('='):
+            return None
+        
+        ltm_col_letter = get_column_letter(ltm_column)
+        
+        try:
+            formula_body = formula[1:]  # Remove leading '='
+            
+            # Handle division formulas like =AB25/AB23-1
+            division_pattern = rf"{ltm_col_letter}(\d+)/{ltm_col_letter}(\d+)(-?\d*)"
+            division_match = re.match(division_pattern, formula_body)
+            if division_match:
+                numerator_row = int(division_match.group(1))
+                denominator_row = int(division_match.group(2))
+                offset_str = division_match.group(3)
+                
+                num_val = evaluate_cell_func(numerator_row)
+                denom_val = evaluate_cell_func(denominator_row)
+                
+                if num_val is not None and denom_val is not None and denom_val != 0:
+                    result = float(num_val) / float(denom_val)
+                    if offset_str:
+                        result += float(offset_str)
+                    return result
+                return None
+            
+            # Handle SUM with different column range: =SUM(X50:AA50)
+            # But NOT when it's the same column as LTM (that should use internal_sum_pattern)
+            cross_col_sum_pattern = r"SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)"
+            cross_col_match = re.match(cross_col_sum_pattern, formula_body)
+            if cross_col_match:
+                start_col = cross_col_match.group(1)
+                start_row = int(cross_col_match.group(2))
+                end_col = cross_col_match.group(3)
+                end_row = int(cross_col_match.group(4))
+                
+                # If both columns are the LTM column, skip to internal_sum_pattern handling
+                if start_col == ltm_col_letter and end_col == ltm_col_letter:
+                    pass  # Skip - will be handled by internal_sum_pattern below
+                else:
+                    # Sum across the column range (different columns)
+                    total = 0.0
+                    start_col_idx = column_index_from_string(start_col)
+                    end_col_idx = column_index_from_string(end_col)
+                    
+                    for col in range(start_col_idx, end_col_idx + 1):
+                        for row in range(start_row, end_row + 1):
+                            cell_val = cijfers_sheet.cell(row=row, column=col).value
+                            if isinstance(cell_val, (int, float)):
+                                total += float(cell_val)
+                            elif isinstance(cell_val, str) and not cell_val.startswith('='):
+                                try:
+                                    total += float(cell_val)
+                                except ValueError:
+                                    pass
+                    return total  # Return 0 if formula evaluates to 0
+            
+            # Handle complex parenthesized formulas: =-(AB50-AB53)
+            paren_pattern = rf"-\({ltm_col_letter}(\d+)-{ltm_col_letter}(\d+)\)"
+            paren_match = re.match(paren_pattern, formula_body)
+            if paren_match:
+                row1 = int(paren_match.group(1))
+                row2 = int(paren_match.group(2))
+                val1 = evaluate_cell_func(row1)
+                val2 = evaluate_cell_func(row2)
+                if val1 is not None and val2 is not None:
+                    return -(float(val1) - float(val2))
+                return None
+            
+            # Check if this is primarily a BDO reference formula
+            # (contains 'BDO' and not just internal column references)
+            if 'BDO' in formula_body:
+                # Delegate to BDO reference evaluation
+                bdo_value = self._evaluate_bdo_reference(formula, bdo_sheet, bdo_sheet_name)
+                if bdo_value is not None:
+                    return bdo_value
+            
+            # Check if it starts with negation (=-...)
+            negate_result = False
+            if formula_body.startswith('-'):
+                negate_result = True
+                formula_body = formula_body[1:]
+            
+            # Pattern for internal SUM references: SUM(AB23:AB24)
+            internal_sum_pattern = rf"SUM\({ltm_col_letter}(\d+):{ltm_col_letter}(\d+)\)"
+            
+            # Check for internal SUM pattern
+            internal_sum_match = re.search(internal_sum_pattern, formula_body)
+            if internal_sum_match:
+                start_row = int(internal_sum_match.group(1))
+                end_row = int(internal_sum_match.group(2))
+                total = 0.0
+                for row in range(start_row, end_row + 1):
+                    cell_val = evaluate_cell_func(row)
+                    if cell_val is not None and isinstance(cell_val, (int, float)):
+                        total += float(cell_val)
+                
+                # Process remaining terms after the SUM
+                remaining = formula_body[internal_sum_match.end():]
+                total += self._process_additional_terms(remaining, bdo_sheet, ltm_col_letter, evaluate_cell_func)
+                
+                return -total if negate_result else total
+            
+            # Pattern for addition of internal cell references: AB57+AB65 or AB47+AB46+AB45
+            internal_add_pattern = rf"^{ltm_col_letter}(\d+)(?:\+{ltm_col_letter}(\d+))+$"
+            if re.match(internal_add_pattern, formula_body):
+                total = 0.0
+                for row_str in re.findall(rf"{ltm_col_letter}(\d+)", formula_body):
+                    row_num = int(row_str)
+                    cell_val = evaluate_cell_func(row_num)
+                    if cell_val is not None and isinstance(cell_val, (int, float)):
+                        total += float(cell_val)
+                return -total if negate_result else total
+            
+            # Pattern for single internal cell reference
+            internal_ref_pattern = rf"^{ltm_col_letter}(\d+)$"
+            single_ref_match = re.match(internal_ref_pattern, formula_body)
+            if single_ref_match:
+                row_num = int(single_ref_match.group(1))
+                cell_val = evaluate_cell_func(row_num)
+                if cell_val is not None:
+                    return -float(cell_val) if negate_result else float(cell_val)
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Could not evaluate formula with internal refs '{formula}': {e}")
+            return None
+    
+    def _process_additional_terms(self, remaining: str, bdo_sheet, ltm_col_letter: str, evaluate_cell_func):
+        """Process additional terms like +AB45 or -'BDO'!H76."""
+        import re
+        
+        total = 0.0
+        
+        # Process internal column references: +AB45 or -AB45
+        internal_pattern = rf"([+-]){ltm_col_letter}(\d+)"
+        for match in re.finditer(internal_pattern, remaining):
+            sign = 1 if match.group(1) == '+' else -1
+            row_num = int(match.group(2))
+            cell_val = evaluate_cell_func(row_num)
+            if cell_val is not None and isinstance(cell_val, (int, float)):
+                total += sign * float(cell_val)
+        
+        return total
+    
+    def _evaluate_bdo_reference(self, formula: str, bdo_sheet, bdo_sheet_name: str):
+        """
+        Evaluate a formula that references the BDO sheet.
+        
+        Handles patterns like:
+        - ='BDO - Q3-25'!H16 (single cell reference)
+        - =SUM('BDO - Q3-25'!H6:H10) (SUM range)
+        - ='BDO - Q3-25'!H13+'BDO - Q3-25'!H14+'BDO - Q3-25'!H15 (additions)
+        - =SUM('BDO - Q3-25'!H67:H72)+'BDO - Q3-25'!H65 (combined)
+        
+        Also handles nested formulas where BDO column H contains SUM(C:G) formulas.
+        """
+        import re
+        from openpyxl.utils import column_index_from_string
+        
+        if not formula or not isinstance(formula, str):
+            return None
+        
+        def evaluate_simple_expr(expr: str) -> float:
+            """Evaluate a simple arithmetic expression like =-110650-5."""
+            try:
+                # Remove the leading = if present
+                if expr.startswith('='):
+                    expr = expr[1:]
+                # Only evaluate if it's a simple arithmetic expression (numbers and +/-)
+                if re.match(r'^[\d\.\-\+\s]+$', expr):
+                    return float(eval(expr))
+            except Exception:
+                pass
+            return 0.0
+        
+        def get_raw_cell_value(row: int, col: int, depth: int = 0) -> float:
+            """Get numeric value from a cell, evaluating nested formulas if needed."""
+            if depth > 10:  # Prevent infinite recursion
+                return 0.0
+            
+            val = bdo_sheet.cell(row=row, column=col).value
+            if val is None:
+                return 0.0
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str) and val.startswith('='):
+                # Handle cell reference formulas like =D130
+                cell_ref = re.match(r'^=([A-Z]+)(\d+)$', val)
+                if cell_ref:
+                    ref_col = column_index_from_string(cell_ref.group(1))
+                    ref_row = int(cell_ref.group(2))
+                    return get_raw_cell_value(ref_row, ref_col, depth + 1)
+                
+                # Try to evaluate SUM formulas
+                inner_sum = re.match(r'=SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', val)
+                if inner_sum:
+                    start_col = column_index_from_string(inner_sum.group(1))
+                    start_row = int(inner_sum.group(2))
+                    end_col = column_index_from_string(inner_sum.group(3))
+                    end_row = int(inner_sum.group(4))
+                    total = 0.0
+                    for r in range(start_row, end_row + 1):
+                        for c in range(start_col, end_col + 1):
+                            total += get_raw_cell_value(r, c, depth + 1)
+                    return total
+                
+                # Try to evaluate simple expressions like =-110650-5
+                return evaluate_simple_expr(val)
+            return 0.0
+        
+        def evaluate_inner_sum(inner_formula: str) -> float:
+            """Evaluate a SUM formula within the BDO sheet like =SUM(C6:G6)."""
+            inner_sum = re.match(r'=SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)', inner_formula)
+            if inner_sum:
+                start_col = column_index_from_string(inner_sum.group(1))
+                start_row = int(inner_sum.group(2))
+                end_col = column_index_from_string(inner_sum.group(3))
+                end_row = int(inner_sum.group(4))
+                
+                total = 0.0
+                for r in range(start_row, end_row + 1):
+                    for c in range(start_col, end_col + 1):
+                        total += get_raw_cell_value(r, c, 0)  # Pass depth parameter
+                return total
+            return 0.0
+        
+        def get_cell_value(col_letter: str, row_num: int) -> float:
+            """Get numeric value from BDO sheet cell, evaluating nested formulas if needed."""
+            try:
+                col_idx = column_index_from_string(col_letter)
+                value = bdo_sheet.cell(row=row_num, column=col_idx).value
+                
+                # If None, return 0
+                if value is None:
+                    return 0.0
+                
+                # If it's a number, return it directly
+                if isinstance(value, (int, float)):
+                    return float(value)
+                
+                # If it's a formula, try to evaluate it
+                if isinstance(value, str) and value.startswith('='):
+                    # First try as a SUM formula
+                    result = evaluate_inner_sum(value)
+                    if result != 0.0:
+                        return result
+                    # Then try as a simple expression
+                    return evaluate_simple_expr(value)
+                    
+            except Exception:
+                pass
+            return 0.0
+        
+        def evaluate_sum_range(col_letter: str, start_row: int, end_row: int) -> float:
+            """Evaluate a SUM range like H6:H10."""
+            total = 0.0
+            for row in range(start_row, end_row + 1):
+                total += get_cell_value(col_letter, row)
+            return total
+        
+        try:
+            total = 0.0
+            remaining = formula
+            
+            # Track if we found any matches (SUM or cell references)
+            found_matches = False
+            
+            # Process all SUM(...) parts first
+            sum_pattern = r"SUM\('[^']+'\!([A-Z]+)(\d+):([A-Z]+)(\d+)\)"
+            for match in re.finditer(sum_pattern, remaining):
+                found_matches = True
+                col_letter = match.group(1)
+                start_row = int(match.group(2))
+                end_col = match.group(3)
+                end_row = int(match.group(4))
+                
+                # Assuming same column for range (H6:H10, not H6:I10)
+                if col_letter == end_col:
+                    total += evaluate_sum_range(col_letter, start_row, end_row)
+            
+            # Remove processed SUM parts from remaining
+            remaining = re.sub(sum_pattern, '', remaining)
+            
+            # Process all single cell references with + or - signs
+            # For formula =-'BDO'!H76-'BDO'!H77, we parse each term with its sign:
+            # - First term after '=' has sign determined by what follows '='
+            # - Subsequent terms have explicit + or - signs
+            
+            # Pattern to match: =-'BDO'!H76 or ='BDO'!H76 or +/-'BDO'!H76
+            # We need to handle the = at the start specially
+            formula_body = remaining[1:] if remaining.startswith('=') else remaining
+            
+            # Pattern for all cell references with their signs
+            # This matches: -'BDO...'!H76 or +'BDO...'!H76 or 'BDO...'!H76 (implicit +)
+            cell_pattern = r"([+-]?)'[^']+'\!([A-Z]+)(\d+)"
+            
+            for match in re.finditer(cell_pattern, formula_body):
+                found_matches = True
+                sign_str = match.group(1)
+                col_letter = match.group(2)
+                row_num = int(match.group(3))
+                
+                # Determine sign: '-' means negative, '+' or '' means positive
+                sign = -1 if sign_str == '-' else 1
+                total += sign * get_cell_value(col_letter, row_num)
+            
+            # Return total if we found matches (even if 0), None if no matches
+            return total if found_matches else None
+            
+        except Exception as e:
+            logger.debug(f"Could not evaluate formula '{formula}': {e}")
+            return None
     
     def _evaluate_simple_formula(self, formula: str, sheet, current_row: int) -> float:
         """Evaluate a simple SUM formula within the same sheet."""
@@ -727,6 +1151,226 @@ class ComplianceBuilder:
         # Ensure signature page content exists
         self._ensure_signature_page(sheet)
     
+    def _copy_actual_values_to_suppl_calc(self, management_accounts_path: str):
+        """
+        Copy actual values from Management Cijfers to Suppl. Calc sheet.
+        
+        This matches keywords in Suppl. Calc Column B with Management Cijfers Column A,
+        and copies the corresponding values from the LTM column to the current quarter column.
+        
+        Quarter to column mapping:
+        - Q3 2025 → Column O (15)
+        - Q4 2025 → Column P (16)
+        - Q1 2026 → Column Q (17)
+        - Q2 2026 → Column R (18)
+        """
+        if 'Suppl. Calc' not in self.workbook.sheetnames:
+            logger.warning("Suppl. Calc sheet not found")
+            return
+        
+        suppl_sheet = self.workbook['Suppl. Calc']
+        
+        # Load Management Cijfers sheet with both formula and data views
+        try:
+            ma_wb_formulas = openpyxl.load_workbook(management_accounts_path, data_only=False)
+            ma_wb_data = openpyxl.load_workbook(management_accounts_path, data_only=True)
+            
+            # Find Management Cijfers sheet (formulas)
+            cijfers_sheet = None
+            cijfers_sheet_data = None
+            for name in ma_wb_formulas.sheetnames:
+                if 'Management Cijfers' in name:
+                    cijfers_sheet = ma_wb_formulas[name]
+                    cijfers_sheet_data = ma_wb_data[name]
+                    break
+            
+            if cijfers_sheet is None:
+                logger.warning("Management Cijfers sheet not found in Management Accounts file")
+                ma_wb_formulas.close()
+                ma_wb_data.close()
+                return
+            
+            # Find BDO sheet for formula evaluation
+            expected_bdo_name = f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}"
+            bdo_sheet = None
+            for name in ma_wb_formulas.sheetnames:
+                if expected_bdo_name in name:
+                    bdo_sheet = ma_wb_formulas[name]
+                    logger.info(f"Found BDO sheet for Suppl. Calc: {name}")
+                    break
+            
+            # Find the current quarter column in Management Cijfers (NOT the LTM column)
+            # For Q3 2025, this is Column AA (the quarter column, not AB which is LTM)
+            # The quarter column is one to the left of the LTM column
+            source_column = None
+            quarter_header = f"Q{self.config.quarter} {self.config.year}"
+            
+            for col in range(cijfers_sheet.max_column, 0, -1):
+                cell_val = cijfers_sheet.cell(row=22, column=col).value
+                if cell_val:
+                    cell_str = str(cell_val)
+                    # Look for the quarter header (e.g., "Q3 2025") NOT the LTM header
+                    if quarter_header in cell_str and 'LTM' not in cell_str:
+                        source_column = col
+                        logger.info(f"Found quarter column at {get_column_letter(col)} ({col}) with header: '{cell_str}'")
+                        break
+            
+            if source_column is None:
+                logger.warning(f"Could not find quarter column '{quarter_header}' in Management Cijfers")
+                ma_wb_formulas.close()
+                ma_wb_data.close()
+                return
+            
+            source_col_letter = get_column_letter(source_column)
+            
+            # Determine target column based on quarter
+            # Q3=O(15), Q4=P(16), Q1=Q(17), Q2=R(18)
+            quarter_offset = (self.config.quarter - 3) % 4
+            target_column = 15 + quarter_offset  # O=15 for Q3
+            target_col_letter = get_column_letter(target_column)
+            
+            logger.info(f"Target column for Q{self.config.quarter}: {target_col_letter} ({target_column})")
+            
+            # Find LTM column for Balance Sheet items (one column to the right of quarter column)
+            ltm_column = source_column + 1
+            logger.info(f"LTM column for Balance Sheet items: {get_column_letter(ltm_column)} ({ltm_column})")
+            
+            # Keyword mapping: Suppl. Calc keyword -> (Management Cijfers keyword variations, row, is_balance_sheet)
+            # P&L items (rows 23-68) use quarterly column AA
+            # Balance Sheet items (rows 3-19) use LTM column AB
+            keyword_mapping = {
+                'Theoretical rental income after sales': (['Gross Theoretical rental income'], 23, False),
+                '(Financial vacancy)': (['(Financial vacancy)'], 24, False),
+                '(loss of rent from Unit Sales)': (None, None, None),  # Not in Management Cijfers - skip
+                'Gross rental income': (['Gross rental income'], 25, False),
+                'Service costs charged (100% occupancy)': (None, None, None),  # Skip - keep empty
+                '(Service costs recoverable)': (None, None, None),  # Skip - keep empty
+                '(Vacancy costs)': (['(Vacancy costs)'], 28, False),
+                'Non recoverable service charges': (['Service charges'], 30, False),
+                '(Maintenance & repair costs)': (['(Maintenance & repair costs actual)'], 32, False),
+                '(Owners society costs (VVE))': (['(Owners society costs (VVE))'], 33, False),
+                '(Insurance costs)': (['(Insurance costs)'], 34, False),
+                '(Landlord tax)': (['(Landlord tax costs)'], 35, False),
+                '(Property tax)': (['(Property tax)'], 36, False),
+                '(Other costs)': (['(Other costs)'], 40, False),
+                '(Agent costs) - in financing costs on CC': (['(Agent costs)'], 38, False),
+                '(Brokerage costs)': (['(Brokerage costs)'], 39, False),
+                '(Audit/fee costs)': (['(Accountant costs)', '(Advisory costs)'], [41, 42], False),  # Sum of both
+                'Property related expenses': (['Property related expenses'], 44, False),
+                'Net rental income': (['Net rental income'], 45, False),
+                '(Management fees)': (['(Management fees)'], 46, False),
+                'EBIT Rental operation': (['EBITDA rental operation'], 48, False),
+                'Total EBIT': (['Total EBITDA'], 55, False),
+                '(Interest expenses Senior)': (['(Net interest expenses - SFA)'], 60, False),
+                '(Interest expenses Hedge)': (['(Net interest expenses - Hedge)'], 64, False),
+                'EBT': (['EBT'], 66, False),
+                'Senior loan - EoP': (['Bank loan'], 12, True),  # Balance Sheet - use LTM column
+                'CAPEX loan - EoP': (None, None, None),  # Not in Management Cijfers - skip
+            }
+            
+            # Shift row 7 values to preserve forecast values by moving them forward
+            # Row 7 is "(loss of rent from Unit Sales)"
+            # The shift starts from the current quarter's target column and moves values right
+            # Q3 2025: O→P→Q→R→S, clear O
+            # Q4 2025: P→Q→R→S→T, clear P
+            # Q1 2026: Q→R→S→T→U, clear Q
+            # Q2 2026: R→S→T→U→V, clear R
+            shift_start_col = target_column  # Dynamic based on quarter
+            shift_cols = [shift_start_col + i for i in range(4)]  # 4 columns to shift
+            for i in range(len(shift_cols) - 1, -1, -1):
+                src_col = shift_cols[i]
+                dst_col = src_col + 1
+                val = suppl_sheet.cell(row=7, column=src_col).value
+                if val is not None:
+                    suppl_sheet.cell(row=7, column=dst_col).value = val
+            # Clear the current quarter's column (row 7) after shifting
+            suppl_sheet.cell(row=7, column=target_column).value = None
+            logger.info(f"Shifted row 7 values from {target_col_letter} onwards and cleared {target_col_letter}7")
+            
+            # Create helper function to evaluate a cell's value
+            def get_cell_value(row: int, col: int = source_column):
+                """Get a cell's value, evaluating formulas if needed."""
+                # Try cached value first
+                cached_val = cijfers_sheet_data.cell(row=row, column=col).value
+                if cached_val is not None and isinstance(cached_val, (int, float)):
+                    return cached_val
+                
+                # Try formula evaluation
+                formula = cijfers_sheet.cell(row=row, column=col).value
+                if formula and isinstance(formula, str) and formula.startswith('='):
+                    # Use the existing BDO evaluation logic
+                    if bdo_sheet is not None:
+                        result = self._evaluate_bdo_reference(formula, bdo_sheet, expected_bdo_name)
+                        if result is not None:
+                            return result
+                        
+                        # Try internal formula evaluation
+                        result = self._evaluate_formula_with_internal_refs(
+                            formula, bdo_sheet, expected_bdo_name, source_column, cijfers_sheet, get_cell_value
+                        )
+                        if result is not None:
+                            return result
+                
+                return None
+            
+            # Now process each keyword in Suppl. Calc
+            values_copied = 0
+            for suppl_row in range(1, suppl_sheet.max_row + 1):
+                suppl_keyword = suppl_sheet.cell(row=suppl_row, column=2).value  # Column B
+                if suppl_keyword is None:
+                    continue
+                
+                suppl_keyword_str = str(suppl_keyword).strip()
+                
+                # Check if this keyword is in our mapping
+                if suppl_keyword_str in keyword_mapping:
+                    keywords, source_rows, is_balance_sheet = keyword_mapping[suppl_keyword_str]
+                    if keywords is None:
+                        continue  # Skip keywords that don't exist in Management Cijfers
+                    
+                    # Determine which column to use
+                    # P&L items use quarterly column (AA), Balance Sheet uses LTM column (AB)
+                    use_column = ltm_column if is_balance_sheet else source_column
+                    
+                    # Get the value from Management Cijfers
+                    found_value = None
+                    
+                    if isinstance(source_rows, list):
+                        # Sum multiple rows (e.g., Accountant + Advisory for Audit/fee costs)
+                        total = 0.0
+                        all_found = True
+                        for src_row in source_rows:
+                            val = get_cell_value(src_row, use_column)
+                            if val is not None:
+                                total += val
+                            else:
+                                all_found = False
+                        if all_found or total != 0:
+                            found_value = total
+                    else:
+                        # Single row
+                        found_value = get_cell_value(source_rows, use_column)
+                    
+                    if found_value is not None:
+                        suppl_sheet.cell(row=suppl_row, column=target_column).value = found_value
+                        values_copied += 1
+                        logger.debug(f"Copied {found_value:,.2f} to Suppl. Calc row {suppl_row} ({suppl_keyword_str})")
+            
+            # Update the column header from "Forecast" to "Actual"
+            header_cell = suppl_sheet.cell(row=3, column=target_column)
+            if header_cell.value and 'Forecast' in str(header_cell.value):
+                header_cell.value = 'Actual'
+                logger.info(f"Updated {target_col_letter}3 from 'Forecast' to 'Actual'")
+            
+            logger.info(f"Copied {values_copied} actual values to Suppl. Calc column {target_col_letter}")
+            ma_wb_formulas.close()
+            ma_wb_data.close()
+            
+        except Exception as e:
+            logger.error(f"Error copying actual values to Suppl. Calc: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _update_signature_page_dates(self, sheet):
         """
         Update dates in the signature page section of SFA CC.
@@ -979,15 +1623,16 @@ class ComplianceBuilder:
             # These contain historical quarter labels that should NOT be updated
             skip_header_rows = sheet_name in ['Suppl. Calc', 'Impact Unit Sales']
             
-            # SKIP the Management Accounts sheet entirely - it contains PREVIOUS quarter's
-            # data and should keep the previous quarter's references (e.g., "LTM Q2 2025")
-            if 'Management Accounts' in sheet_name:
-                logger.debug(f"Skipping date/text updates for {sheet_name} (contains previous quarter data)")
-                continue
+            # For Management Accounts sheet, skip Row 21 (P&L title) since we set it explicitly
+            # in _copy_ma_data to ensure it shows the correct LTM title
+            is_management_accounts = 'Management Accounts' in sheet_name
             
             for row in range(1, min(sheet.max_row + 1, 200)):
                 # Skip header row (row 2) for specific sheets with quarter column headers
                 if skip_header_rows and row == 2:
+                    continue
+                # Skip row 21 in Management Accounts (P&L title set explicitly in _copy_ma_data)
+                if is_management_accounts and row == 21:
                     continue
                 
                 for col in range(1, min(sheet.max_column + 1, 50)):
