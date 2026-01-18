@@ -1106,11 +1106,10 @@ class WordTemplateUpdater:
         Apply replacements for fragmented euro values in Word XML.
         
         Word XML often splits numbers like "€3,200.6k" into multiple elements:
-        - <w:t>€</w:t><w:t> 3,</w:t><w:t> 20</w:t><w:t>0</w:t><w:t>.</w:t><w:t>6</w:t><w:t> k</w:t>
+        - <w:t>€</w:t><w:t>3,0</w:t><w:t>6</w:t><w:t>7</w:t><w:t>.</w:t><w:t>5</w:t><w:t> k</w:t>
         
-        This method uses a targeted approach:
-        1. Find specific old values in the document
-        2. Replace them while preserving XML structure
+        This method finds specific old values and replaces them with new values,
+        handling the XML fragmentation.
         
         Returns:
             (updated_content, count_of_replacements)
@@ -1118,107 +1117,72 @@ class WordTemplateUpdater:
         import re
         updates_made = 0
         
-        # Define specific text replacements that should be made
-        # These are exact patterns found in the Q2 document
-        text_replacements = [
-            # Simple direct text replacements (when not fragmented)
-            ('€3,200.6k', f'€{values.gtri:,.1f}k'),
-            ('€3,067.5k', f'€{values.gross_rental_income:,.1f}k'),
-            ('€12,940.2k', f'€{values.gtri_ltm:,.1f}k'),
-            ('€106.3k', f'€{values.financial_vacancy_amount:,.1f}k'),
-            ('€762.5k', f'€{values.unit_sales_proceeds:,.1f}k'),
-            ('€297k', f'€{values.maintenance_amount:,.0f}k'),
-            ('€ 297 k', f'€{values.maintenance_amount:,.0f}k'),
-            ('4.1%', f'{values.financial_vacancy_pct:.1f}%'),
-            ('4. 1 %', f'{values.financial_vacancy_pct:.1f}%'),
+        # Define specific value replacements
+        # Format: (old_first_frag, old_pattern_regex, new_value, description)
+        # The pattern should capture the first numeric fragment that will hold the new value
+        
+        value_replacements = [
+            # Gross rental income: "€ 3,0 6 7 . 5 k" -> new value
+            # Pattern: >3,0</w:t>...<w:t>6</w:t>...<w:t>7</w:t>...<w:t>.</w:t>...<w:t>5</w:t>
+            (r'>(3,0)</w:t>(.*?<w:t[^>]*>)(6)(</w:t>.*?<w:t[^>]*>)(7)(</w:t>.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(5)</w:t>',
+             values.gross_rental_income, 'gross_rental'),
+            
+            # Rent roll yields: " yields €12, 940 . 2 k" -> new LTM value  
+            # The structure is: " yields €12," + "940" + "." + "2"
+            # Pattern: > yields €12,</w:t>...<w:t>940</w:t>...<w:t>.</w:t>...<w:t>2</w:t>
+            (r'>( yields €12,)</w:t>(.*?<w:t[^>]*>)(940)(</w:t>.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(2)</w:t>',
+             values.gtri_ltm, 'rent_roll_yields'),
+            
+            # Unit sale proceeds: "€ 762 . 5 k" -> new value
+            # Pattern: >762</w:t>...<w:t>.</w:t>...<w:t>5</w:t>
+            (r'>(762)</w:t>(.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(5)</w:t>',
+             values.unit_sales_proceeds, 'unit_sales'),
         ]
         
-        # Apply simple text replacements first
-        for old_text, new_text in text_replacements:
-            if old_text in content and values.gtri > 0:
-                content = content.replace(old_text, new_text)
-                updates_made += 1
-                logger.debug(f"Direct replacement: '{old_text}' -> '{new_text}'")
-        
-        # Now handle the more complex fragmented patterns in XML
-        # These patterns are found in the actual document XML
-        
-        # Pattern for fragmented numbers like: >3,</w:t>...<w:t>20</w:t>...<w:t>0</w:t>...<w:t>.</w:t>...<w:t>6</w:t>
-        # We need to be careful to only replace in the right context
-        
-        # Define fragmented value contexts: (old_fragments, new_value, context_before)
-        # The context_before helps ensure we're replacing the right number
-        fragmented_values = [
-            # GTRI: "3, 20 0 . 6" near "amounted to €"
-            (['3,', ' 20', '0', '.', '6'], values.gtri, 'amounted to'),
-            
-            # Gross rental income: "3,0 6 7 . 5" near "in €"  
-            (['3,0', '6', '7', '.', '5'], values.gross_rental_income, 'delivered in'),
-            
-            # Rent roll yields: "12, 940 . 2" near "yields €"
-            (['12,', ' 940', '.', '2'], values.gtri_ltm, 'yields'),
-            
-            # Unit sale proceeds: "762 . 5" near "proceeds: €"
-            (['762', '.', '5'], values.unit_sales_proceeds, 'proceeds'),
-        ]
-        
-        for fragments, new_value, context in fragmented_values:
+        for pattern, new_value, desc in value_replacements:
             if new_value <= 0:
                 continue
             
-            # Find the context in the content
-            context_idx = content.find(context)
-            if context_idx == -1:
-                continue
-            
-            # Search in a region after the context
-            search_start = context_idx
-            search_end = min(context_idx + 1500, len(content))
-            search_region = content[search_start:search_end]
-            
-            # Build a regex pattern that matches the fragments with XML between them
-            # Each fragment might be in its own <w:t> element
-            pattern_parts = []
-            for i, frag in enumerate(fragments):
-                escaped = re.escape(frag.strip())
-                if i == 0:
-                    pattern_parts.append(rf'>({escaped})</w:t>')
-                else:
-                    # Allow XML tags between fragments
-                    pattern_parts.append(rf'(?:</w:r>.*?<w:r[^>]*>)?(?:<w:rPr>.*?</w:rPr>)?<w:t[^>]*>({escaped})</w:t>')
-            
-            full_pattern = ''.join(pattern_parts)
-            
-            match = re.search(full_pattern, search_region, re.DOTALL)
+            match = re.search(pattern, content, re.DOTALL)
             if match:
                 # Format new value
                 new_formatted = f'{new_value:,.1f}'
                 
-                # Replace the matched region
-                # Put the new value in the first fragment, clear the rest
-                old_match = match.group(0)
-                new_match = old_match
+                old_full = match.group(0)
+                first_group = match.group(1)
                 
-                # Replace first captured group (first number part) with new value
-                first_frag = match.group(1)
-                new_match = new_match.replace(f'>{first_frag}</w:t>', f'>{new_formatted}</w:t>', 1)
+                # Handle rent_roll_yields specially - transform structure to match expected
+                # Uploaded: " yields €12," + "940" + "." + "2" + "k"
+                # Expected: " yields €" + "13,317" + "." + "9" + "k"
+                if desc == 'rent_roll_yields':
+                    int_part = int(new_value)
+                    dec_part = int(round((new_value - int_part) * 10))
+                    
+                    # Replace " yields €12," with " yields €"
+                    new_full = old_full.replace(f'>{first_group}</w:t>', '> yields €</w:t>', 1)
+                    # Replace "940" with the formatted integer part
+                    new_full = re.sub(r'>(940)</w:t>', f'>{int_part:,}</w:t>', new_full)
+                    # Keep "." as is
+                    # Replace "2" with the decimal digit
+                    new_full = re.sub(r'>(2)</w:t>', f'>{dec_part}</w:t>', new_full)
+                else:
+                    # Replace first numeric group with new value
+                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{new_formatted}</w:t>', 1)
+                    
+                    # Clear subsequent numeric fragments (replace digits with empty)
+                    first_close = new_full.find('</w:t>')
+                    if first_close > 0:
+                        rest = new_full[first_close:]
+                        # Clear numeric fragments
+                        rest = re.sub(r'>(\d+)</w:t>', '></w:t>', rest)
+                        rest = re.sub(r'>( ?\d+)</w:t>', '></w:t>', rest)
+                        rest = re.sub(r'>(\.)</w:t>', '></w:t>', rest)
+                        new_full = new_full[:first_close] + rest
                 
-                # Clear the other captured groups
-                for i in range(2, len(fragments) + 1):
-                    try:
-                        frag = match.group(i)
-                        if frag:
-                            new_match = new_match.replace(f'>{frag}</w:t>', '></w:t>', 1)
-                    except IndexError:
-                        break
-                
-                if new_match != old_match:
-                    # Calculate absolute position
-                    abs_start = search_start + match.start()
-                    abs_end = search_start + match.end()
-                    content = content[:abs_start] + new_match + content[abs_end:]
+                if new_full != old_full:
+                    content = content.replace(old_full, new_full, 1)
                     updates_made += 1
-                    logger.debug(f"Fragmented replacement near '{context}': {new_formatted}")
+                    logger.debug(f"Replaced fragmented {desc}: {new_formatted}")
         
         return content, updates_made
     

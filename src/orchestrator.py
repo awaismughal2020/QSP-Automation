@@ -347,7 +347,9 @@ class QuarterlyReportOrchestrator:
                 report_date=datetime.now().strftime("%d %B %Y"),
                 # Page 4 - from BDO/Management Accounts
                 gtri=gtri_amount,  # Q3 GTRI in thousands
-                gtri_ltm=gtri_ltm,  # LTM GTRI (used for "rent roll yields" value)
+                # gtri_ltm is used for "rent roll yields" value in Word document
+                # Use rent_roll_k (annual rent from rent roll file) as this matches the expected document
+                gtri_ltm=rent_roll_k,  # Rent roll annual (appears as "yields €X,XXXk" in Word)
                 gross_rental_income=gross_rental_income,  # Q3 gross rental in thousands
                 gross_rental_income_ltm=gross_rental_ltm,
                 financial_vacancy_pct=vacancy_pct,
