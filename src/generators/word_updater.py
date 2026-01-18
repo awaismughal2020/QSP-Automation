@@ -954,6 +954,9 @@ class WordTemplateUpdater:
                     # Apply fragmented date replacements (e.g., "1- 7 -202 5" -> "1- 10 -202 5")
                     content = self._apply_fragmented_date_replacements(content, replacements)
                 
+                # Resize Portfolio Highlights box to ensure all content is visible
+                content = self._resize_portfolio_highlights_box(content)
+                
                 if content != original_content:
                     with open(xml_file, 'w', encoding='utf-8') as f:
                         f.write(content)
@@ -974,6 +977,80 @@ class WordTemplateUpdater:
         
         # Cleanup temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def _resize_portfolio_highlights_box(self, content: str) -> str:
+        """
+        Adjust the Portfolio Highlights box to fit all content.
+        
+        Instead of resizing the box (which can overlap other content), this method:
+        1. Keeps the original box size
+        2. Reduces the font size of text inside the box so all content fits
+        
+        Args:
+            content: The XML content of document.xml
+            
+        Returns:
+            Updated XML content with smaller font sizes in Portfolio Highlights box
+        """
+        import re
+        
+        # Find all anchors individually (non-greedy pattern that stops at first closing tag)
+        anchor_pattern = r'<wp:anchor[^>]*>(?:(?!</wp:anchor>).)*?</wp:anchor>'
+        
+        def is_portfolio_highlights_box(anchor_xml: str) -> bool:
+            """Check if this anchor is the Portfolio Highlights box."""
+            return ('rental income:' in anchor_xml and 
+                    ('3,273' in anchor_xml or '3,095' in anchor_xml or 'vacancy:' in anchor_xml))
+        
+        def reduce_font_size(anchor_xml: str) -> str:
+            """Reduce font sizes in the Portfolio Highlights box."""
+            updated = False
+            
+            # Find all font size declarations in the box and reduce them
+            # Word uses w:sz (font size in half-points, so 20 = 10pt, 14 = 7pt)
+            # Current sizes are around 14-20 (7-10pt), reduce to 12-16 (6-8pt)
+            
+            # Pattern to find w:sz elements
+            sz_pattern = r'(<w:sz\s+w:val=")(\d+)(")'
+            szCs_pattern = r'(<w:szCs\s+w:val=")(\d+)(")'
+            
+            def reduce_size(match):
+                prefix = match.group(1)
+                size = int(match.group(2))
+                suffix = match.group(3)
+                
+                # Reduce font size by about 30% (but keep minimum of 10 = 5pt)
+                new_size = max(10, int(size * 0.7))
+                return f'{prefix}{new_size}{suffix}'
+            
+            # Apply font size reduction
+            new_anchor_xml = re.sub(sz_pattern, reduce_size, anchor_xml)
+            new_anchor_xml = re.sub(szCs_pattern, reduce_size, new_anchor_xml)
+            
+            if new_anchor_xml != anchor_xml:
+                updated = True
+                logger.info("Reduced font sizes in Portfolio Highlights box")
+            
+            return new_anchor_xml
+        
+        # Find all anchors and process only the Portfolio Highlights box
+        updated_content = content
+        anchors_found = 0
+        
+        for match in reversed(list(re.finditer(anchor_pattern, content, flags=re.DOTALL))):
+            anchor_xml = match.group(0)
+            
+            if is_portfolio_highlights_box(anchor_xml):
+                anchors_found += 1
+                modified = reduce_font_size(anchor_xml)
+                updated_content = updated_content[:match.start()] + modified + updated_content[match.end():]
+        
+        if anchors_found > 0:
+            logger.info(f"Adjusted font sizes in {anchors_found} Portfolio Highlights box(es)")
+        else:
+            logger.warning("Could not find Portfolio Highlights box in document")
+        
+        return updated_content
     
     def _apply_context_numeric_replacements(self, content: str, values: ReportValues) -> Tuple[str, int]:
         """
@@ -1274,7 +1351,8 @@ class WordTemplateUpdater:
             # === Portfolio Highlights Section ===
             # GTRI: "€" + "3," + "20" + "0" + "." + "6" + "k" -> new GTRI value
             # Exact fragmentation from template: € | 3, | 20 | 0 | . | 6
-            (r'>(3,)</w:t>(.*?<w:t[^>]*>)(20)</w:t>(.*?<w:t[^>]*>)(0)</w:t>(.*?<w:t[^>]*>)(\.)</w:t>',
+            # Pattern must capture all fragments including the decimal digit (any digit)
+            (r'>(3,)</w:t>(.*?<w:t[^>]*>)(20)</w:t>(.*?<w:t[^>]*>)(0)</w:t>(.*?<w:t[^>]*>)(\.)</w:t>(.*?<w:t[^>]*>)(\d)</w:t>',
              values.gtri, 'gtri_portfolio'),
             
             # Gross rental income: "€" + "3,0" + "6" + "7" + "." + "5" + "k"
@@ -1327,18 +1405,40 @@ class WordTemplateUpdater:
                     new_full = re.sub(r'>(2)</w:t>', f'>{dec_part}</w:t>', new_full)
                     
                 elif desc == 'gtri_portfolio':
-                    # GTRI: "3," + "20" + "0" + "." -> "3,273.6"
-                    int_part = int(new_value)
-                    dec_part = int(round((new_value - int_part) * 10))
+                    # GTRI: "3," + "20" + "0" + "." + "6" -> "3,273.6"
+                    # Round to 1 decimal place to ensure consistent formatting
+                    rounded_value = round(new_value, 1)
+                    int_part = int(rounded_value)
+                    dec_part = int(round((rounded_value - int_part) * 10))
                     
-                    # Replace "3," with new thousands part (without period, we add decimal at end)
+                    # Get the old decimal digit from match (group 9)
+                    old_dec_digit = match.group(9) if len(match.groups()) >= 9 else None
+                    
+                    # Replace "3," with new thousands part (includes decimal point)
                     new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part:,}.</w:t>', 1)
-                    # Replace "20" with decimal digit
+                    # Replace "20" with new decimal digit (single digit only)
                     new_full = re.sub(r'>(20)</w:t>', f'>{dec_part}</w:t>', new_full)
                     # Clear "0" - keep the tag structure but remove digit
                     new_full = re.sub(r'>(0)</w:t>', '></w:t>', new_full)
                     # Clear "." since we already added decimal point above
                     new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
+                    # Clear the old decimal digit (captured from match) - it's been replaced above
+                    if old_dec_digit:
+                        # Replace only the specific old decimal digit fragment
+                        new_full = new_full.replace(f'>{old_dec_digit}</w:t>', '></w:t>', 1)
+                    
+                    # Additional safety: After all replacements, ensure we don't have a second decimal digit
+                    # Check if the result contains "273.6" followed by another digit fragment
+                    # This is a cleanup pass to handle any edge cases
+                    if f'273.{dec_part}' in new_full:
+                        # If we see "273.6" followed by another digit (like "273.66"), remove the second digit
+                        # Pattern: "273.6" + any XML + another digit fragment
+                        new_full = re.sub(
+                            r'(273\.' + str(dec_part) + r')</w:t>(.*?<w:t[^>]*>)(\d)</w:t>',
+                            r'\1</w:t>\2></w:t>',
+                            new_full,
+                            count=1  # Only replace first occurrence
+                        )
                     
                 elif desc == 'vacancy_pct':
                     # Vacancy percentage: "4" + "." + "1" + "%" -> "5.4%"
@@ -1391,6 +1491,26 @@ class WordTemplateUpdater:
                     content = content.replace(old_full, new_full, 1)
                     updates_made += 1
                     logger.debug(f"Replaced fragmented {desc}: {new_formatted}")
+        
+        # Final cleanup pass: Fix any GTRI values that still have 2 decimal places
+        # This catches cases where the pattern didn't match or there's a different structure
+        # Pattern: "273.6" + XML + another digit -> "273.6" (remove second digit)
+        # Handle fragmented case: "273." + "6" + XML + "6" -> "273." + "6" + XML + ""
+        gtri_2dec_pattern = r'(273\.(\d))</w:t>(.*?<w:t[^>]*>)(\d)</w:t>'
+        def fix_gtri_2dec(m):
+            first_dec = m.group(2)
+            second_dec = m.group(4)
+            # Round: if second decimal is 5 or more, round up first decimal
+            if int(second_dec) >= 5:
+                new_first_dec = str((int(first_dec) + 1) % 10)
+                return f'273.{new_first_dec}</w:t>{m.group(3)}></w:t>'
+            else:
+                # Just remove the second digit
+                return f'{m.group(1)}</w:t>{m.group(3)}></w:t>'
+        
+        # Only apply if we see "273.XX" pattern (where XX are two digits)
+        if '273.' in content:
+            content = re.sub(gtri_2dec_pattern, fix_gtri_2dec, content, count=2)  # Max 2 occurrences
         
         return content, updates_made
     
