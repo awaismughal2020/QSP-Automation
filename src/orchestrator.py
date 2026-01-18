@@ -288,54 +288,68 @@ class QuarterlyReportOrchestrator:
             logger.info("Step 7: Updating Word template")
             word_output = self.config.output_dir / f"Quarterly QSP - {self.config.quarter_str} - Draft.docx"
             
-            # Extract values from BDO data for Management Accounts
-            # Key account codes from formula_templates.yaml:
-            # - 8000003: GTRI (Gross Theoretical Rental Income)
-            # - 8000004: Financial vacancy amount
-            # - 4100400: Maintenance & repair costs
+            # Extract values from the generated Management Accounts Excel file
+            # This ensures we use the same calculated values that appear in the Excel output
+            from .generators.word_updater import extract_values_from_management_accounts
             
-            gtri_amount = 0.0
-            vacancy_amount = 0.0
-            maintenance_amount = 0.0
+            ma_values = extract_values_from_management_accounts(
+                str(ma_output),
+                self.config.quarter,
+                self.config.year
+            )
             
-            for code, entry in bdo_result.accounts.items():
-                # GTRI - usually negative in BDO (income account)
-                if code == '8000003':
-                    gtri_amount = abs(entry.closing_balance - entry.opening_balance) / 1000  # Q3 mutations in thousands
-                # Financial vacancy - positive (reduces income)
-                elif code == '8000004':
-                    vacancy_amount = abs(entry.closing_balance - entry.opening_balance) / 1000
-                # Maintenance costs - account 4100400
-                elif code.startswith('4100'):
-                    maintenance_amount += abs(entry.closing_balance - entry.opening_balance) / 1000
+            # Use extracted values, with fallbacks to BDO data
+            gtri_amount = ma_values.get('gtri', 0.0)
+            gtri_ltm = ma_values.get('gtri_ltm', 0.0)
+            vacancy_amount = ma_values.get('vacancy_amount', 0.0)
+            gross_rental_income = ma_values.get('gross_rental', 0.0)
+            gross_rental_ltm = ma_values.get('gross_rental_ltm', 0.0)
+            vacancy_pct = ma_values.get('vacancy_pct', 0.0)
+            maintenance_amount = ma_values.get('maintenance', 0.0)
+            maintenance_ltm = ma_values.get('maintenance_ltm', 0.0)
             
-            # Calculate gross rental income (GTRI - vacancy)
-            gross_rental_income = gtri_amount - vacancy_amount
-            
-            # Calculate vacancy percentage
-            vacancy_pct = (vacancy_amount / gtri_amount * 100) if gtri_amount > 0 else 0.0
+            # Fallback: Extract from BDO data if MA extraction failed
+            if gtri_amount == 0:
+                for code, entry in bdo_result.accounts.items():
+                    if code == '8000003':
+                        gtri_amount = abs(entry.closing_balance - entry.opening_balance) / 1000
+                    elif code == '8000004':
+                        vacancy_amount = abs(entry.closing_balance - entry.opening_balance) / 1000
+                    elif code.startswith('4100'):
+                        maintenance_amount += abs(entry.closing_balance - entry.opening_balance) / 1000
+                
+                gross_rental_income = gtri_amount - vacancy_amount
+                vacancy_pct = (vacancy_amount / gtri_amount * 100) if gtri_amount > 0 else 0.0
+                # Estimate LTM as 4x quarterly (approximation)
+                gtri_ltm = gtri_amount * 4
+                gross_rental_ltm = gross_rental_income * 4
+                maintenance_ltm = maintenance_amount * 4
             
             # Calculate unit sales proceeds from sales tracker (in thousands)
-            unit_sales_proceeds = sales_data.quarter_proceeds / 1000 if sales_data.quarter_proceeds else 0
+            unit_sales_proceeds = ma_values.get('unit_sales_proceeds', 0.0)
+            if unit_sales_proceeds == 0 and sales_data.quarter_proceeds:
+                unit_sales_proceeds = sales_data.quarter_proceeds / 1000
             
             # Rent roll total (annual, in thousands)
             rent_roll_k = rent_roll.total_annual_rent / 1000
             
-            logger.info(f"Page 4 KPIs extracted:")
-            logger.info(f"  GTRI (Q3): €{gtri_amount:,.0f}k")
-            logger.info(f"  Gross rental income: €{gross_rental_income:,.0f}k")
-            logger.info(f"  Financial vacancy: {vacancy_pct:.1f}% (€{vacancy_amount:,.0f}k)")
-            logger.info(f"  Rent roll (annual): €{rent_roll_k:,.0f}k")
-            logger.info(f"  Maintenance: €{maintenance_amount:,.0f}k")
+            logger.info(f"Page 4 KPIs extracted from Management Accounts:")
+            logger.info(f"  GTRI (Q3): €{gtri_amount:,.1f}k")
+            logger.info(f"  GTRI (LTM): €{gtri_ltm:,.1f}k")
+            logger.info(f"  Gross rental income: €{gross_rental_income:,.1f}k")
+            logger.info(f"  Financial vacancy: {vacancy_pct:.1f}% (€{vacancy_amount:,.1f}k)")
+            logger.info(f"  Rent roll (annual): €{rent_roll_k:,.1f}k")
+            logger.info(f"  Maintenance: €{maintenance_amount:,.1f}k")
+            logger.info(f"  Unit sales proceeds: €{unit_sales_proceeds:,.1f}k")
             logger.info(f"  Unit sales: {sales_data.quarter_units_sold} units, €{unit_sales_proceeds:,.0f}k")
             
             report_values = ReportValues(
                 report_date=datetime.now().strftime("%d %B %Y"),
                 # Page 4 - from BDO/Management Accounts
                 gtri=gtri_amount,  # Q3 GTRI in thousands
-                gtri_ltm=gtri_amount * 4,  # Approximate LTM (4 quarters)
+                gtri_ltm=gtri_ltm,  # LTM GTRI (used for "rent roll yields" value)
                 gross_rental_income=gross_rental_income,  # Q3 gross rental in thousands
-                gross_rental_income_ltm=gross_rental_income * 4,
+                gross_rental_income_ltm=gross_rental_ltm,
                 financial_vacancy_pct=vacancy_pct,
                 financial_vacancy_amount=vacancy_amount,
                 # Page 4 - from Rent Roll
@@ -346,22 +360,23 @@ class QuarterlyReportOrchestrator:
                 unit_sales_proceeds=unit_sales_proceeds,
                 # Page 4/6 - Maintenance and CAPEX
                 maintenance_amount=maintenance_amount,
-                maintenance_ltm=maintenance_amount * 4,  # Approximate LTM
+                maintenance_ltm=maintenance_ltm,
                 capex_amount=0,  # CAPEX is entered manually per mainPlan.pdf
                 capex_ltm=0,
                 # Narratives
                 unit_sales_narrative=f"{sales_data.quarter_units_sold} unit(s) sold for €{unit_sales_proceeds:,.0f}k" if sales_data.quarter_units_sold > 0 else "No unit sales this quarter.",
                 maintenance_detail="",
                 sustainability_detail="",
-                # Previous quarter values (for replacement matching)
-                # These would ideally be extracted from the previous report
-                # For now, setting to 0 will rely on context-aware replacement
-                prev_gtri=0,
-                prev_gross_rental_income=0,
-                prev_vacancy_pct=0,
+                # Previous quarter values (Q2 2025 values from template document)
+                # Used for finding and replacing old values with new values
+                prev_gtri=3200.6,  # Q2 GTRI
+                prev_gtri_ltm=12940.2,  # Q2 LTM GTRI (shown as "rent roll yields")
+                prev_gross_rental_income=3067.5,  # Q2 gross rental income
+                prev_vacancy_pct=4.1,  # Q2 vacancy percentage
+                prev_vacancy_amount=106.3,  # Q2 vacancy amount
                 prev_rent_roll=0,
-                prev_maintenance=0,
-                prev_unit_sales_proceeds=0,
+                prev_maintenance=297.0,  # Q2 maintenance
+                prev_unit_sales_proceeds=762.5,  # Q2 unit sales proceeds
             )
             word_updater = WordTemplateUpdater(str(self.config.word_template), str(word_output))
             word_updater.update_with_python_docx(

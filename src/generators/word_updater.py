@@ -16,6 +16,11 @@ etc.
 
 These values must be extracted from the generated Excel outputs and injected
 into the Word document, replacing the previous quarter's values.
+
+VALUE SOURCES (from Management Cijfers sheet):
+- Column AA: Current quarter values (Q3 2025 = column 27)
+- Column AB: LTM values (Q3 2025 LTM = column 28)
+- Dynamic column calculation: base_column + (quarter_total - base_quarter_total)
 """
 
 from dataclasses import dataclass, field
@@ -36,7 +41,7 @@ class ReportValues:
     
     # Page 4 - Executive Summary (from Management Accounts / BDO)
     gtri: float  # Gross Theoretical Rental Income (€k) - quarterly
-    gtri_ltm: float = 0.0  # GTRI LTM (€k) - for annual references
+    gtri_ltm: float = 0.0  # GTRI LTM (€k) - for annual references / rent roll yields
     gross_rental_income: float = 0.0  # Actual rental income (€k) - quarterly
     gross_rental_income_ltm: float = 0.0  # Gross rental income LTM (€k)
     financial_vacancy_pct: float = 0.0  # Vacancy percentage
@@ -64,12 +69,114 @@ class ReportValues:
     sustainability_detail: str = ""  # Sustainability/CAPEX description
     
     # Previous quarter values (for finding/replacing)
+    # These are extracted from the template document (Q2 values)
     prev_gtri: float = 0.0
+    prev_gtri_ltm: float = 0.0  # Previous LTM GTRI (for rent roll yields)
     prev_gross_rental_income: float = 0.0
     prev_vacancy_pct: float = 0.0
+    prev_vacancy_amount: float = 0.0
     prev_rent_roll: float = 0.0
     prev_maintenance: float = 0.0
     prev_unit_sales_proceeds: float = 0.0
+
+
+def extract_values_from_management_accounts(ma_path: str, quarter: int, year: int) -> dict:
+    """
+    Extract financial values from Management Accounts Excel file.
+    
+    The Management Cijfers sheet contains:
+    - Column AA (index 27) for Q3 2025 quarterly values
+    - Column AB (index 28) for Q3 2025 LTM values
+    - Each subsequent quarter advances by 1 column
+    
+    Args:
+        ma_path: Path to Management Accounts Excel file
+        quarter: Quarter number (1-4)
+        year: Year (e.g., 2025)
+        
+    Returns:
+        Dictionary with extracted values in €k
+    """
+    import openpyxl
+    
+    try:
+        # Load with data_only=True to get calculated values
+        wb = openpyxl.load_workbook(ma_path, data_only=True)
+        
+        # Find Management Cijfers sheet
+        cijfers_sheet = None
+        for name in wb.sheetnames:
+            if 'Management Cijfers' in name:
+                cijfers_sheet = wb[name]
+                break
+        
+        if cijfers_sheet is None:
+            logger.warning("Management Cijfers sheet not found")
+            wb.close()
+            return {}
+        
+        # Calculate column indices dynamically
+        # Base: Q3 2025 = Column AA (index 27)
+        # Formula: column = 27 + ((year * 4 + quarter) - (2025 * 4 + 3))
+        base_quarter_total = 2025 * 4 + 3  # Q3 2025 = 8103
+        target_quarter_total = year * 4 + quarter
+        quarterly_column = 27 + (target_quarter_total - base_quarter_total)
+        ltm_column = quarterly_column + 1
+        
+        logger.info(f"Extracting values from columns {quarterly_column} (quarterly) and {ltm_column} (LTM)")
+        
+        # Find BDO sheet for direct value extraction
+        bdo_sheet = None
+        expected_bdo_name = f"BDO - Q{quarter}-{str(year)[-2:]}"
+        for name in wb.sheetnames:
+            if expected_bdo_name in name:
+                bdo_sheet = wb[name]
+                break
+        
+        values = {}
+        
+        # Extract from BDO sheet (more reliable for calculated values)
+        if bdo_sheet:
+            # Row 76: GTRI (stored as negative, take absolute)
+            gtri_q = bdo_sheet.cell(row=76, column=7).value  # Column G
+            gtri_ltm = bdo_sheet.cell(row=76, column=8).value  # Column H
+            values['gtri'] = abs(gtri_q) / 1000 if gtri_q else 0
+            values['gtri_ltm'] = abs(gtri_ltm) / 1000 if gtri_ltm else 0
+            
+            # Row 77: Financial vacancy (stored as positive)
+            vac_q = bdo_sheet.cell(row=77, column=7).value
+            vac_ltm = bdo_sheet.cell(row=77, column=8).value
+            values['vacancy_amount'] = abs(vac_q) / 1000 if vac_q else 0
+            values['vacancy_amount_ltm'] = abs(vac_ltm) / 1000 if vac_ltm else 0
+            
+            # Row 88: Maintenance (stored as positive)
+            maint_q = bdo_sheet.cell(row=88, column=7).value
+            maint_ltm = bdo_sheet.cell(row=88, column=8).value
+            values['maintenance'] = abs(maint_q) / 1000 if maint_q else 0
+            values['maintenance_ltm'] = abs(maint_ltm) / 1000 if maint_ltm else 0
+            
+            logger.info(f"Extracted from BDO: GTRI={values['gtri']:.1f}k, Vacancy={values['vacancy_amount']:.1f}k")
+        
+        # Calculate derived values
+        values['gross_rental'] = values.get('gtri', 0) - values.get('vacancy_amount', 0)
+        values['gross_rental_ltm'] = values.get('gtri_ltm', 0) - values.get('vacancy_amount_ltm', 0)
+        
+        # Vacancy percentage
+        if values.get('gtri', 0) > 0:
+            values['vacancy_pct'] = (values.get('vacancy_amount', 0) / values['gtri']) * 100
+        else:
+            values['vacancy_pct'] = 0
+        
+        # Extract cash proceeds from Management Cijfers row 50
+        cash_proceeds = cijfers_sheet.cell(row=50, column=quarterly_column).value
+        values['unit_sales_proceeds'] = abs(cash_proceeds) / 1000 if cash_proceeds else 0
+        
+        wb.close()
+        return values
+        
+    except Exception as e:
+        logger.error(f"Error extracting values from Management Accounts: {e}")
+        return {}
 
 
 @dataclass 
@@ -682,6 +789,13 @@ class WordTemplateUpdater:
                 if values:
                     content, num_count = self._apply_context_numeric_replacements(content, values)
                     numeric_updates += num_count
+                    
+                    # Apply fragmented euro value replacements
+                    content, frag_count = self._apply_fragmented_euro_replacements(content, values)
+                    numeric_updates += frag_count
+                    
+                    # Apply fragmented date replacements (e.g., "1- 7 -202 5" -> "1- 10 -202 5")
+                    content = self._apply_fragmented_date_replacements(content, replacements)
                 
                 if content != original_content:
                     with open(xml_file, 'w', encoding='utf-8') as f:
@@ -715,12 +829,81 @@ class WordTemplateUpdater:
         Word XML fragments numbers across multiple <w:t> elements, e.g.:
         "€3,200k" might be: <w:t>€</w:t><w:t>3,</w:t><w:t>200</w:t><w:t>k</w:t>
         
+        The document has specific Q2 values that need to be replaced with Q3 values:
+        - GTRI: €3,200.6k → €3,273.6k
+        - Financial vacancy: €106.3k → €177.5k (amount), 4.1% → 5.4% (percentage)
+        - Gross rental income: €3,067.5k → €3,095.9k
+        - Rent roll yields: €12,940.2k → €13,317.9k (this is LTM GTRI)
+        - Unit sales proceeds: €762.5k → €203.5k
+        - Maintenance: €297k → €244k
+        
         Returns:
             (updated_content, count_of_replacements)
         """
         updates_made = 0
         
-        # Define KPI contexts and their new values
+        # Define specific value replacements: (old_value, new_value, value_format, context_keywords)
+        # Using exact Q2 values found in the template document
+        specific_replacements = [
+            # GTRI quarterly: €3,200.6k → new GTRI
+            (3200.6, values.gtri, 'euro_k_decimal', ['GTRI', 'Gross Theoretical rental income']),
+            (3200, values.gtri, 'euro_k', ['GTRI', 'Gross Theoretical rental income']),
+            
+            # Financial vacancy amount: €106.3k → new vacancy amount  
+            (106.3, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),
+            (128.5, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),  # Alternative Q2 value
+            
+            # Financial vacancy percentage: 4.1% → new percentage
+            (4.1, values.financial_vacancy_pct, 'percent', ['vacancy']),
+            
+            # Gross rental income: €3,067.5k → new gross rental
+            (3067.5, values.gross_rental_income, 'euro_k_decimal', ['gross rental income']),
+            (3067, values.gross_rental_income, 'euro_k', ['gross rental income']),
+            
+            # Rent roll yields (this is LTM GTRI): €12,940.2k → new LTM GTRI
+            (12940.2, values.gtri_ltm, 'euro_k_decimal', ['rent roll', 'yields']),
+            (12940, values.gtri_ltm, 'euro_k', ['rent roll', 'yields']),
+            
+            # Unit sales proceeds: €762.5k → new proceeds
+            (762.5, values.unit_sales_proceeds, 'euro_k_decimal', ['Unit sale proceeds', 'proceeds']),
+            (762, values.unit_sales_proceeds, 'euro_k', ['sale proceeds']),
+            
+            # Maintenance: €297k → new maintenance
+            (297, values.maintenance_amount, 'euro_k', ['Maintenance']),
+        ]
+        
+        # Apply specific replacements
+        for old_val, new_val, fmt, keywords in specific_replacements:
+            if new_val <= 0:
+                continue
+            
+            # Generate old and new formatted strings
+            if fmt == 'euro_k_decimal':
+                old_patterns = [
+                    f'€{old_val:,.1f}k', f'€ {old_val:,.1f}k', f'€{old_val:,.1f} k',
+                    f'€{old_val:.1f}k', f'€ {old_val:.1f}k',
+                ]
+                new_formatted = f'€{new_val:,.1f}k'
+            elif fmt == 'euro_k':
+                old_patterns = [
+                    f'€{old_val:,.0f}k', f'€ {old_val:,.0f}k', f'€{old_val:,.0f} k',
+                    f'€{int(old_val):,}k', f'€ {int(old_val):,}k',
+                ]
+                new_formatted = f'€{new_val:,.0f}k'
+            elif fmt == 'percent':
+                old_patterns = [f'{old_val:.1f}%', f'{old_val:.1f} %', f'{old_val}%']
+                new_formatted = f'{new_val:.1f}%'
+            else:
+                continue
+            
+            # Try direct replacement first
+            for old_pattern in old_patterns:
+                if old_pattern in content:
+                    content = content.replace(old_pattern, new_formatted)
+                    updates_made += 1
+                    logger.debug(f"Replaced '{old_pattern}' with '{new_formatted}'")
+        
+        # Define KPI contexts and their new values for context-aware replacement
         # Format: (context_keywords, new_value, value_format)
         kpi_mappings = [
             # GTRI - appears as "GTRI of the portfolio amounted to €X,XXXk"
@@ -732,8 +915,8 @@ class WordTemplateUpdater:
             # Financial vacancy - "Financial vacancy was X.X%" or "vacancy of X.X%"
             (['Financial vacancy', 'vacancy'], values.financial_vacancy_pct, 'percent'),
             
-            # Rent roll - "rent roll total of €X,XXXk" 
-            (['rent roll', 'Rent roll', 'huurlijst'], values.rent_roll_annual, 'euro_k'),
+            # Rent roll yields - uses LTM GTRI value
+            (['rent roll', 'Rent roll', 'yields'], values.gtri_ltm, 'euro_k'),
             
             # Maintenance - "Maintenance expenses of €XXXk"
             (['Maintenance', 'maintenance', 'repair costs'], values.maintenance_amount, 'euro_k'),
@@ -915,6 +1098,190 @@ class WordTemplateUpdater:
         # Apply common fragmented patterns using XML-aware regex
         # These handle cases where Word splits text across <w:t> elements
         content = self._apply_xml_aware_patterns(content, replacements)
+        
+        return content
+    
+    def _apply_fragmented_euro_replacements(self, content: str, values: ReportValues) -> Tuple[str, int]:
+        """
+        Apply replacements for fragmented euro values in Word XML.
+        
+        Word XML often splits numbers like "€3,200.6k" into multiple elements:
+        - <w:t>€</w:t><w:t> 3,</w:t><w:t> 20</w:t><w:t>0</w:t><w:t>.</w:t><w:t>6</w:t><w:t> k</w:t>
+        
+        This method uses a targeted approach:
+        1. Find specific old values in the document
+        2. Replace them while preserving XML structure
+        
+        Returns:
+            (updated_content, count_of_replacements)
+        """
+        import re
+        updates_made = 0
+        
+        # Define specific text replacements that should be made
+        # These are exact patterns found in the Q2 document
+        text_replacements = [
+            # Simple direct text replacements (when not fragmented)
+            ('€3,200.6k', f'€{values.gtri:,.1f}k'),
+            ('€3,067.5k', f'€{values.gross_rental_income:,.1f}k'),
+            ('€12,940.2k', f'€{values.gtri_ltm:,.1f}k'),
+            ('€106.3k', f'€{values.financial_vacancy_amount:,.1f}k'),
+            ('€762.5k', f'€{values.unit_sales_proceeds:,.1f}k'),
+            ('€297k', f'€{values.maintenance_amount:,.0f}k'),
+            ('€ 297 k', f'€{values.maintenance_amount:,.0f}k'),
+            ('4.1%', f'{values.financial_vacancy_pct:.1f}%'),
+            ('4. 1 %', f'{values.financial_vacancy_pct:.1f}%'),
+        ]
+        
+        # Apply simple text replacements first
+        for old_text, new_text in text_replacements:
+            if old_text in content and values.gtri > 0:
+                content = content.replace(old_text, new_text)
+                updates_made += 1
+                logger.debug(f"Direct replacement: '{old_text}' -> '{new_text}'")
+        
+        # Now handle the more complex fragmented patterns in XML
+        # These patterns are found in the actual document XML
+        
+        # Pattern for fragmented numbers like: >3,</w:t>...<w:t>20</w:t>...<w:t>0</w:t>...<w:t>.</w:t>...<w:t>6</w:t>
+        # We need to be careful to only replace in the right context
+        
+        # Define fragmented value contexts: (old_fragments, new_value, context_before)
+        # The context_before helps ensure we're replacing the right number
+        fragmented_values = [
+            # GTRI: "3, 20 0 . 6" near "amounted to €"
+            (['3,', ' 20', '0', '.', '6'], values.gtri, 'amounted to'),
+            
+            # Gross rental income: "3,0 6 7 . 5" near "in €"  
+            (['3,0', '6', '7', '.', '5'], values.gross_rental_income, 'delivered in'),
+            
+            # Rent roll yields: "12, 940 . 2" near "yields €"
+            (['12,', ' 940', '.', '2'], values.gtri_ltm, 'yields'),
+            
+            # Unit sale proceeds: "762 . 5" near "proceeds: €"
+            (['762', '.', '5'], values.unit_sales_proceeds, 'proceeds'),
+        ]
+        
+        for fragments, new_value, context in fragmented_values:
+            if new_value <= 0:
+                continue
+            
+            # Find the context in the content
+            context_idx = content.find(context)
+            if context_idx == -1:
+                continue
+            
+            # Search in a region after the context
+            search_start = context_idx
+            search_end = min(context_idx + 1500, len(content))
+            search_region = content[search_start:search_end]
+            
+            # Build a regex pattern that matches the fragments with XML between them
+            # Each fragment might be in its own <w:t> element
+            pattern_parts = []
+            for i, frag in enumerate(fragments):
+                escaped = re.escape(frag.strip())
+                if i == 0:
+                    pattern_parts.append(rf'>({escaped})</w:t>')
+                else:
+                    # Allow XML tags between fragments
+                    pattern_parts.append(rf'(?:</w:r>.*?<w:r[^>]*>)?(?:<w:rPr>.*?</w:rPr>)?<w:t[^>]*>({escaped})</w:t>')
+            
+            full_pattern = ''.join(pattern_parts)
+            
+            match = re.search(full_pattern, search_region, re.DOTALL)
+            if match:
+                # Format new value
+                new_formatted = f'{new_value:,.1f}'
+                
+                # Replace the matched region
+                # Put the new value in the first fragment, clear the rest
+                old_match = match.group(0)
+                new_match = old_match
+                
+                # Replace first captured group (first number part) with new value
+                first_frag = match.group(1)
+                new_match = new_match.replace(f'>{first_frag}</w:t>', f'>{new_formatted}</w:t>', 1)
+                
+                # Clear the other captured groups
+                for i in range(2, len(fragments) + 1):
+                    try:
+                        frag = match.group(i)
+                        if frag:
+                            new_match = new_match.replace(f'>{frag}</w:t>', '></w:t>', 1)
+                    except IndexError:
+                        break
+                
+                if new_match != old_match:
+                    # Calculate absolute position
+                    abs_start = search_start + match.start()
+                    abs_end = search_start + match.end()
+                    content = content[:abs_start] + new_match + content[abs_end:]
+                    updates_made += 1
+                    logger.debug(f"Fragmented replacement near '{context}': {new_formatted}")
+        
+        return content, updates_made
+    
+    def _apply_fragmented_date_replacements(self, content: str, replacements: List[Tuple[str, str]]) -> str:
+        """
+        Apply replacements for fragmented dates in Word XML.
+        
+        Dates like "1-7-2025" are often fragmented as "1- 7 -202 5" across multiple
+        <w:t> elements. This method handles these patterns for rent roll dates.
+        
+        Args:
+            content: The XML content to process
+            replacements: List of (old, new) text replacement tuples
+            
+        Returns:
+            Updated content with date replacements applied
+        """
+        import re
+        
+        # Extract old and new quarter info from replacements
+        old_q_num = None
+        new_q_num = None
+        for old_text, new_text in replacements:
+            old_match = re.match(r'Q(\d)\s+(\d{4})', old_text)
+            new_match = re.match(r'Q(\d)\s+(\d{4})', new_text)
+            if old_match and new_match:
+                old_q_num = int(old_match.group(1))
+                new_q_num = int(new_match.group(1))
+                break
+        
+        if not old_q_num:
+            return content
+        
+        # Calculate rent roll date months (first day of month after quarter end)
+        # Q2 ends June -> rent roll 1 July (7)
+        # Q3 ends September -> rent roll 1 October (10)
+        old_month = (old_q_num * 3) + 1
+        if old_month > 12:
+            old_month = 1
+        new_month = (new_q_num * 3) + 1
+        if new_month > 12:
+            new_month = 1
+        
+        logger.debug(f"Replacing rent roll date month: {old_month} -> {new_month}")
+        
+        # Find "per 1-" context followed by month number
+        # Pattern matches: >per </w:t>...<w:t>1-</w:t>...<w:t> 7 </w:t>
+        # We need to replace the " 7 " with " 10 "
+        
+        # First, find "1-" followed by month in the XML
+        # The pattern is: >1-</w:t></w:r><w:r...><w:t> 7 </w:t>
+        date_pattern = rf'(>1-</w:t>)(.*?)(<w:t[^>]*>)(\s*){old_month}(\s*)(</w:t>)'
+        
+        def replace_month(match):
+            before = match.group(1)
+            middle = match.group(2)
+            tag_open = match.group(3)
+            space_before = match.group(4)
+            space_after = match.group(5)
+            tag_close = match.group(6)
+            return f'{before}{middle}{tag_open}{space_before}{new_month}{space_after}{tag_close}'
+        
+        content = re.sub(date_pattern, replace_month, content, flags=re.DOTALL)
         
         return content
     
