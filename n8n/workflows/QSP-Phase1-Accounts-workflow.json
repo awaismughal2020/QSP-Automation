@@ -1,0 +1,373 @@
+{
+  "name": "QSP Phase 1 - Generate Accounts",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "generate-accounts",
+        "formTitle": "QSP Phase 1: Generate Management Accounts",
+        "formDescription": "Upload files to generate Management Accounts and Draft Compliance Certificate. After completion, review and edit the Compliance Certificate before proceeding to Phase 2.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Year",
+              "fieldType": "number",
+              "placeholder": "2025",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Quarter",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "Q1" },
+                  { "option": "Q2" },
+                  { "option": "Q3" },
+                  { "option": "Q4" }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "BDO_File",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Prev_MA_File",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Rent_Roll",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Sales_Tracker",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Prev_Compliance",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "phase1-form-trigger",
+      "name": "Phase 1 Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.1,
+      "position": [1248, 816],
+      "webhookId": "generate-accounts"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "BDO_File"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase1-upload-bdo",
+      "name": "Upload BDO",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 448]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Prev_MA_File"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase1-upload-ma",
+      "name": "Upload MA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 624]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Rent_Roll"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase1-upload-rent-roll",
+      "name": "Upload Rent Roll",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 784]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Sales_Tracker"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase1-upload-sales",
+      "name": "Upload Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 944]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Prev_Compliance"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase1-upload-compliance",
+      "name": "Upload Compliance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 1104]
+    },
+    {
+      "parameters": {
+        "numberInputs": 5
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [2128, 752],
+      "id": "phase1-merge",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "phase1-wait-uploads",
+      "name": "Wait All Uploads",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [2416, 832],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const year = $('Phase 1 Form').first().json.Year;\nconst quarterRaw = $('Phase 1 Form').first().json.Quarter;\nconst quarter = parseInt(quarterRaw.replace('Q', ''));\nconst bdo_file = $('Upload BDO').first().json.path;\nconst prev_ma_file = $('Upload MA').first().json.path;\nconst rent_roll_file = $('Upload Rent Roll').first().json.path;\nconst sales_tracker_file = $('Upload Sales').first().json.path;\nconst prev_compliance_file = $('Upload Compliance').first().json.path;\n\nreturn [{\n  json: {\n    year: year,\n    quarter: quarter,\n    bdo_file: bdo_file,\n    prev_ma_file: prev_ma_file,\n    rent_roll_file: rent_roll_file,\n    sales_tracker_file: sales_tracker_file,\n    prev_compliance_file: prev_compliance_file\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2656, 832],
+      "id": "phase1-build-request",
+      "name": "Build Request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/generate-accounts",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 600000
+        }
+      },
+      "id": "phase1-generate",
+      "name": "Generate Accounts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2912, 832]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "success-check",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "phase1-success-check",
+      "name": "Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3152, 832]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 1 Complete</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#4ade80;margin-bottom:20px}\n        .phase-badge{display:inline-block;background:#3b82f6;color:#fff;padding:4px 12px;border-radius:4px;font-size:14px;margin-bottom:15px}\n        .btn{display:inline-block;margin:8px 8px 8px 0;padding:12px 20px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px;font-weight:500}\n        .btn:hover{background:#2563eb}\n        .btn-next{background:#22c55e}\n        .btn-next:hover{background:#16a34a}\n        .warn{background:#422006;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b}\n        .stats{background:#0f172a;padding:15px;border-radius:8px;margin:15px 0}\n        .next-steps{background:#1e3a5f;padding:20px;border-radius:8px;margin:20px 0;border-left:4px solid #3b82f6}\n        a{color:#60a5fa}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <span class=\"phase-badge\">Phase 1 of 3</span>\n    <h1>✅ Management Accounts Generated!</h1>\n    <div class=\"stats\">\n        <p><strong>Job ID:</strong> {{ $json.job_id }}</p>\n        <p><strong>Execution Time:</strong> {{ $json.execution_time_seconds ? $json.execution_time_seconds.toFixed(1) + ' seconds' : 'N/A' }}</p>\n    </div>\n    <h3>📥 Download Generated Files:</h3>\n    <p>\n    {{ ($json.output_files || []).map(f => '<a class=\"btn\" href=\"http://localhost:8000/api/v1/outputs/' + f.split('/').pop() + '\" target=\"_blank\">📄 ' + f.split('/').pop() + '</a>').join(' ') }}\n    </p>\n    <div class=\"next-steps\">\n        <h3>📋 Next Steps:</h3>\n        <ol>\n            <li>Download and review the <strong>Compliance Certificate</strong></li>\n            <li>Make any necessary edits to the Compliance Certificate</li>\n            <li>Proceed to <strong>Phase 2</strong> to generate the Word Report</li>\n        </ol>\n        <a class=\"btn btn-next\" href=\"/form/generate-word-report\">➡️ Continue to Phase 2</a>\n    </div>\n    {{ $json.warnings && $json.warnings.length > 0 ? '<div class=\"warn\"><strong>⚠️ Warnings:</strong><ul>' + $json.warnings.map(w => '<li>' + w + '</li>').join('') + '</ul></div>' : '' }}\n    <p style=\"margin-top:25px\"><a href=\"/form/generate-accounts\">← Start Over</a></p>\n</div>\n</body>\n</html>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "phase1-success-page",
+      "name": "Success Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3472, 736]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 1 Failed</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#f87171}\n        .err{background:#450a0a;padding:20px;border-radius:8px;border-left:4px solid #ef4444}\n        .btn{display:inline-block;margin-top:20px;padding:12px 24px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <h1>❌ Phase 1 Generation Failed</h1>\n    <div class=\"err\">\n        <p><strong>Error Details:</strong></p>\n        {{ ($json.errors || []).map(e => '<p>• ' + e + '</p>').join('') }}\n        {{ $json.detail ? '<p>• ' + $json.detail + '</p>' : '' }}\n        {{ $json.message ? '<p>• ' + $json.message + '</p>' : '' }}\n    </div>\n    <a class=\"btn\" href=\"/form/generate-accounts\">🔄 Try Again</a>\n</div>\n</body>\n</html>",
+        "options": {
+          "responseCode": 500,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "phase1-error-page",
+      "name": "Error Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3472, 928]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Phase 1 Form": {
+      "main": [
+        [
+          { "node": "Upload BDO", "type": "main", "index": 0 },
+          { "node": "Upload MA", "type": "main", "index": 0 },
+          { "node": "Upload Rent Roll", "type": "main", "index": 0 },
+          { "node": "Upload Sales", "type": "main", "index": 0 },
+          { "node": "Upload Compliance", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upload BDO": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 0 }]]
+    },
+    "Upload MA": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 1 }]]
+    },
+    "Upload Rent Roll": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 2 }]]
+    },
+    "Upload Sales": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 3 }]]
+    },
+    "Upload Compliance": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 4 }]]
+    },
+    "Merge": {
+      "main": [[{ "node": "Wait All Uploads", "type": "main", "index": 0 }]]
+    },
+    "Wait All Uploads": {
+      "main": [[{ "node": "Build Request", "type": "main", "index": 0 }]]
+    },
+    "Build Request": {
+      "main": [[{ "node": "Generate Accounts", "type": "main", "index": 0 }]]
+    },
+    "Generate Accounts": {
+      "main": [[{ "node": "Success?", "type": "main", "index": 0 }]]
+    },
+    "Success?": {
+      "main": [
+        [{ "node": "Success Page", "type": "main", "index": 0 }],
+        [{ "node": "Error Page", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "phase1-v1",
+  "meta": {
+    "instanceId": "qsp-automation-phase1"
+  },
+  "id": "QSPPhase1Accounts",
+  "tags": ["qsp", "phase1", "accounts"]
+}

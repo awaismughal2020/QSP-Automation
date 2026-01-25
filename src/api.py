@@ -17,7 +17,14 @@ import uuid
 import os
 from loguru import logger
 
-from .orchestrator import QuarterlyReportOrchestrator, QuarterlyReportConfig
+from .orchestrator import (
+    QuarterlyReportOrchestrator, 
+    QuarterlyReportConfig,
+    WordReportOrchestrator,
+    WordReportConfig,
+    FinalPDFOrchestrator,
+    FinalPDFConfig
+)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -91,6 +98,83 @@ class GenerateResponse(BaseModel):
     warnings: Optional[List[str]] = None
     errors: Optional[List[str]] = None
     execution_time_seconds: Optional[float] = None
+
+
+class GenerateAccountsRequest(BaseModel):
+    """Request model for Phase 1: Generate Management Accounts + Compliance Certificate."""
+    year: int = Field(..., description="Report year (e.g., 2025)", ge=2020, le=2030)
+    quarter: int = Field(..., description="Quarter number (1-4)", ge=1, le=4)
+    bdo_file: str = Field(..., description="Path to BDO financials Excel file")
+    prev_ma_file: str = Field(..., description="Path to previous Management Accounts file")
+    rent_roll_file: str = Field(..., description="Path to rent roll Excel file")
+    sales_tracker_file: str = Field(..., description="Path to sales tracker Excel file")
+    prev_compliance_file: str = Field(..., description="Path to previous Compliance Certificate file")
+    output_dir: Optional[str] = Field(None, description="Output directory (default: outputs/)")
+    dry_run: bool = Field(False, description="Validate inputs without generating files")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "year": 2025,
+                "quarter": 3,
+                "bdo_file": "inputs/Cijfers_QSP_Q3.xlsx",
+                "prev_ma_file": "inputs/Management Accounts Q2 2025 - Draft 1.xlsx",
+                "rent_roll_file": "inputs/QSP_huurlijst_Q3.xlsx",
+                "sales_tracker_file": "inputs/Unit_Sales_tracker_Q3.xlsx",
+                "prev_compliance_file": "inputs/Compliance Certificate Berekening QSP - Q2 2025.xlsx",
+                "dry_run": False
+            }
+        }
+
+
+class GenerateWordReportRequest(BaseModel):
+    """Request model for Phase 2: Generate Word Report."""
+    year: int = Field(..., description="Report year (e.g., 2025)", ge=2020, le=2030)
+    quarter: int = Field(..., description="Quarter number (1-4)", ge=1, le=4)
+    management_accounts_file: str = Field(..., description="Path to Management Accounts file (from Phase 1)")
+    compliance_certificate_file: str = Field(..., description="Path to Compliance Certificate file (edited by client)")
+    rent_roll_file: str = Field(..., description="Path to rent roll Excel file")
+    sales_tracker_file: str = Field(..., description="Path to sales tracker Excel file")
+    word_template_file: str = Field(..., description="Path to Word template file")
+    output_dir: Optional[str] = Field(None, description="Output directory (default: outputs/)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "year": 2025,
+                "quarter": 3,
+                "management_accounts_file": "outputs/Management Accounts Q3 2025 - Draft 1.xlsx",
+                "compliance_certificate_file": "inputs/Compliance Certificate Berekening QSP - Q3 2025_edited.xlsx",
+                "rent_roll_file": "inputs/QSP_huurlijst_Q3.xlsx",
+                "sales_tracker_file": "inputs/Unit_Sales_tracker_Q3.xlsx",
+                "word_template_file": "inputs/Quarterly_QSP_-_Q2_2025_-_Draft.docx"
+            }
+        }
+
+
+class GenerateFinalPDFRequest(BaseModel):
+    """Request model for Phase 3: Generate Final PDF."""
+    year: int = Field(..., description="Report year (e.g., 2025)", ge=2020, le=2030)
+    quarter: int = Field(..., description="Quarter number (1-4)", ge=1, le=4)
+    word_report_file: str = Field(..., description="Path to final Word report (from Phase 2, potentially edited)")
+    management_accounts_file: str = Field(..., description="Path to final Management Accounts file")
+    compliance_certificate_file: str = Field(..., description="Path to final Compliance Certificate (client-approved)")
+    rent_roll_file: str = Field(..., description="Path to rent roll Excel file")
+    sales_tracker_file: str = Field(..., description="Path to sales tracker Excel file")
+    output_dir: Optional[str] = Field(None, description="Output directory (default: outputs/)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "year": 2025,
+                "quarter": 3,
+                "word_report_file": "outputs/Quarterly QSP - Q3 2025 - Draft.docx",
+                "management_accounts_file": "outputs/Management Accounts Q3 2025 - Draft 1.xlsx",
+                "compliance_certificate_file": "inputs/Compliance Certificate Berekening QSP - Q3 2025_final.xlsx",
+                "rent_roll_file": "inputs/QSP_huurlijst_Q3.xlsx",
+                "sales_tracker_file": "inputs/Unit_Sales_tracker_Q3.xlsx"
+            }
+        }
 
 
 class JobStatusResponse(BaseModel):
@@ -295,6 +379,327 @@ async def get_job_status(job_id: str):
         progress=job.get("progress"),
         result=job.get("result")
     )
+
+
+# ============================================================================
+# PHASE 1: Generate Management Accounts + Compliance Certificate
+# ============================================================================
+
+@app.post("/api/v1/generate-accounts", response_model=GenerateResponse)
+async def generate_accounts(request: GenerateAccountsRequest):
+    """
+    Phase 1: Generate Management Accounts and Draft Compliance Certificate.
+    
+    This is the first phase of the split workflow:
+    1. Parse BDO quarterly financials
+    2. Parse rent roll
+    3. Parse sales tracker  
+    4. Build Management Accounts
+    5. Build Compliance Certificate
+    
+    Outputs:
+    - Management Accounts Excel
+    - Compliance Certificate Excel (Draft)
+    
+    The client can download and review/edit the Compliance Certificate
+    before proceeding to Phase 2.
+    """
+    start_time = datetime.now()
+    job_id = str(uuid.uuid4())[:8]
+    
+    logger.info(f"[Job {job_id}] [Phase 1] Starting accounts generation for Q{request.quarter} {request.year}")
+    
+    try:
+        # Resolve file paths
+        output_dir = Path(request.output_dir) if request.output_dir else OUTPUTS_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Validate input files exist
+        input_files = {
+            "bdo_file": request.bdo_file,
+            "prev_ma_file": request.prev_ma_file,
+            "rent_roll_file": request.rent_roll_file,
+            "sales_tracker_file": request.sales_tracker_file,
+            "prev_compliance_file": request.prev_compliance_file,
+        }
+        
+        resolved_files = {}
+        missing_files = []
+        
+        for name, path_str in input_files.items():
+            resolved_path = resolve_input_path(path_str)
+            if not resolved_path.exists():
+                missing_files.append(f"{name}: {path_str} (resolved: {resolved_path})")
+            else:
+                resolved_files[name] = resolved_path
+                logger.info(f"[Job {job_id}] Resolved {name}: {path_str} -> {resolved_path}")
+        
+        if missing_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing input files: {', '.join(missing_files)}"
+            )
+        
+        # Create orchestrator config
+        config = QuarterlyReportConfig(
+            year=request.year,
+            quarter=request.quarter,
+            bdo_file=resolved_files["bdo_file"],
+            previous_management_accounts=resolved_files["prev_ma_file"],
+            rent_roll_file=resolved_files["rent_roll_file"],
+            sales_tracker_file=resolved_files["sales_tracker_file"],
+            previous_compliance_calc=resolved_files["prev_compliance_file"],
+            word_template=Path("/dev/null"),  # Not used in Phase 1
+            output_dir=output_dir
+        )
+        
+        # Run Phase 1 only
+        orchestrator = QuarterlyReportOrchestrator(config)
+        result = orchestrator.run_accounts_only(dry_run=request.dry_run)
+        
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        if result.get('status') == 'success':
+            return GenerateResponse(
+                status="success",
+                job_id=job_id,
+                message=f"Phase 1 complete: Management Accounts and Compliance Certificate generated for Q{request.quarter} {request.year}",
+                output_files=result.get('output_files', []),
+                warnings=result.get('warnings', []),
+                errors=[],
+                execution_time_seconds=execution_time
+            )
+        else:
+            return GenerateResponse(
+                status="failed",
+                job_id=job_id,
+                message="Phase 1 generation failed",
+                output_files=result.get('output_files', []),
+                warnings=result.get('warnings', []),
+                errors=result.get('errors', []),
+                execution_time_seconds=execution_time
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Error in Phase 1: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Phase 1 generation failed: {str(e)}"
+        )
+
+
+# ============================================================================
+# PHASE 2: Generate Word Report
+# ============================================================================
+
+@app.post("/api/v1/generate-word-report", response_model=GenerateResponse)
+async def generate_word_report(request: GenerateWordReportRequest):
+    """
+    Phase 2: Generate Draft Word Report.
+    
+    Uses Management Accounts and Compliance Certificate from Phase 1
+    (potentially edited by client) to generate the Word report.
+    
+    Inputs:
+    - Management Accounts file (from Phase 1)
+    - Compliance Certificate (edited/updated by client)
+    - All source files (rent roll, sales tracker)
+    - Word template
+    
+    Output:
+    - Draft Word Report
+    """
+    start_time = datetime.now()
+    job_id = str(uuid.uuid4())[:8]
+    
+    logger.info(f"[Job {job_id}] [Phase 2] Starting Word report generation for Q{request.quarter} {request.year}")
+    
+    try:
+        # Resolve file paths
+        output_dir = Path(request.output_dir) if request.output_dir else OUTPUTS_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Validate input files exist
+        input_files = {
+            "management_accounts_file": request.management_accounts_file,
+            "compliance_certificate_file": request.compliance_certificate_file,
+            "rent_roll_file": request.rent_roll_file,
+            "sales_tracker_file": request.sales_tracker_file,
+            "word_template_file": request.word_template_file,
+        }
+        
+        resolved_files = {}
+        missing_files = []
+        
+        for name, path_str in input_files.items():
+            resolved_path = resolve_input_path(path_str)
+            if not resolved_path.exists():
+                missing_files.append(f"{name}: {path_str} (resolved: {resolved_path})")
+            else:
+                resolved_files[name] = resolved_path
+                logger.info(f"[Job {job_id}] Resolved {name}: {path_str} -> {resolved_path}")
+        
+        if missing_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing input files: {', '.join(missing_files)}"
+            )
+        
+        # Create Word report config
+        config = WordReportConfig(
+            year=request.year,
+            quarter=request.quarter,
+            management_accounts_file=resolved_files["management_accounts_file"],
+            compliance_certificate_file=resolved_files["compliance_certificate_file"],
+            rent_roll_file=resolved_files["rent_roll_file"],
+            sales_tracker_file=resolved_files["sales_tracker_file"],
+            word_template=resolved_files["word_template_file"],
+            output_dir=output_dir
+        )
+        
+        # Run Phase 2
+        orchestrator = WordReportOrchestrator(config)
+        result = orchestrator.run()
+        
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        if result.get('status') == 'success':
+            return GenerateResponse(
+                status="success",
+                job_id=job_id,
+                message=f"Phase 2 complete: Word report generated for Q{request.quarter} {request.year}",
+                output_files=result.get('output_files', []),
+                warnings=result.get('warnings', []),
+                errors=[],
+                execution_time_seconds=execution_time
+            )
+        else:
+            return GenerateResponse(
+                status="failed",
+                job_id=job_id,
+                message="Phase 2 generation failed",
+                output_files=result.get('output_files', []),
+                warnings=result.get('warnings', []),
+                errors=result.get('errors', []),
+                execution_time_seconds=execution_time
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Error in Phase 2: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Phase 2 generation failed: {str(e)}"
+        )
+
+
+# ============================================================================
+# PHASE 3: Generate Final PDF
+# ============================================================================
+
+@app.post("/api/v1/generate-final-pdf", response_model=GenerateResponse)
+async def generate_final_pdf(request: GenerateFinalPDFRequest):
+    """
+    Phase 3: Generate Final PDF Report.
+    
+    Takes all finalized documents and assembles them into the final PDF.
+    
+    Inputs:
+    - Final Compliance Certificate (client-approved)
+    - Final Word Report (from Phase 2, potentially edited)
+    - All source files (rent roll, sales tracker)
+    
+    Output:
+    - Final PDF Report
+    
+    Note: Requires LibreOffice to be installed for PDF conversion.
+    """
+    start_time = datetime.now()
+    job_id = str(uuid.uuid4())[:8]
+    
+    logger.info(f"[Job {job_id}] [Phase 3] Starting final PDF generation for Q{request.quarter} {request.year}")
+    
+    try:
+        # Resolve file paths
+        output_dir = Path(request.output_dir) if request.output_dir else OUTPUTS_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Validate input files exist
+        input_files = {
+            "word_report_file": request.word_report_file,
+            "management_accounts_file": request.management_accounts_file,
+            "compliance_certificate_file": request.compliance_certificate_file,
+            "rent_roll_file": request.rent_roll_file,
+            "sales_tracker_file": request.sales_tracker_file,
+        }
+        
+        resolved_files = {}
+        missing_files = []
+        
+        for name, path_str in input_files.items():
+            resolved_path = resolve_input_path(path_str)
+            if not resolved_path.exists():
+                missing_files.append(f"{name}: {path_str} (resolved: {resolved_path})")
+            else:
+                resolved_files[name] = resolved_path
+                logger.info(f"[Job {job_id}] Resolved {name}: {path_str} -> {resolved_path}")
+        
+        if missing_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing input files: {', '.join(missing_files)}"
+            )
+        
+        # Create Final PDF config
+        config = FinalPDFConfig(
+            year=request.year,
+            quarter=request.quarter,
+            word_report_file=resolved_files["word_report_file"],
+            management_accounts_file=resolved_files["management_accounts_file"],
+            compliance_certificate_file=resolved_files["compliance_certificate_file"],
+            rent_roll_file=resolved_files["rent_roll_file"],
+            sales_tracker_file=resolved_files["sales_tracker_file"],
+            output_dir=output_dir
+        )
+        
+        # Run Phase 3
+        orchestrator = FinalPDFOrchestrator(config)
+        result = orchestrator.run()
+        
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        if result.get('status') == 'success':
+            return GenerateResponse(
+                status="success",
+                job_id=job_id,
+                message=f"Phase 3 complete: Final PDF generated for Q{request.quarter} {request.year}",
+                output_files=result.get('output_files', []),
+                warnings=result.get('warnings', []),
+                errors=[],
+                execution_time_seconds=execution_time
+            )
+        else:
+            return GenerateResponse(
+                status="failed",
+                job_id=job_id,
+                message="Phase 3 generation failed",
+                output_files=result.get('output_files', []),
+                warnings=result.get('warnings', []),
+                errors=result.get('errors', []),
+                execution_time_seconds=execution_time
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Error in Phase 3: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Phase 3 generation failed: {str(e)}"
+        )
 
 
 @app.get("/api/v1/outputs")

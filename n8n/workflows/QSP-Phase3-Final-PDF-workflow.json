@@ -1,0 +1,373 @@
+{
+  "name": "QSP Phase 3 - Generate Final PDF",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "generate-final-pdf",
+        "formTitle": "QSP Phase 3: Generate Final PDF",
+        "formDescription": "Upload all finalized documents to assemble the final PDF report. Ensure all documents have been reviewed and approved before proceeding.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Year",
+              "fieldType": "number",
+              "placeholder": "2025",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Quarter",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "Q1" },
+                  { "option": "Q2" },
+                  { "option": "Q3" },
+                  { "option": "Q4" }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Word_Report",
+              "fieldType": "file",
+              "acceptFileTypes": ".docx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Management_Accounts",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Compliance_Certificate",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Rent_Roll",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Sales_Tracker",
+              "fieldType": "file",
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "phase3-form-trigger",
+      "name": "Phase 3 Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.1,
+      "position": [1248, 816],
+      "webhookId": "generate-final-pdf"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Word_Report"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase3-upload-word",
+      "name": "Upload Word Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 448]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Management_Accounts"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase3-upload-ma",
+      "name": "Upload MA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 608]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Compliance_Certificate"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase3-upload-compliance",
+      "name": "Upload Compliance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 768]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Rent_Roll"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase3-upload-rent-roll",
+      "name": "Upload Rent Roll",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 928]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/upload",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "Sales_Tracker"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "phase3-upload-sales",
+      "name": "Upload Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1792, 1088]
+    },
+    {
+      "parameters": {
+        "numberInputs": 5
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [2128, 752],
+      "id": "phase3-merge",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "phase3-wait-uploads",
+      "name": "Wait All Uploads",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [2416, 832],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const year = $('Phase 3 Form').first().json.Year;\nconst quarterRaw = $('Phase 3 Form').first().json.Quarter;\nconst quarter = parseInt(quarterRaw.replace('Q', ''));\nconst word_report_file = $('Upload Word Report').first().json.path;\nconst management_accounts_file = $('Upload MA').first().json.path;\nconst compliance_certificate_file = $('Upload Compliance').first().json.path;\nconst rent_roll_file = $('Upload Rent Roll').first().json.path;\nconst sales_tracker_file = $('Upload Sales').first().json.path;\n\nreturn [{\n  json: {\n    year: year,\n    quarter: quarter,\n    word_report_file: word_report_file,\n    management_accounts_file: management_accounts_file,\n    compliance_certificate_file: compliance_certificate_file,\n    rent_roll_file: rent_roll_file,\n    sales_tracker_file: sales_tracker_file\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2656, 832],
+      "id": "phase3-build-request",
+      "name": "Build Request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://qsp-automation-api:8000/api/v1/generate-final-pdf",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 600000
+        }
+      },
+      "id": "phase3-generate",
+      "name": "Generate Final PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2912, 832]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "success-check",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "phase3-success-check",
+      "name": "Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3152, 832]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Report Complete!</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#4ade80;margin-bottom:20px;font-size:2em}\n        .phase-badge{display:inline-block;background:#22c55e;color:#fff;padding:4px 12px;border-radius:4px;font-size:14px;margin-bottom:15px}\n        .btn{display:inline-block;margin:8px 8px 8px 0;padding:12px 20px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px;font-weight:500}\n        .btn:hover{background:#2563eb}\n        .btn-download{background:#22c55e;font-size:1.1em;padding:15px 25px}\n        .btn-download:hover{background:#16a34a}\n        .warn{background:#422006;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b}\n        .stats{background:#0f172a;padding:15px;border-radius:8px;margin:15px 0}\n        .success-box{background:#14532d;padding:20px;border-radius:8px;margin:20px 0;border-left:4px solid #22c55e;text-align:center}\n        a{color:#60a5fa}\n        .celebration{font-size:3em;margin-bottom:10px}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <span class=\"phase-badge\">Phase 3 of 3 - Complete!</span>\n    <h1>🎉 Final PDF Generated!</h1>\n    <div class=\"success-box\">\n        <div class=\"celebration\">✅</div>\n        <p>The quarterly report has been successfully generated and is ready for distribution.</p>\n    </div>\n    <div class=\"stats\">\n        <p><strong>Job ID:</strong> {{ $json.job_id }}</p>\n        <p><strong>Execution Time:</strong> {{ $json.execution_time_seconds ? $json.execution_time_seconds.toFixed(1) + ' seconds' : 'N/A' }}</p>\n    </div>\n    <h3>📥 Download Final Report:</h3>\n    <p>\n    {{ ($json.output_files || []).map(f => '<a class=\"btn btn-download\" href=\"http://localhost:8000/api/v1/outputs/' + f.split('/').pop() + '\" target=\"_blank\">📄 ' + f.split('/').pop() + '</a>').join(' ') }}\n    </p>\n    {{ $json.warnings && $json.warnings.length > 0 ? '<div class=\"warn\"><strong>⚠️ Warnings:</strong><ul>' + $json.warnings.map(w => '<li>' + w + '</li>').join('') + '</ul></div>' : '' }}\n    <p style=\"margin-top:25px\"><a href=\"/form/generate-accounts\">🔄 Generate Another Report (Phase 1)</a></p>\n</div>\n</body>\n</html>",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "phase3-success-page",
+      "name": "Success Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3472, 736]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 3 Failed</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#f87171}\n        .err{background:#450a0a;padding:20px;border-radius:8px;border-left:4px solid #ef4444}\n        .btn{display:inline-block;margin-top:20px;padding:12px 24px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px}\n        .note{background:#1e3a5f;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #3b82f6}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <h1>❌ Phase 3 Generation Failed</h1>\n    <div class=\"err\">\n        <p><strong>Error Details:</strong></p>\n        {{ ($json.errors || []).map(e => '<p>• ' + e + '</p>').join('') }}\n        {{ $json.detail ? '<p>• ' + $json.detail + '</p>' : '' }}\n        {{ $json.message ? '<p>• ' + $json.message + '</p>' : '' }}\n    </div>\n    <div class=\"note\">\n        <p><strong>💡 Note:</strong> PDF generation requires LibreOffice to be installed on the server.</p>\n        <p>Install with: <code>brew install --cask libreoffice</code> (macOS) or <code>apt install libreoffice</code> (Linux)</p>\n    </div>\n    <a class=\"btn\" href=\"/form/generate-final-pdf\">🔄 Try Again</a>\n</div>\n</body>\n</html>",
+        "options": {
+          "responseCode": 500,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "phase3-error-page",
+      "name": "Error Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3472, 928]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Phase 3 Form": {
+      "main": [
+        [
+          { "node": "Upload Word Report", "type": "main", "index": 0 },
+          { "node": "Upload MA", "type": "main", "index": 0 },
+          { "node": "Upload Compliance", "type": "main", "index": 0 },
+          { "node": "Upload Rent Roll", "type": "main", "index": 0 },
+          { "node": "Upload Sales", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upload Word Report": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 0 }]]
+    },
+    "Upload MA": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 1 }]]
+    },
+    "Upload Compliance": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 2 }]]
+    },
+    "Upload Rent Roll": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 3 }]]
+    },
+    "Upload Sales": {
+      "main": [[{ "node": "Merge", "type": "main", "index": 4 }]]
+    },
+    "Merge": {
+      "main": [[{ "node": "Wait All Uploads", "type": "main", "index": 0 }]]
+    },
+    "Wait All Uploads": {
+      "main": [[{ "node": "Build Request", "type": "main", "index": 0 }]]
+    },
+    "Build Request": {
+      "main": [[{ "node": "Generate Final PDF", "type": "main", "index": 0 }]]
+    },
+    "Generate Final PDF": {
+      "main": [[{ "node": "Success?", "type": "main", "index": 0 }]]
+    },
+    "Success?": {
+      "main": [
+        [{ "node": "Success Page", "type": "main", "index": 0 }],
+        [{ "node": "Error Page", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "phase3-v1",
+  "meta": {
+    "instanceId": "qsp-automation-phase3"
+  },
+  "id": "QSPPhase3FinalPDF",
+  "tags": ["qsp", "phase3", "pdf"]
+}
