@@ -317,8 +317,9 @@ profit_loss:
   # Sales section
   50:
     label: "Cash proceeds sale"
-    type: manual
-    # This is manually entered, not a formula
+    type: manual_with_ltm
+    ltm_type: ltm_sum_quarters
+    num_quarters: 4
     
   51:
     label: "(Cost of sales)"
@@ -360,32 +361,26 @@ profit_loss:
     
   61:
     label: "(Prepaid derivatives transaction- SFA)"
-    # Q3: Uses account 1790000 (Swap fee)
-    # LTM: Uses special row "Afschrijving prepaid derivatives transaction"
     type: bdo_ref_conditional
     q_config:
       type: bdo_ref
       account_codes: ["1790000"]
       sign: ""
     ltm_config:
-      type: bdo_ref_label
-      label_search: "Afschrijving prepaid derivatives transaction"
-      sign: "-"
+      type: ltm_sum_quarters
+      num_quarters: 4
     
   64:
     label: "(Net interest expenses - Hedge)"
-    # Q3: SWAP = 4643000 + 1790000
-    # LTM: Uses special row "SWAP"
     type: bdo_ref_conditional
     q_config:
       type: bdo_ref
-      account_codes: ["4643000", "1790000"]
+      account_codes: ["4643000", "1790000", "4642000"]
       sign: "-"
       operator: "-"
     ltm_config:
-      type: bdo_ref_label
-      label_search: "SWAP"
-      sign: "-"
+      type: ltm_sum_quarters
+      num_quarters: 4
     
   65:
     label: "(Net interest income - DMRRP INV I)"

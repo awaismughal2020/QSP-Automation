@@ -262,7 +262,7 @@ class ManagementAccountsBuilder:
         self._move_summary_sheet_to_end()
         
         # Step 7: Validate calculations
-        self._validate_calculations(bdo_result)
+        self.validation_result = self._validate_calculations(bdo_result)
         
         # Save output
         self.workbook.save(self.output_path)
@@ -507,6 +507,25 @@ class ManagementAccountsBuilder:
         
         logger.info(f"Set {formulas_set} formulas in column H (special rows handled separately)")
     
+    def _extract_swap_income_from_sheet(self, sheet) -> float:
+        """
+        Extract SWAP income value for the new quarter from the BDO sheet.
+        Looks up account 4643000 in column A and reads its column G value.
+        """
+        for row_idx in range(1, sheet.max_row + 1):
+            code = sheet.cell(row=row_idx, column=1).value
+            if code and str(code).strip() == "4643000":
+                val = sheet.cell(row=row_idx, column=7).value
+                if val is not None:
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
+                logger.warning("Account 4643000 found but column G has no numeric value")
+                return 0.0
+        logger.warning("Account 4643000 not found in BDO sheet for SWAP income extraction")
+        return 0.0
+
     def _add_special_rows_with_formulas(self, sheet, start_row: int):
         """
         Add special rows with formulas matching the reference file structure.
@@ -524,30 +543,26 @@ class ManagementAccountsBuilder:
         - Row 135: "IC interest" with =D115+D120, etc.
         - Row 136: Total row with SUM formulas
         """
-        # Get shifted values for Inkomsten SWAP from previous sheet
         prev_inkomsten_values = self._get_shifted_inkomsten_swap_values()
         
-        # Row offsets from start_row (which is the last data row from source, ~127)
-        # Special rows structure based on reference file:
+        swap_income = self._extract_swap_income_from_sheet(sheet)
+        logger.info(f"Extracted SWAP income for new quarter: {swap_income:,.2f}")
         
-        # Row 129 (start_row + 2): afschrijving SWAP
-        # Using 110650 directly to get exact value (36883.33*3 = 110649.99 which causes rounding issues)
+        # Row 129 (start_row + 2): afschrijving SWAP — use formula matching client template
         row_129 = start_row + 2
         sheet.cell(row=row_129, column=1).value = "afschrijving SWAP"
-        sheet.cell(row=row_129, column=4).value = 110650  # D
-        sheet.cell(row=row_129, column=5).value = 110650  # E
-        sheet.cell(row=row_129, column=6).value = 110650  # F
-        sheet.cell(row=row_129, column=7).value = 110650  # G
-        # H = None for this row
+        sheet.cell(row=row_129, column=4).value = "=36883.33*3"  # D
+        sheet.cell(row=row_129, column=5).value = "=36883.33*3"  # E
+        sheet.cell(row=row_129, column=6).value = "=36883.33*3"  # F
+        sheet.cell(row=row_129, column=7).value = "=36883.33*3"  # G
         
-        # Row 130 (start_row + 3): Inkomsten SWAP - shifted values
+        # Row 130 (start_row + 3): Inkomsten SWAP — shifted values + new quarter from BDO
         row_130 = start_row + 3
         sheet.cell(row=row_130, column=1).value = "Inkomsten SWAP"
         sheet.cell(row=row_130, column=4).value = prev_inkomsten_values.get('E', 0)  # D = old E
         sheet.cell(row=row_130, column=5).value = prev_inkomsten_values.get('F', 0)  # E = old F
         sheet.cell(row=row_130, column=6).value = prev_inkomsten_values.get('G', 0)  # F = old G
-        sheet.cell(row=row_130, column=7).value = None  # G = new quarter (empty)
-        # H = None for this row
+        sheet.cell(row=row_130, column=7).value = swap_income  # G = new quarter SWAP income
         
         # Row 131 (start_row + 4): Empty row
         
@@ -560,17 +575,16 @@ class ManagementAccountsBuilder:
         sheet.cell(row=row_132, column=7).value = "=G117"
         sheet.cell(row=row_132, column=8).value = "=H117+H114+H116+H115"
         
-        # Row 133 (start_row + 6): SWAP - references Inkomsten SWAP row
+        # Row 133 (start_row + 6): SWAP — all columns reference Inkomsten SWAP row
         row_133 = start_row + 6
         sheet.cell(row=row_133, column=1).value = "SWAP"
         sheet.cell(row=row_133, column=4).value = f"=D{row_130}"
         sheet.cell(row=row_133, column=5).value = f"=E{row_130}"
         sheet.cell(row=row_133, column=6).value = f"=F{row_130}"
-        # G133: New quarter SWAP income value (from reference: 156398.53 for Q3 2025)
-        sheet.cell(row=row_133, column=7).value = 156398.53
+        sheet.cell(row=row_133, column=7).value = f"=G{row_130}"
         sheet.cell(row=row_133, column=8).value = f"=SUM(D{row_133}:G{row_133})"
         
-        # Row 134 (start_row + 7): Afschrijving prepaid - references afschrijving SWAP row
+        # Row 134 (start_row + 7): Afschrijving prepaid — references afschrijving SWAP row
         row_134 = start_row + 7
         sheet.cell(row=row_134, column=1).value = "Afschrijving prepaid derivatives transaction"
         sheet.cell(row=row_134, column=4).value = f"=D{row_129}"
@@ -832,13 +846,14 @@ class ManagementAccountsBuilder:
             summary_sheet.cell(row=row_idx, column=new_quarter_col).value = None
         
         # Step 3: Build P&L formulas from templates (row 22 onwards)
-        # Pass previous column index to copy number formatting
         self._build_pl_formulas_from_templates(summary_sheet, new_quarter_col, bdo_column='G',
-                                               prev_col_idx=prev_quarter_col)
+                                               prev_col_idx=prev_quarter_col,
+                                               quarter_col_idx=new_quarter_col)
         
         # Step 4: Build LTM formulas (same structure but with column H)
         self._build_pl_formulas_from_templates(summary_sheet, new_ltm_col, bdo_column='H',
-                                               prev_col_idx=new_quarter_col)
+                                               prev_col_idx=new_quarter_col,
+                                               quarter_col_idx=new_quarter_col)
         
         # Step 4b: Set manual values (Row 50 - Cash proceeds sale)
         if self.config.cash_proceeds_sale:
@@ -880,35 +895,47 @@ class ManagementAccountsBuilder:
             ltm_date_cell.border = copy(prev_ltm_date_cell.border)
             ltm_date_cell.fill = copy(prev_ltm_date_cell.fill)
         
-        # LTM column headers (row 22) - copy from previous LTM (which is now at new_ltm_col)
-        # The inserted column shifted the old LTM, so we copy its style
+        # LTM column header (row 22): Calibri/11/bold/white on blue #4472C4
         blue_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
         ltm_header = summary_sheet.cell(row=22, column=new_ltm_col)
         ltm_header.value = f"LTM {self.config.quarter}"
-        ltm_header.font = Font(bold=True, color="FFFFFF")  # White text on blue
+        ltm_header.font = Font(name='Calibri', size=11, bold=True, color="FFFFFF")
         ltm_header.fill = blue_fill
         ltm_header.alignment = copy(prev_header_cell.alignment) if prev_header_cell.has_style else None
         
         # Copy number formatting for all P&L rows from previous column
+        client_number_format = '_(* #,##0_);_(* \\(#,##0\\);_(* "-"??_);_(@_)'
         self._copy_number_formatting(summary_sheet, prev_quarter_col, new_quarter_col, 
                                      start_row=22, end_row=summary_sheet.max_row)
         self._copy_number_formatting(summary_sheet, new_quarter_col, new_ltm_col,
                                      start_row=22, end_row=summary_sheet.max_row)
         
+        # Apply styling to new quarter column data cells: Calibri/11/non-bold
+        calibri_font = Font(name='Calibri', size=11, bold=False)
+        for row_idx in range(23, summary_sheet.max_row + 1):
+            cell = summary_sheet.cell(row=row_idx, column=new_quarter_col)
+            if cell.value is not None:
+                cell.font = calibri_font
+                if cell.number_format == 'General':
+                    cell.number_format = client_number_format
+        
+        # Apply styling to LTM column data cells: Avenir Book/10/bold
+        avenir_font = Font(name='Avenir Book', size=10, bold=True)
+        for row_idx in range(23, summary_sheet.max_row + 1):
+            cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
+            if cell.value is not None:
+                cell.font = avenir_font
+                if cell.number_format == 'General':
+                    cell.number_format = client_number_format
+        
         # Step 7: Update LTM column SUM formulas to include new quarter column
-        # After inserting a column, SUM ranges shift but don't include the new column
         self._update_ltm_sum_ranges(summary_sheet, new_ltm_col, new_quarter_col)
         
         # Step 8: Update Bank Account Overview section (rows 104-120)
-        # This section has direct BDO references that need to be updated to new BDO sheet
         self._update_bank_account_overview_section(summary_sheet, new_ltm_col)
         
         # Step 9: Add new quarter column to column group (outline)
-        # The new column should be part of the group like previous quarters (outline_level=1)
-        # but remain visible (hidden=False)
         new_col_letter = get_column_letter(new_quarter_col)
-        
-        # Add new quarter column to the group (outline_level=1, but visible)
         summary_sheet.column_dimensions[new_col_letter].outlineLevel = 1
         summary_sheet.column_dimensions[new_col_letter].hidden = False
         logger.info(f"Added column {new_col_letter} to group (outline_level=1, hidden=False)")
@@ -1063,7 +1090,8 @@ class ManagementAccountsBuilder:
             logger.info(f"Updated {updated_count} cells in Bank Account Overview section (column {ltm_letter})")
     
     def _build_pl_formulas_from_templates(self, sheet, col_idx: int, bdo_column: str = 'G',
-                                          prev_col_idx: int = None):
+                                          prev_col_idx: int = None,
+                                          quarter_col_idx: int = None):
         """
         Build P&L formulas for a column using formula templates.
         
@@ -1071,12 +1099,15 @@ class ManagementAccountsBuilder:
         - bdo_ref type: Look up account codes in BDO sheet, build formula with correct row numbers
         - calc type: Replace {COL} placeholder with actual column letter
         - manual type: Copy value from previous column (for Cash proceeds sale, etc.)
+        - ltm_sum_quarters: SUM of the last N quarterly columns (for LTM)
+        - manual_with_ltm: Manual for quarter columns, ltm_sum_quarters for LTM
         
         Args:
             sheet: The summary sheet
             col_idx: Column index to write formulas to
             bdo_column: BDO column to reference (G for quarter, H for LTM)
             prev_col_idx: Previous column index (for copying manual values)
+            quarter_col_idx: New quarter column index (needed for ltm_sum_quarters)
         """
         col_letter = get_column_letter(col_idx)
         bdo_sheet_name = self.config.bdo_sheet_name
@@ -1087,21 +1118,18 @@ class ManagementAccountsBuilder:
             target_cell = sheet.cell(row=row_idx, column=col_idx)
             
             if formula_type == 'bdo_ref':
-                # Build formula from account codes
                 formula = self._build_bdo_ref_formula(template, bdo_sheet_name, bdo_column)
                 if formula:
                     target_cell.value = formula
                     formulas_built += 1
                     
             elif formula_type == 'bdo_ref_label':
-                # Build formula from label search
                 formula = self._build_bdo_ref_label_formula(template, bdo_sheet_name, bdo_column)
                 if formula:
                     target_cell.value = formula
                     formulas_built += 1
             
             elif formula_type == 'bdo_ref_conditional':
-                # Use different config for Q3 (column G) vs LTM (column H)
                 if bdo_column == 'G':
                     sub_template = template.get('q_config', {})
                 else:
@@ -1112,6 +1140,10 @@ class ManagementAccountsBuilder:
                     formula = self._build_bdo_ref_formula(sub_template, bdo_sheet_name, bdo_column)
                 elif sub_type == 'bdo_ref_label':
                     formula = self._build_bdo_ref_label_formula(sub_template, bdo_sheet_name, bdo_column)
+                elif sub_type == 'ltm_sum_quarters':
+                    formula = self._build_ltm_sum_quarters_formula(
+                        row_idx, sub_template.get('num_quarters', 4), quarter_col_idx
+                    )
                 else:
                     formula = None
                     
@@ -1120,29 +1152,55 @@ class ManagementAccountsBuilder:
                     formulas_built += 1
                     
             elif formula_type == 'calc':
-                # Replace {COL} with actual column letter
                 pattern = template.get('pattern', '')
                 formula = pattern.replace('{COL}', col_letter)
                 target_cell.value = formula
                 formulas_built += 1
                 
             elif formula_type == 'manual':
-                # Manual entry - this value needs to be provided separately
-                # For now, don't set a value (will be handled by copy from source or external input)
                 pass
             
+            elif formula_type == 'manual_with_ltm':
+                if bdo_column == 'H' and quarter_col_idx:
+                    ltm_type = template.get('ltm_type', '')
+                    if ltm_type == 'ltm_sum_quarters':
+                        formula = self._build_ltm_sum_quarters_formula(
+                            row_idx, template.get('num_quarters', 4), quarter_col_idx
+                        )
+                        if formula:
+                            target_cell.value = formula
+                            formulas_built += 1
+            
             elif formula_type == 'constant':
-                # Constant value (e.g., 0 for unused rows)
                 target_cell.value = template.get('value', 0)
                 formulas_built += 1
             
-            # Copy number format from previous column to maintain formatting
             if prev_col_idx:
                 prev_cell = sheet.cell(row=row_idx, column=prev_col_idx)
                 if prev_cell.number_format:
                     target_cell.number_format = prev_cell.number_format
         
         logger.info(f"Built {formulas_built} P&L formulas for column {col_letter} (BDO col {bdo_column})")
+    
+    def _build_ltm_sum_quarters_formula(self, row_idx: int, num_quarters: int,
+                                         quarter_col_idx: int) -> Optional[str]:
+        """
+        Build =SUM(start:end) formula covering the last N quarterly columns.
+        
+        The quarter_col_idx is the newest quarter column. The formula sums from
+        (quarter_col_idx - num_quarters + 1) to quarter_col_idx.
+        """
+        if not quarter_col_idx:
+            logger.warning(f"Row {row_idx}: Cannot build ltm_sum_quarters without quarter_col_idx")
+            return None
+        start_col = quarter_col_idx - num_quarters + 1
+        if start_col < 1:
+            start_col = 1
+        start_letter = get_column_letter(start_col)
+        end_letter = get_column_letter(quarter_col_idx)
+        formula = f"=SUM({start_letter}{row_idx}:{end_letter}{row_idx})"
+        logger.debug(f"Row {row_idx}: LTM SUM formula: {formula}")
+        return formula
     
     def _build_bdo_ref_formula(self, template: Dict[str, Any], bdo_sheet_name: str, 
                                 bdo_column: str) -> Optional[str]:
@@ -1708,8 +1766,13 @@ class ManagementAccountsBuilder:
             date.strftime('%B %d, %Y'),
         ]
     
-    def _validate_calculations(self, bdo_result: BDOParseResult):
-        """Validate that calculations are correct."""
+    def _validate_calculations(self, bdo_result: BDOParseResult) -> dict:
+        """
+        Validate that calculations are correct and return structured results.
+        
+        Checks: Equity Movement == Direct Result (within tolerance).
+        If misaligned, writes a warning row into the Management Cijfers sheet.
+        """
         equity_start = 0.0
         equity_end = 0.0
         
@@ -1739,11 +1802,48 @@ class ManagementAccountsBuilder:
         direct_result = result_mutations if result_mutations != 0 else (income_mutations + expense_mutations)
         
         tolerance = 1000.00
-        if abs(equity_movement - direct_result) > tolerance:
-            logger.warning(
-                f"VALIDATION WARNING: Equity movement ({equity_movement:,.2f}) != Direct Result ({direct_result:,.2f})"
+        difference = abs(equity_movement - direct_result)
+        is_aligned = difference <= tolerance
+        
+        validation = {
+            'equity_movement': equity_movement,
+            'direct_result': direct_result,
+            'is_aligned': is_aligned,
+            'difference': difference,
+            'messages': []
+        }
+        
+        if not is_aligned:
+            msg = (
+                f"Equity movement ({equity_movement:,.2f}) != Direct Result ({direct_result:,.2f}), "
+                f"difference: {difference:,.2f}"
             )
-            logger.warning(f"  Difference: {abs(equity_movement - direct_result):,.2f}")
+            validation['messages'].append(msg)
+            logger.warning(f"VALIDATION WARNING: {msg}")
+            
+            self._add_validation_warning_to_sheet()
         else:
-            logger.info(f"✓ Equity movement validation passed: {equity_movement:,.2f} ≈ {direct_result:,.2f}")
+            logger.info(f"Equity movement validation passed: {equity_movement:,.2f} ≈ {direct_result:,.2f}")
+        
+        return validation
+    
+    def _add_validation_warning_to_sheet(self):
+        """Write a visible red warning row in Management Cijfers if validation fails."""
+        summary_sheets = [name for name in self.workbook.sheetnames
+                          if 'Management Cijfers' in name]
+        if not summary_sheets:
+            return
+        
+        sheet = self.workbook[summary_sheets[-1]]
+        warning_row = 70
+        
+        red_font = Font(name='Calibri', size=11, bold=True, color='FF0000')
+        red_fill = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+        
+        cell = sheet.cell(row=warning_row, column=2)
+        cell.value = "WARNING: Direct Result (row 68) does not reconcile with Total Equity Movement (row 19)"
+        cell.font = red_font
+        cell.fill = red_fill
+        
+        logger.info(f"Added validation warning in Management Cijfers row {warning_row}")
 

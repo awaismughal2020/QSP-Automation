@@ -5,7 +5,7 @@
       "parameters": {
         "path": "generate-final-pdf",
         "formTitle": "QSP Phase 3: Generate Final PDF",
-        "formDescription": "Upload all finalized documents to assemble the final PDF report. Ensure all documents have been reviewed and approved before proceeding.",
+        "formDescription": "Upload all finalized documents to assemble the final PDF report. Use the same reviewed Management Accounts and Compliance Certificate from Phase 2. Ensure all documents have been reviewed and approved before proceeding.",
         "formFields": {
           "values": [
             {
@@ -37,13 +37,15 @@
               "fieldLabel": "Management_Accounts",
               "fieldType": "file",
               "acceptFileTypes": ".xlsx",
-              "requiredField": true
+              "requiredField": true,
+              "placeholder": "Upload the same reviewed Management Accounts used in Phase 2"
             },
             {
               "fieldLabel": "Compliance_Certificate",
               "fieldType": "file",
               "acceptFileTypes": ".xlsx",
-              "requiredField": true
+              "requiredField": true,
+              "placeholder": "Upload the same reviewed Compliance Certificate used in Phase 2"
             },
             {
               "fieldLabel": "Rent_Roll",

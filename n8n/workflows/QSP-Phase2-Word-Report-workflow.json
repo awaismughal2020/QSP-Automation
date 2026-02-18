@@ -5,7 +5,7 @@
       "parameters": {
         "path": "generate-word-report",
         "formTitle": "QSP Phase 2: Generate Word Report",
-        "formDescription": "Upload the Management Accounts and edited Compliance Certificate from Phase 1, along with source files, to generate the Draft Word Report.",
+        "formDescription": "Upload the reviewed/edited Management Accounts and Compliance Certificate from Phase 1, along with source files, to generate the Draft Word Report. The Management Accounts file you upload here will be used for all subsequent processing.",
         "formFields": {
           "values": [
             {
@@ -31,13 +31,15 @@
               "fieldLabel": "Management_Accounts",
               "fieldType": "file",
               "acceptFileTypes": ".xlsx",
-              "requiredField": true
+              "requiredField": true,
+              "placeholder": "Upload the reviewed/edited Management Accounts from Phase 1"
             },
             {
               "fieldLabel": "Compliance_Certificate",
               "fieldType": "file",
               "acceptFileTypes": ".xlsx",
-              "requiredField": true
+              "requiredField": true,
+              "placeholder": "Upload the reviewed/edited Compliance Certificate from Phase 1"
             },
             {
               "fieldLabel": "Rent_Roll",

@@ -244,9 +244,15 @@ class QuarterlyReportOrchestrator:
                 bdo_source_path=str(self.config.bdo_file)  # Pass BDO file for direct copy
             )
             ma_builder.build(bdo_result)
+            
+            ma_validation = getattr(ma_builder, 'validation_result', None)
+            if ma_validation and not ma_validation.get('is_aligned', True):
+                results['warnings'].extend(ma_validation.get('messages', []))
+            
             results['steps']['management_accounts'] = {
                 'status': 'success',
-                'output': str(ma_output)
+                'output': str(ma_output),
+                'validation': ma_validation
             }
             results['output_files'].append(str(ma_output))
             
@@ -618,9 +624,15 @@ class QuarterlyReportOrchestrator:
                 bdo_source_path=str(self.config.bdo_file)
             )
             ma_builder.build(bdo_result)
+            
+            ma_validation = getattr(ma_builder, 'validation_result', None)
+            if ma_validation and not ma_validation.get('is_aligned', True):
+                results['warnings'].extend(ma_validation.get('messages', []))
+            
             results['steps']['management_accounts'] = {
                 'status': 'success',
-                'output': str(ma_output)
+                'output': str(ma_output),
+                'validation': ma_validation
             }
             results['output_files'].append(str(ma_output))
             
