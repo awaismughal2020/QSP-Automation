@@ -1766,15 +1766,251 @@ class ManagementAccountsBuilder:
             date.strftime('%B %d, %Y'),
         ]
     
+    def _compute_bdo_ref_value(self, template: dict, bdo_result: BDOParseResult) -> Tuple[float, List[str]]:
+        """
+        Compute the numeric value a bdo_ref formula would produce from raw BDO data.
+        
+        Mirrors the Excel formula built by _build_bdo_ref_formula, but returns
+        a computed float instead of a formula string.
+        
+        Returns (value, list_of_missing_account_codes).
+        """
+        account_codes = template.get('account_codes', [])
+        sign = template.get('sign', '-')
+        operator = template.get('operator', '-')
+        
+        if not account_codes:
+            return 0.0, []
+        
+        vals = []
+        missing = []
+        for code in account_codes:
+            entry = bdo_result.accounts.get(code)
+            if entry:
+                vals.append(entry.closing_balance - entry.opening_balance)
+            else:
+                vals.append(0.0)
+                missing.append(code)
+        
+        result = -vals[0] if sign == '-' else vals[0]
+        for v in vals[1:]:
+            if operator == '-':
+                result -= v
+            else:
+                result += v
+        
+        return result, missing
+    
+    def _evaluate_calc_pattern(self, pattern: str, shadow: dict) -> Optional[float]:
+        """
+        Evaluate a calc-type formula pattern using pre-computed shadow values.
+        
+        Supports: SUM range, addition chains, negated subtraction, division.
+        Returns None if the pattern cannot be parsed.
+        """
+        p = pattern.strip()
+        
+        sum_match = re.match(r'^=SUM\(\{COL\}(\d+):\{COL\}(\d+)\)$', p)
+        if sum_match:
+            start_row = int(sum_match.group(1))
+            end_row = int(sum_match.group(2))
+            total = 0.0
+            for r in range(start_row, end_row + 1):
+                if r in shadow:
+                    total += shadow[r]['value']
+            return total
+        
+        neg_sub_match = re.match(r'^=-\(\{COL\}(\d+)-\{COL\}(\d+)\)$', p)
+        if neg_sub_match:
+            r1 = int(neg_sub_match.group(1))
+            r2 = int(neg_sub_match.group(2))
+            v1 = shadow.get(r1, {}).get('value', 0.0)
+            v2 = shadow.get(r2, {}).get('value', 0.0)
+            return -(v1 - v2)
+        
+        div_match = re.match(r'^=\{COL\}(\d+)/\{COL\}(\d+)-1$', p)
+        if div_match:
+            r1 = int(div_match.group(1))
+            r2 = int(div_match.group(2))
+            v1 = shadow.get(r1, {}).get('value', 0.0)
+            v2 = shadow.get(r2, {}).get('value', 0.0)
+            if v2 != 0:
+                return v1 / v2 - 1
+            return 0.0
+        
+        add_refs = re.findall(r'\{COL\}(\d+)', p)
+        if add_refs and '+' in p and '-' not in p.replace('=-', ''):
+            total = 0.0
+            for ref in add_refs:
+                r = int(ref)
+                total += shadow.get(r, {}).get('value', 0.0)
+            return total
+        
+        if add_refs and len(add_refs) >= 2:
+            total = 0.0
+            for ref in add_refs:
+                r = int(ref)
+                total += shadow.get(r, {}).get('value', 0.0)
+            return total
+        
+        logger.debug(f"Could not parse calc pattern: {p}")
+        return None
+    
+    def _compute_shadow_pl(self, bdo_result: BDOParseResult) -> dict:
+        """
+        Compute a 'shadow P&L' from BDO raw data, mirroring the formula chain.
+        
+        For each row in the formula templates, computes the expected numeric value
+        that the Excel formula would produce if evaluated. This allows comparing
+        the P&L chain output against equity movement to find divergence points.
+        
+        Returns: {row_num: {'label': str, 'value': float, 'type': str,
+                            'account_codes': list, 'missing_codes': list}, ...}
+        """
+        shadow = {}
+        
+        for row_idx in sorted(self.formula_templates.keys()):
+            template = self.formula_templates[row_idx]
+            formula_type = template.get('type', 'calc')
+            label = template.get('label', f'Row {row_idx}')
+            entry = {'label': label, 'value': 0.0, 'type': formula_type,
+                     'account_codes': [], 'missing_codes': []}
+            
+            if formula_type == 'bdo_ref':
+                val, missing = self._compute_bdo_ref_value(template, bdo_result)
+                entry['value'] = val
+                entry['account_codes'] = template.get('account_codes', [])
+                entry['missing_codes'] = missing
+            
+            elif formula_type == 'bdo_ref_conditional':
+                sub = template.get('q_config', {})
+                sub_type = sub.get('type', 'bdo_ref')
+                if sub_type == 'bdo_ref':
+                    val, missing = self._compute_bdo_ref_value(sub, bdo_result)
+                    entry['value'] = val
+                    entry['account_codes'] = sub.get('account_codes', [])
+                    entry['missing_codes'] = missing
+                else:
+                    entry['value'] = 0.0
+            
+            elif formula_type == 'calc':
+                pattern = template.get('pattern', '')
+                val = self._evaluate_calc_pattern(pattern, shadow)
+                entry['value'] = val if val is not None else 0.0
+            
+            elif formula_type == 'constant':
+                entry['value'] = float(template.get('value', 0))
+            
+            elif formula_type in ('manual', 'manual_with_ltm'):
+                if row_idx == 50:
+                    entry['value'] = self.config.cash_proceeds_sale or 0.0
+                else:
+                    entry['value'] = 0.0
+            
+            shadow[row_idx] = entry
+        
+        logger.info(f"Shadow P&L computed for {len(shadow)} rows")
+        return shadow
+    
+    def _reconcile_pl_chain(self, shadow: dict, equity_movement: float) -> dict:
+        """
+        Compare shadow P&L chain against equity movement to find divergence.
+        
+        Walks backwards from row 68 (Direct Result) through the formula chain
+        to identify which specific row(s) contribute to any mismatch.
+        """
+        shadow_direct = shadow.get(68, {}).get('value', 0.0)
+        tolerance = 1.0
+        difference = abs(shadow_direct - equity_movement)
+        is_reconciled = difference <= tolerance
+        
+        key_rows = [68, 66, 57, 55, 48, 45, 25, 67, 60, 61, 64, 65, 56, 53, 50,
+                    44, 30, 23, 24, 27, 28, 29, 46, 47]
+        
+        breakdown = []
+        for r in key_rows:
+            if r in shadow:
+                s = shadow[r]
+                breakdown.append({
+                    'row': r,
+                    'label': s['label'],
+                    'value': s['value'],
+                    'type': s['type'],
+                    'missing_codes': s.get('missing_codes', []),
+                })
+        
+        divergence_point = None
+        if not is_reconciled:
+            chain_pairs = [
+                (68, [67, 66], 'Direct result = Delta DTA + EBT'),
+                (66, list(range(57, 66)), 'EBT = SUM(57:65)'),
+                (57, [56, 55], 'EBIT = Depreciation + Total EBITDA'),
+                (55, [53, 48], 'Total EBITDA = Sales + Rental'),
+                (48, [47, 46, 45], 'EBITDA = Mgmt fees + Net rental'),
+                (45, [25, 30, 44], 'Net rental = Gross + Service + Property'),
+            ]
+            
+            for parent_row, child_rows, desc in chain_pairs:
+                parent_val = shadow.get(parent_row, {}).get('value', 0.0)
+                children_sum = sum(
+                    shadow.get(r, {}).get('value', 0.0) for r in child_rows
+                    if r in shadow
+                )
+                if abs(parent_val - children_sum) > tolerance:
+                    divergence_point = {
+                        'row': parent_row,
+                        'label': shadow.get(parent_row, {}).get('label', ''),
+                        'expected': children_sum,
+                        'actual': parent_val,
+                        'detail': f"{desc}: children sum={children_sum:,.2f}, parent={parent_val:,.2f}"
+                    }
+                    break
+            
+            if not divergence_point:
+                bdo_ref_rows = [r for r in shadow if shadow[r]['type'] in ('bdo_ref', 'bdo_ref_conditional')]
+                for r in bdo_ref_rows:
+                    if shadow[r].get('missing_codes'):
+                        codes_str = ', '.join(shadow[r]['missing_codes'])
+                        divergence_point = {
+                            'row': r,
+                            'label': shadow[r]['label'],
+                            'expected': None,
+                            'actual': shadow[r]['value'],
+                            'detail': f"Missing account codes in BDO data: {codes_str}"
+                        }
+                        break
+        
+        result = {
+            'shadow_direct_result': shadow_direct,
+            'equity_movement': equity_movement,
+            'is_reconciled': is_reconciled,
+            'difference': difference,
+            'row_breakdown': breakdown,
+            'divergence_point': divergence_point,
+        }
+        
+        if is_reconciled:
+            logger.info(f"Shadow P&L reconciliation passed: shadow={shadow_direct:,.2f}, equity={equity_movement:,.2f}")
+        else:
+            logger.warning(
+                f"Shadow P&L reconciliation FAILED: shadow={shadow_direct:,.2f}, "
+                f"equity={equity_movement:,.2f}, diff={difference:,.2f}"
+            )
+            if divergence_point:
+                logger.warning(f"  Divergence at row {divergence_point['row']}: {divergence_point['detail']}")
+        
+        return result
+    
     def _validate_calculations(self, bdo_result: BDOParseResult) -> dict:
         """
         Validate that calculations are correct and return structured results.
         
-        Two-pass validation:
+        Three-pass validation:
         1. BDO data check: equity movement vs direct result from raw account data
         2. Structural formula check: verify key Excel formulas are present and correct
+        3. Shadow P&L reconciliation: row-by-row check to pinpoint divergence
         
-        If either check fails, writes a warning row into the Management Cijfers sheet.
+        If any check fails, writes warning rows into the Management Cijfers sheet.
         """
         # --- Pass 1: BDO raw data check ---
         equity_start = 0.0
@@ -1831,7 +2067,36 @@ class ManagementAccountsBuilder:
         # --- Pass 2: Structural formula check ---
         formula_ok = self._validate_structural_formulas(validation)
         
-        if not validation['is_aligned'] or not formula_ok:
+        # --- Pass 3: Shadow P&L reconciliation ---
+        shadow_pl = self._compute_shadow_pl(bdo_result)
+        reconciliation = self._reconcile_pl_chain(shadow_pl, equity_movement)
+        validation['reconciliation'] = reconciliation
+        
+        if not reconciliation['is_reconciled']:
+            validation['messages'].append(
+                f"Shadow P&L: Direct Result from formula chain = {reconciliation['shadow_direct_result']:,.2f}, "
+                f"Equity Movement = {reconciliation['equity_movement']:,.2f}, "
+                f"difference = {reconciliation['difference']:,.2f}"
+            )
+            
+            if reconciliation.get('divergence_point'):
+                dp = reconciliation['divergence_point']
+                validation['messages'].append(
+                    f"Divergence point: Row {dp['row']} ({dp['label']}) - {dp['detail']}"
+                )
+            
+            for row_info in reconciliation['row_breakdown']:
+                if row_info.get('missing_codes'):
+                    codes = ', '.join(row_info['missing_codes'])
+                    validation['messages'].append(
+                        f"Row {row_info['row']} ({row_info['label']}): "
+                        f"missing BDO accounts: {codes}"
+                    )
+            
+            if not is_aligned:
+                validation['is_aligned'] = False
+        
+        if not validation['is_aligned'] or not formula_ok or not reconciliation['is_reconciled']:
             self._add_validation_warning_to_sheet(validation['messages'])
         
         return validation
