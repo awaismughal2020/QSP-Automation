@@ -2134,6 +2134,49 @@ class ManagementAccountsBuilder:
                 f"≈ P&L row 68 = {direct_result:,.2f}"
             )
         
+        # --- Pass 1b: BDO ground truth check ---
+        bdo_resultaat = self._read_bdo_resultaat_na_belasting()
+        validation['bdo_resultaat'] = bdo_resultaat
+        
+        if bdo_resultaat is not None:
+            diff_dr = abs(bdo_resultaat - direct_result)
+            diff_eq = abs(bdo_resultaat - equity_movement)
+            dr_ok = diff_dr <= tolerance
+            eq_ok = diff_eq <= tolerance
+            
+            validation['bdo_vs_direct_result'] = diff_dr
+            validation['bdo_vs_equity_movement'] = diff_eq
+            
+            if not dr_ok or not eq_ok:
+                validation['is_aligned'] = False
+                validation['messages'].append(
+                    f"BDO ground truth: Resultaat na belasting = {bdo_resultaat:,.2f}"
+                )
+                if not dr_ok:
+                    validation['messages'].append(
+                        f"  vs Direct Result (P&L row 68) = {direct_result:,.2f}, "
+                        f"difference: {diff_dr:,.2f}"
+                    )
+                if not eq_ok:
+                    validation['messages'].append(
+                        f"  vs Total Equity Movement (BS row 19) = {equity_movement:,.2f}, "
+                        f"difference: {diff_eq:,.2f}"
+                    )
+                logger.warning(
+                    f"VALIDATION WARNING: BDO Resultaat na belasting ({bdo_resultaat:,.2f}) "
+                    f"differs from Direct Result ({direct_result:,.2f}, Δ={diff_dr:,.2f}) "
+                    f"and/or Equity Movement ({equity_movement:,.2f}, Δ={diff_eq:,.2f})"
+                )
+            else:
+                logger.info(
+                    f"BDO ground truth check passed: Resultaat={bdo_resultaat:,.2f} "
+                    f"≈ DR={direct_result:,.2f} ≈ EM={equity_movement:,.2f}"
+                )
+        else:
+            validation['messages'].append(
+                "BDO ground truth: Could not locate 'Resultaat na belasting' row in BDO sheet"
+            )
+        
         # --- Pass 2: Structural formula check ---
         formula_ok = self._validate_structural_formulas(validation)
         
@@ -2169,6 +2212,55 @@ class ManagementAccountsBuilder:
         
         return validation
     
+    def _read_bdo_resultaat_na_belasting(self) -> Optional[float]:
+        """
+        Read the 'Resultaat na belasting' ground truth value from the BDO sheet.
+
+        Locates the row by label in the BDO sheet, then sums columns D through G
+        (the quarterly mutation columns) to get the expected result after tax.
+        Returns None if the row or sheet cannot be found.
+        """
+        bdo_sheet_name = self.config.bdo_sheet_name
+        if bdo_sheet_name not in self.workbook.sheetnames:
+            logger.warning("BDO ground truth check: sheet not found")
+            return None
+
+        sheet = self.workbook[bdo_sheet_name]
+
+        target_row = None
+
+        label_key = 'resultaat na belasting'
+        if label_key in self._new_bdo_label_map:
+            target_row = self._new_bdo_label_map[label_key]
+        else:
+            for row_idx in range(1, min(sheet.max_row + 1, 140)):
+                for col in (1, 2):
+                    cell_val = sheet.cell(row=row_idx, column=col).value
+                    if cell_val and isinstance(cell_val, str):
+                        if 'resultaat na belasting' in cell_val.lower():
+                            target_row = row_idx
+                            break
+                if target_row:
+                    break
+
+        if target_row is None:
+            logger.warning("BDO ground truth check: 'Resultaat na belasting' row not found")
+            return None
+
+        total = 0.0
+        for col_idx in range(4, 8):  # columns D(4), E(5), F(6), G(7)
+            val = sheet.cell(row=target_row, column=col_idx).value
+            if isinstance(val, (int, float)):
+                total += val
+            elif isinstance(val, str):
+                try:
+                    total += float(val.replace(',', '.').replace(' ', ''))
+                except (ValueError, AttributeError):
+                    pass
+
+        logger.info(f"BDO ground truth: Resultaat na belasting (row {target_row}, D-G) = {total:,.2f}")
+        return total
+
     def _validate_structural_formulas(self, validation: dict) -> bool:
         """
         Verify that key Excel formulas in Management Cijfers are structurally correct.
@@ -2290,7 +2382,7 @@ class ManagementAccountsBuilder:
         red_fill = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
         
         header_cell = sheet.cell(row=warning_row, column=2)
-        header_cell.value = "VALIDATION WARNING: Direct Result (row 68) does not reconcile with Total Equity Movement (row 19)"
+        header_cell.value = "VALIDATION WARNING: Reconciliation check failed — see details below"
         header_cell.font = red_font
         header_cell.fill = red_fill
         
