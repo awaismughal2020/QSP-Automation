@@ -1770,9 +1770,13 @@ class ManagementAccountsBuilder:
         """
         Validate that calculations are correct and return structured results.
         
-        Checks: Equity Movement == Direct Result (within tolerance).
-        If misaligned, writes a warning row into the Management Cijfers sheet.
+        Two-pass validation:
+        1. BDO data check: equity movement vs direct result from raw account data
+        2. Structural formula check: verify key Excel formulas are present and correct
+        
+        If either check fails, writes a warning row into the Management Cijfers sheet.
         """
+        # --- Pass 1: BDO raw data check ---
         equity_start = 0.0
         equity_end = 0.0
         
@@ -1810,25 +1814,137 @@ class ManagementAccountsBuilder:
             'direct_result': direct_result,
             'is_aligned': is_aligned,
             'difference': difference,
+            'formula_checks': {},
             'messages': []
         }
         
         if not is_aligned:
             msg = (
-                f"Equity movement ({equity_movement:,.2f}) != Direct Result ({direct_result:,.2f}), "
-                f"difference: {difference:,.2f}"
+                f"BDO data check: Equity movement ({equity_movement:,.2f}) != "
+                f"Direct Result ({direct_result:,.2f}), difference: {difference:,.2f}"
             )
             validation['messages'].append(msg)
             logger.warning(f"VALIDATION WARNING: {msg}")
-            
-            self._add_validation_warning_to_sheet()
         else:
-            logger.info(f"Equity movement validation passed: {equity_movement:,.2f} ≈ {direct_result:,.2f}")
+            logger.info(f"BDO data check passed: {equity_movement:,.2f} ≈ {direct_result:,.2f}")
+        
+        # --- Pass 2: Structural formula check ---
+        formula_ok = self._validate_structural_formulas(validation)
+        
+        if not validation['is_aligned'] or not formula_ok:
+            self._add_validation_warning_to_sheet(validation['messages'])
         
         return validation
     
-    def _add_validation_warning_to_sheet(self):
-        """Write a visible red warning row in Management Cijfers if validation fails."""
+    def _validate_structural_formulas(self, validation: dict) -> bool:
+        """
+        Verify that key Excel formulas in Management Cijfers are structurally correct.
+        
+        Checks row 19 (Total Equity Movement), row 66 (EBT), row 68 (Direct Result),
+        and intermediate P&L rows (60, 61, 64, 65, 67) for the new quarter and LTM columns.
+        
+        Returns True if all formula checks pass.
+        """
+        summary_sheets = [name for name in self.workbook.sheetnames
+                          if 'Management Cijfers' in name]
+        if not summary_sheets:
+            logger.warning("Structural validation skipped: Management Cijfers sheet not found")
+            return True
+        
+        sheet = self.workbook[summary_sheets[-1]]
+        
+        ltm_col = self._find_ltm_column(sheet)
+        if not ltm_col:
+            logger.warning("Structural validation skipped: LTM column not found")
+            return True
+        
+        quarter_col = ltm_col - 1
+        q_letter = get_column_letter(quarter_col)
+        ltm_letter = get_column_letter(ltm_col)
+        
+        all_ok = True
+        checks = {}
+        
+        expected_formulas = {
+            19: {'col': ltm_col, 'letter': ltm_letter,
+                 'expected': f'=SUM({ltm_letter}3:{ltm_letter}18)',
+                 'label': 'Total Equity Movement (LTM)'},
+            66: {'col': quarter_col, 'letter': q_letter,
+                 'expected': f'=SUM({q_letter}57:{q_letter}65)',
+                 'label': 'EBT (quarter)'},
+            68: {'col': quarter_col, 'letter': q_letter,
+                 'expected': f'={q_letter}67+{q_letter}66',
+                 'label': 'Direct Result (quarter)'},
+        }
+        
+        for row_num, spec in expected_formulas.items():
+            cell = sheet.cell(row=row_num, column=spec['col'])
+            actual = str(cell.value) if cell.value else '(empty)'
+            ok = actual.upper() == spec['expected'].upper()
+            checks[f'row_{row_num}'] = {
+                'label': spec['label'],
+                'expected': spec['expected'],
+                'actual': actual,
+                'ok': ok
+            }
+            if not ok:
+                all_ok = False
+                msg = (
+                    f"Formula check failed: {spec['label']} row {row_num} col {spec['letter']} - "
+                    f"expected '{spec['expected']}', got '{actual}'"
+                )
+                validation['messages'].append(msg)
+                logger.warning(f"VALIDATION WARNING: {msg}")
+        
+        intermediate_rows = {
+            60: 'Net interest expenses - SFA',
+            61: 'Prepaid derivatives - SFA',
+            64: 'Net interest expenses - Hedge',
+            65: 'Net interest income - DMRRP',
+            67: 'Delta DTA & CIT',
+        }
+        for row_num, label in intermediate_rows.items():
+            q_cell = sheet.cell(row=row_num, column=quarter_col)
+            ltm_cell = sheet.cell(row=row_num, column=ltm_col)
+            q_val = q_cell.value
+            ltm_val = ltm_cell.value
+            
+            q_ok = q_val is not None
+            ltm_ok = ltm_val is not None
+            checks[f'row_{row_num}_q'] = {
+                'label': f'{label} (quarter)',
+                'has_formula': q_ok,
+                'actual': str(q_val) if q_val else '(empty)',
+                'ok': q_ok
+            }
+            checks[f'row_{row_num}_ltm'] = {
+                'label': f'{label} (LTM)',
+                'has_formula': ltm_ok,
+                'actual': str(ltm_val) if ltm_val else '(empty)',
+                'ok': ltm_ok
+            }
+            if not q_ok:
+                all_ok = False
+                msg = f"Formula missing: {label} (quarter) row {row_num} col {q_letter} is empty"
+                validation['messages'].append(msg)
+                logger.warning(f"VALIDATION WARNING: {msg}")
+            if not ltm_ok:
+                all_ok = False
+                msg = f"Formula missing: {label} (LTM) row {row_num} col {ltm_letter} is empty"
+                validation['messages'].append(msg)
+                logger.warning(f"VALIDATION WARNING: {msg}")
+        
+        validation['formula_checks'] = checks
+        
+        if all_ok:
+            logger.info("Structural formula validation passed: all key formulas present and correct")
+        else:
+            validation['is_aligned'] = False
+        
+        return all_ok
+    
+    def _add_validation_warning_to_sheet(self, messages: list):
+        """Write visible red warning rows in Management Cijfers if validation fails."""
         summary_sheets = [name for name in self.workbook.sheetnames
                           if 'Management Cijfers' in name]
         if not summary_sheets:
@@ -1840,10 +1956,15 @@ class ManagementAccountsBuilder:
         red_font = Font(name='Calibri', size=11, bold=True, color='FF0000')
         red_fill = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
         
-        cell = sheet.cell(row=warning_row, column=2)
-        cell.value = "WARNING: Direct Result (row 68) does not reconcile with Total Equity Movement (row 19)"
-        cell.font = red_font
-        cell.fill = red_fill
+        header_cell = sheet.cell(row=warning_row, column=2)
+        header_cell.value = "VALIDATION WARNING: Direct Result (row 68) does not reconcile with Total Equity Movement (row 19)"
+        header_cell.font = red_font
+        header_cell.fill = red_fill
         
-        logger.info(f"Added validation warning in Management Cijfers row {warning_row}")
+        for i, msg in enumerate(messages):
+            detail_cell = sheet.cell(row=warning_row + 1 + i, column=2)
+            detail_cell.value = f"  - {msg}"
+            detail_cell.font = Font(name='Calibri', size=10, color='FF0000')
+        
+        logger.info(f"Added validation warnings in Management Cijfers rows {warning_row}-{warning_row + len(messages)}")
 
