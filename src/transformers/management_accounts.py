@@ -81,10 +81,6 @@ class ManagementAccountsBuilder:
         self.workbook = None
         self.mappings_path = Path(mappings_path)
         self.line_item_mappings = self._load_mappings()
-        self.equity_prefixes = []
-        self.income_prefixes = []
-        self.expense_prefixes = []
-        self._load_validation_config()
         
         # Load formula templates
         self.formula_templates_path = Path("config/formula_templates.yaml")
@@ -178,32 +174,6 @@ class ManagementAccountsBuilder:
         
         logger.info(f"Loaded {len(mappings)} line item mappings from {self.mappings_path}")
         return mappings
-    
-    def _load_validation_config(self):
-        """Load validation account prefixes from config."""
-        if not self.mappings_path.exists():
-            self.equity_prefixes = ['10', '11']
-            self.income_prefixes = ['8']
-            self.expense_prefixes = ['4']
-            return
-        
-        with open(self.mappings_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        
-        if 'equity_accounts' in config:
-            self.equity_prefixes = config['equity_accounts'].get('prefixes', ['10', '11'])
-        else:
-            self.equity_prefixes = ['10', '11']
-            
-        if 'income_accounts' in config:
-            self.income_prefixes = config['income_accounts'].get('prefixes', ['8'])
-        else:
-            self.income_prefixes = ['8']
-            
-        if 'expense_accounts' in config:
-            self.expense_prefixes = config['expense_accounts'].get('prefixes', ['4'])
-        else:
-            self.expense_prefixes = ['4']
     
     def _get_default_mappings(self) -> Dict[str, Tuple[List[str], str]]:
         """Return default mappings if config file not found."""
@@ -1801,6 +1771,58 @@ class ManagementAccountsBuilder:
         
         return result, missing
     
+    def _compute_bdo_sum_range_value(self, template: dict, bdo_result: BDOParseResult,
+                                       use_mutation: bool = True) -> Tuple[float, List[str]]:
+        """
+        Compute the numeric value a bdo_sum_range formula would produce from raw BDO data.
+
+        Uses raw_row from AccountEntry to replicate the Excel SUM range logic.
+        When use_mutation=True, computes closing_balance - opening_balance (period change).
+        """
+        start_account = template.get('start_account')
+        end_account = template.get('end_account')
+        count = template.get('count')
+        additional = template.get('additional', [])
+
+        total = 0.0
+        missing = []
+
+        if start_account:
+            start_entry = bdo_result.accounts.get(start_account)
+            if start_entry:
+                row_to_entry = {}
+                for entry in bdo_result.accounts.values():
+                    row_to_entry[entry.raw_row] = entry
+
+                start_raw = start_entry.raw_row
+                if count:
+                    for r in range(start_raw, start_raw + count):
+                        if r in row_to_entry:
+                            e = row_to_entry[r]
+                            total += (e.closing_balance - e.opening_balance) if use_mutation else e.closing_balance
+                elif end_account:
+                    end_entry = bdo_result.accounts.get(end_account)
+                    if end_entry:
+                        for r in range(start_raw, end_entry.raw_row + 1):
+                            if r in row_to_entry:
+                                e = row_to_entry[r]
+                                total += (e.closing_balance - e.opening_balance) if use_mutation else e.closing_balance
+                    else:
+                        missing.append(end_account)
+                else:
+                    total += (start_entry.closing_balance - start_entry.opening_balance) if use_mutation else start_entry.closing_balance
+            else:
+                missing.append(start_account)
+
+        for code in additional:
+            entry = bdo_result.accounts.get(code)
+            if entry:
+                total += (entry.closing_balance - entry.opening_balance) if use_mutation else entry.closing_balance
+            else:
+                missing.append(code)
+
+        return total, missing
+
     def _evaluate_calc_pattern(self, pattern: str, shadow: dict) -> Optional[float]:
         """
         Evaluate a calc-type formula pattern using pre-computed shadow values.
@@ -1912,6 +1934,58 @@ class ManagementAccountsBuilder:
         logger.info(f"Shadow P&L computed for {len(shadow)} rows")
         return shadow
     
+    def _compute_shadow_bs(self, bdo_result: BDOParseResult) -> dict:
+        """
+        Compute a 'shadow Balance Sheet' from BDO raw data using balance_sheet_templates.
+
+        For each row in the balance sheet templates (rows 3-18), computes the expected
+        numeric value using the same account codes as the Excel formulas. Row 19 is
+        the SUM of rows 3-18, representing the Total Equity Movement.
+
+        Uses mutations (closing_balance - opening_balance) so the result is comparable
+        to the P&L-based Direct Result (row 68).
+
+        Returns: {row_num: {'label': str, 'value': float, 'type': str,
+                            'account_codes': list, 'missing_codes': list}, ...}
+        """
+        shadow = {}
+
+        for row_idx in sorted(self.balance_sheet_templates.keys()):
+            template = self.balance_sheet_templates[row_idx]
+            formula_type = template.get('type', 'bdo_ref')
+            label = template.get('label', f'Row {row_idx}')
+            entry = {'label': label, 'value': 0.0, 'type': formula_type,
+                     'account_codes': [], 'missing_codes': []}
+
+            if formula_type == 'bdo_ref':
+                val, missing = self._compute_bdo_ref_value(template, bdo_result)
+                entry['value'] = val
+                entry['account_codes'] = template.get('account_codes', [])
+                entry['missing_codes'] = missing
+
+            elif formula_type == 'bdo_sum_range':
+                val, missing = self._compute_bdo_sum_range_value(template, bdo_result)
+                entry['value'] = val
+                codes = []
+                if template.get('start_account'):
+                    codes.append(template['start_account'])
+                if template.get('end_account'):
+                    codes.append(f"..{template['end_account']}")
+                codes.extend(template.get('additional', []))
+                entry['account_codes'] = codes
+                entry['missing_codes'] = missing
+
+            elif formula_type == 'calc':
+                pattern = template.get('pattern', '')
+                val = self._evaluate_calc_pattern(pattern, shadow)
+                entry['value'] = val if val is not None else 0.0
+
+            shadow[row_idx] = entry
+
+        logger.info(f"Shadow Balance Sheet computed for {len(shadow)} rows, "
+                     f"row 19 = {shadow.get(19, {}).get('value', 'N/A')}")
+        return shadow
+    
     def _reconcile_pl_chain(self, shadow: dict, equity_movement: float) -> dict:
         """
         Compare shadow P&L chain against equity movement to find divergence.
@@ -2006,42 +2080,21 @@ class ManagementAccountsBuilder:
         Validate that calculations are correct and return structured results.
         
         Three-pass validation:
-        1. BDO data check: equity movement vs direct result from raw account data
+        1. Template-based check: shadow BS row 19 vs shadow P&L row 68
+           (uses the exact same account codes as the Excel formulas)
         2. Structural formula check: verify key Excel formulas are present and correct
-        3. Shadow P&L reconciliation: row-by-row check to pinpoint divergence
+        3. Shadow reconciliation: row-by-row check to pinpoint divergence
         
         If any check fails, writes warning rows into the Management Cijfers sheet.
         """
-        # --- Pass 1: BDO raw data check ---
-        equity_start = 0.0
-        equity_end = 0.0
+        # --- Compute shadow models from BDO data using template account codes ---
+        shadow_pl = self._compute_shadow_pl(bdo_result)
+        shadow_bs = self._compute_shadow_bs(bdo_result)
         
-        for code, entry in bdo_result.accounts.items():
-            first_two = code[:2] if len(code) >= 2 else ''
-            if first_two in self.equity_prefixes:
-                equity_start += entry.opening_balance
-                equity_end += entry.closing_balance
+        direct_result = shadow_pl.get(68, {}).get('value', 0.0)
+        equity_movement = shadow_bs.get(19, {}).get('value', 0.0)
         
-        equity_movement = equity_end - equity_start
-        
-        income_mutations = 0.0
-        expense_mutations = 0.0
-        result_mutations = 0.0
-        
-        for code, entry in bdo_result.accounts.items():
-            first_two = code[:2] if len(code) >= 2 else ''
-            first_digit = code[0] if code else ''
-            
-            if first_two == '95':
-                result_mutations += (entry.closing_balance - entry.opening_balance)
-            elif any(first_digit == prefix[0] for prefix in self.income_prefixes):
-                income_mutations += (entry.closing_balance - entry.opening_balance)
-            elif any(first_digit == prefix[0] for prefix in self.expense_prefixes):
-                expense_mutations += (entry.closing_balance - entry.opening_balance)
-        
-        direct_result = result_mutations if result_mutations != 0 else (income_mutations + expense_mutations)
-        
-        tolerance = 1000.00
+        tolerance = 1.0
         difference = abs(equity_movement - direct_result)
         is_aligned = difference <= tolerance
         
@@ -2051,31 +2104,47 @@ class ManagementAccountsBuilder:
             'is_aligned': is_aligned,
             'difference': difference,
             'formula_checks': {},
+            'shadow_bs': shadow_bs,
+            'shadow_pl': shadow_pl,
             'messages': []
         }
         
         if not is_aligned:
             msg = (
-                f"BDO data check: Equity movement ({equity_movement:,.2f}) != "
-                f"Direct Result ({direct_result:,.2f}), difference: {difference:,.2f}"
+                f"Template check: Total Equity Movement (BS row 19 = {equity_movement:,.2f}) != "
+                f"Direct Result (P&L row 68 = {direct_result:,.2f}), difference: {difference:,.2f}"
             )
             validation['messages'].append(msg)
             logger.warning(f"VALIDATION WARNING: {msg}")
+            
+            bs_missing = []
+            for r in sorted(shadow_bs.keys()):
+                if r == 19:
+                    continue
+                codes = shadow_bs[r].get('missing_codes', [])
+                if codes:
+                    bs_missing.append(f"BS row {r} ({shadow_bs[r]['label']}): {', '.join(codes)}")
+            if bs_missing:
+                validation['messages'].append(
+                    f"Missing BDO accounts in Balance Sheet: {'; '.join(bs_missing)}"
+                )
         else:
-            logger.info(f"BDO data check passed: {equity_movement:,.2f} ≈ {direct_result:,.2f}")
+            logger.info(
+                f"Template check passed: BS row 19 = {equity_movement:,.2f} "
+                f"≈ P&L row 68 = {direct_result:,.2f}"
+            )
         
         # --- Pass 2: Structural formula check ---
         formula_ok = self._validate_structural_formulas(validation)
         
-        # --- Pass 3: Shadow P&L reconciliation ---
-        shadow_pl = self._compute_shadow_pl(bdo_result)
+        # --- Pass 3: Shadow reconciliation (detailed row-by-row) ---
         reconciliation = self._reconcile_pl_chain(shadow_pl, equity_movement)
         validation['reconciliation'] = reconciliation
         
         if not reconciliation['is_reconciled']:
             validation['messages'].append(
-                f"Shadow P&L: Direct Result from formula chain = {reconciliation['shadow_direct_result']:,.2f}, "
-                f"Equity Movement = {reconciliation['equity_movement']:,.2f}, "
+                f"Row-by-row: P&L chain result = {reconciliation['shadow_direct_result']:,.2f}, "
+                f"BS equity movement = {reconciliation['equity_movement']:,.2f}, "
                 f"difference = {reconciliation['difference']:,.2f}"
             )
             
@@ -2093,8 +2162,7 @@ class ManagementAccountsBuilder:
                         f"missing BDO accounts: {codes}"
                     )
             
-            if not is_aligned:
-                validation['is_aligned'] = False
+            validation['is_aligned'] = False
         
         if not validation['is_aligned'] or not formula_ok or not reconciliation['is_reconciled']:
             self._add_validation_warning_to_sheet(validation['messages'])
