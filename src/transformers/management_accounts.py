@@ -2216,8 +2216,9 @@ class ManagementAccountsBuilder:
         """
         Read the 'Resultaat na belasting' ground truth value from the BDO sheet.
 
-        Locates the row by label in the BDO sheet, then sums columns D through G
-        (the quarterly mutation columns) to get the expected result after tax.
+        Locates the row by label, then for each of columns D-G either reads the
+        numeric value directly or, if the cell contains a SUM formula (e.g.
+        =SUM(D76:D123)), evaluates it by summing the referenced cell range.
         Returns None if the row or sheet cannot be found.
         """
         bdo_sheet_name = self.config.bdo_sheet_name
@@ -2252,6 +2253,8 @@ class ManagementAccountsBuilder:
             val = sheet.cell(row=target_row, column=col_idx).value
             if isinstance(val, (int, float)):
                 total += val
+            elif isinstance(val, str) and val.startswith('='):
+                total += self._eval_simple_sum_formula(sheet, val, col_idx)
             elif isinstance(val, str):
                 try:
                     total += float(val.replace(',', '.').replace(' ', ''))
@@ -2259,6 +2262,29 @@ class ManagementAccountsBuilder:
                     pass
 
         logger.info(f"BDO ground truth: Resultaat na belasting (row {target_row}, D-G) = {total:,.2f}")
+        return total
+
+    def _eval_simple_sum_formula(self, sheet, formula: str, default_col: int) -> float:
+        """
+        Evaluate a simple SUM formula like =SUM(D76:D123) by reading cell values.
+
+        Only supports =SUM(COLn:COLm) patterns. Returns 0.0 for unparseable formulas.
+        """
+        m = re.match(r'^=SUM\(([A-Z])(\d+):([A-Z])(\d+)\)$', formula, re.IGNORECASE)
+        if not m:
+            logger.debug(f"Cannot evaluate formula: {formula}")
+            return 0.0
+
+        col_letter_start = m.group(1).upper()
+        row_start = int(m.group(2))
+        row_end = int(m.group(4))
+        col_num = ord(col_letter_start) - ord('A') + 1
+
+        total = 0.0
+        for r in range(row_start, row_end + 1):
+            cell_val = sheet.cell(row=r, column=col_num).value
+            if isinstance(cell_val, (int, float)):
+                total += cell_val
         return total
 
     def _validate_structural_formulas(self, validation: dict) -> bool:
