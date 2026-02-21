@@ -820,6 +820,214 @@ class FinalPDFOrchestrator:
         self.config = config
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
     
+    def _update_cc_with_uploaded_ma(self, warnings: list) -> Path:
+        """
+        Sync the entire Compliance Certificate with the uploaded Management Accounts.
+        
+        Three areas need updating when the user edits the MA after Phase 1:
+        
+        1. Q{n} Management Accounts sheet — direct value copy (Balance Sheet,
+           P&L, Bank Accounts) from the MA's LTM column.
+        2. Suppl. Calc sheet — actual values that were copied from the MA during
+           Phase 1 using a keyword mapping (P&L → quarterly column, Balance
+           Sheet → LTM column).
+        3. Cached formula results — SFA CC, Suppl. Calc, and Impact Unit Sales
+           contain formulas that reference Q MA / Suppl. Calc.  Their cached
+           results are stale after steps 1-2, so we clear them to force
+           LibreOffice recalculation during PDF conversion.
+        
+        Returns:
+            Path to the updated CC file (temp copy).
+        """
+        import openpyxl
+        import shutil
+        import tempfile
+        from openpyxl.utils import get_column_letter
+        
+        ma_path = self.config.management_accounts_file
+        cc_path = self.config.compliance_certificate_file
+        
+        q_ma_sheet_name = f"Q{self.config.quarter} Management Accounts"
+        
+        temp_dir = Path(tempfile.mkdtemp(prefix="cc_updated_"))
+        updated_cc_path = temp_dir / cc_path.name
+        shutil.copy2(cc_path, updated_cc_path)
+        
+        try:
+            ma_wb = openpyxl.load_workbook(ma_path, data_only=True)
+            
+            cijfers_sheet = None
+            for name in ma_wb.sheetnames:
+                if 'Management Cijfers' in name:
+                    cijfers_sheet = ma_wb[name]
+                    logger.info(f"[Phase 3] Using MA sheet '{name}' to update CC")
+                    break
+            
+            if cijfers_sheet is None:
+                logger.warning("[Phase 3] Management Cijfers sheet not found, skipping CC update")
+                ma_wb.close()
+                return cc_path
+            
+            # --- Find LTM column (rightmost "LTM" header in row 22) ---
+            ltm_column = None
+            for col in range(cijfers_sheet.max_column, 0, -1):
+                cell_val = cijfers_sheet.cell(row=22, column=col).value
+                if cell_val and 'LTM' in str(cell_val):
+                    ltm_column = col
+                    logger.info(f"[Phase 3] LTM column at {get_column_letter(col)} ('{cell_val}')")
+                    break
+            if ltm_column is None:
+                for col in range(cijfers_sheet.max_column, 0, -1):
+                    if isinstance(cijfers_sheet.cell(row=3, column=col).value, (int, float)):
+                        ltm_column = col
+                        break
+            if ltm_column is None:
+                logger.warning("[Phase 3] Could not find LTM column, skipping CC update")
+                ma_wb.close()
+                return cc_path
+            
+            # --- Find quarterly column (current quarter header, NOT LTM) ---
+            quarter_column = None
+            quarter_header = f"Q{self.config.quarter} {self.config.year}"
+            for col in range(cijfers_sheet.max_column, 0, -1):
+                cell_val = cijfers_sheet.cell(row=22, column=col).value
+                if cell_val:
+                    cell_str = str(cell_val)
+                    if quarter_header in cell_str and 'LTM' not in cell_str:
+                        quarter_column = col
+                        logger.info(f"[Phase 3] Quarter column at {get_column_letter(col)} ('{cell_str}')")
+                        break
+            if quarter_column is None:
+                quarter_column = ltm_column - 1
+                logger.info(f"[Phase 3] Quarter column fallback: {get_column_letter(quarter_column)}")
+            
+            # --- Open CC for editing (data_only=False to preserve formulas) ---
+            cc_wb = openpyxl.load_workbook(updated_cc_path)
+            
+            # ============================================================
+            # STEP 1: Update Q{n} Management Accounts sheet
+            # ============================================================
+            q_ma_updated = 0
+            if q_ma_sheet_name in cc_wb.sheetnames:
+                target_sheet = cc_wb[q_ma_sheet_name]
+                
+                target_to_source = {}
+                for t in range(2, 19):      # Balance Sheet rows
+                    target_to_source[t] = t + 1
+                for t in range(22, 68):     # P&L rows
+                    target_to_source[t] = t + 1
+                for t in range(72, 79):     # Bank account rows
+                    target_to_source[t] = t + 35
+                
+                for target_row, source_row in target_to_source.items():
+                    value = cijfers_sheet.cell(row=source_row, column=ltm_column).value
+                    if value is not None:
+                        target_sheet.cell(row=target_row, column=3).value = value
+                        q_ma_updated += 1
+                
+                logger.info(f"[Phase 3] Updated {q_ma_updated} values in '{q_ma_sheet_name}'")
+            else:
+                logger.warning(f"[Phase 3] Sheet '{q_ma_sheet_name}' not found in CC")
+            
+            # ============================================================
+            # STEP 2: Update Suppl. Calc actual values
+            # ============================================================
+            suppl_updated = 0
+            if 'Suppl. Calc' in cc_wb.sheetnames:
+                suppl_sheet = cc_wb['Suppl. Calc']
+                
+                # Target column: Q3→O(15), Q4→P(16), Q1→Q(17), Q2→R(18)
+                suppl_target_col = 15 + ((self.config.quarter - 3) % 4)
+                
+                # Keyword → (MA source row(s), use_ltm_column)
+                # P&L items use the quarterly column; Balance Sheet items use LTM
+                keyword_map = {
+                    'Theoretical rental income after sales': ([23], False),
+                    '(Financial vacancy)':                   ([24], False),
+                    'Gross rental income':                   ([25], False),
+                    '(Vacancy costs)':                       ([28], False),
+                    'Non recoverable service charges':       ([30], False),
+                    '(Maintenance & repair costs)':          ([32], False),
+                    '(Owners society costs (VVE))':          ([33], False),
+                    '(Insurance costs)':                     ([34], False),
+                    '(Landlord tax)':                        ([35], False),
+                    '(Property tax)':                        ([36], False),
+                    '(Other costs)':                         ([40], False),
+                    '(Agent costs) - in financing costs on CC': ([38], False),
+                    '(Brokerage costs)':                     ([39], False),
+                    '(Audit/fee costs)':                     ([41, 42], False),  # Accountant + Advisory
+                    'Property related expenses':             ([44], False),
+                    'Net rental income':                     ([45], False),
+                    '(Management fees)':                     ([46], False),
+                    'EBIT Rental operation':                 ([48], False),
+                    'Total EBIT':                            ([55], False),
+                    '(Interest expenses Senior)':            ([60], False),
+                    '(Interest expenses Hedge)':             ([64], False),
+                    'EBT':                                   ([66], False),
+                    'Senior loan - EoP':                     ([12], True),
+                }
+                
+                for row_idx in range(1, suppl_sheet.max_row + 1):
+                    keyword = suppl_sheet.cell(row=row_idx, column=2).value
+                    if keyword is None:
+                        continue
+                    keyword_str = str(keyword).strip()
+                    
+                    if keyword_str in keyword_map:
+                        source_rows, use_ltm = keyword_map[keyword_str]
+                        src_col = ltm_column if use_ltm else quarter_column
+                        
+                        total = 0.0
+                        any_found = False
+                        for src_row in source_rows:
+                            val = cijfers_sheet.cell(row=src_row, column=src_col).value
+                            if val is not None and isinstance(val, (int, float)):
+                                total += float(val)
+                                any_found = True
+                        
+                        if any_found:
+                            suppl_sheet.cell(row=row_idx, column=suppl_target_col).value = total
+                            suppl_updated += 1
+                
+                logger.info(f"[Phase 3] Updated {suppl_updated} values in Suppl. Calc col {get_column_letter(suppl_target_col)}")
+            
+            # ============================================================
+            # STEP 3: Clear cached formula results so LibreOffice recalculates
+            # ============================================================
+            formulas_cleared = 0
+            for sheet_name in ['SFA CC', 'Suppl. Calc', 'Impact Unit Sales']:
+                if sheet_name not in cc_wb.sheetnames:
+                    continue
+                sheet = cc_wb[sheet_name]
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        if isinstance(cell.value, str) and cell.value.startswith('='):
+                            formula = cell.value
+                            cell.value = None
+                            cell.value = formula
+                            formulas_cleared += 1
+            
+            logger.info(f"[Phase 3] Cleared cached results for {formulas_cleared} formula cells")
+            
+            cc_wb.save(updated_cc_path)
+            cc_wb.close()
+            ma_wb.close()
+            
+            logger.info(
+                f"[Phase 3] CC sync complete — "
+                f"Q MA: {q_ma_updated}, Suppl. Calc: {suppl_updated}, "
+                f"formulas invalidated: {formulas_cleared}"
+            )
+            
+            return updated_cc_path
+            
+        except Exception as e:
+            logger.error(f"[Phase 3] Failed to update CC with uploaded MA: {e}")
+            import traceback
+            traceback.print_exc()
+            warnings.append(f"Could not sync CC with uploaded MA: {e}")
+            return cc_path
+    
     def run(self) -> dict:
         """
         Execute Phase 3: Generate final PDF.
@@ -840,6 +1048,10 @@ class FinalPDFOrchestrator:
         }
         
         try:
+            # Sync the CC's "Q Management Accounts" sheet with the uploaded MA
+            # so PDF pages 33-35 reflect any edits the user made
+            updated_cc_path = self._update_cc_with_uploaded_ma(results['warnings'])
+            
             # Assemble PDF
             logger.info("Assembling final PDF")
             pdf_output = self.config.output_dir / f"Quarterly QSP - {self.config.quarter_str} - ASX.pdf"
@@ -865,20 +1077,25 @@ class FinalPDFOrchestrator:
                 # Attachment 3: Sales Tracker
                 PDFSource("Sales Tracker", self.config.sales_tracker_file, 'xlsx'),
                 
-                # Attachment 4: Compliance Certificate (all sheets in order)
-                PDFSource("Compliance SFA CC", self.config.compliance_certificate_file, 'xlsx', "SFA CC"),
+                # Attachment 4: Compliance Certificate (using updated CC with synced MA data)
+                PDFSource("Compliance SFA CC", updated_cc_path, 'xlsx', "SFA CC"),
                 PDFSource(
                     f"Q{self.config.quarter} Management Accounts",
-                    self.config.compliance_certificate_file,
+                    updated_cc_path,
                     'xlsx',
                     f"Q{self.config.quarter} Management Accounts"
                 ),
-                PDFSource("Compliance Suppl Calc", self.config.compliance_certificate_file, 'xlsx', "Suppl. Calc"),
-                PDFSource("Compliance Impact Sales", self.config.compliance_certificate_file, 'xlsx', "Impact Unit Sales"),
+                PDFSource("Compliance Suppl Calc", updated_cc_path, 'xlsx', "Suppl. Calc"),
+                PDFSource("Compliance Impact Sales", updated_cc_path, 'xlsx', "Impact Unit Sales"),
             ]
             
             assembler = PDFAssembler(str(pdf_output))
             assembler.assemble(pdf_sources)
+            
+            # Clean up temp CC file if we created one
+            if updated_cc_path != self.config.compliance_certificate_file:
+                import shutil
+                shutil.rmtree(updated_cc_path.parent, ignore_errors=True)
             
             results['steps']['pdf_assembly'] = {
                 'status': 'success',
