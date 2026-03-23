@@ -1,4 +1,6 @@
 # Covenant Thresholds from Senior Facility Agreement
+# TODO: Update threshold values and descriptions for 2026 SFA terms when provided by client.
+# The Excel template (previous CC file) contains the covenant text; update the template accordingly.
 
 covenants:
   historic_debt_service_cover:

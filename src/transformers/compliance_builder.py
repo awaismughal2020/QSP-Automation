@@ -145,6 +145,9 @@ class ComplianceBuilder:
         # Step 7: Update all dates and text references throughout workbook
         self._update_all_dates_and_text()
         
+        # Step 8: Clear manual input cells (must be last, after all other operations)
+        self._clear_manual_input_cells()
+        
         # Save output
         self.workbook.save(self.output_path)
         logger.info(f"Saved to {self.output_path}")
@@ -188,31 +191,21 @@ class ComplianceBuilder:
         Copy Management Accounts data from the CURRENT quarter's file.
         
         The Q{n} Management Accounts sheet in the Compliance Certificate
-        should contain the CURRENT quarter's (Q{n}) LTM data.
-        
-        For example:
-        - Q3 Compliance Certificate -> Q3 Management Accounts sheet -> Q3 LTM data (Sept 30)
-        - Q4 Compliance Certificate -> Q4 Management Accounts sheet -> Q4 LTM data (Dec 31)
+        should contain BOTH the kwartaal (quarterly) AND LTM data:
+        - Column B: Kwartaal (quarterly) values
+        - Column C: LTM values
         
         The approach:
-        1. Load the CURRENT quarter's Management Accounts file with data_only=True
-           (to get Excel's cached/calculated values directly)
-        2. Find the LTM column (which contains the current quarter's closing balances)
-        3. Copy the cached values to the Compliance Certificate's Management Accounts sheet
-        
-        Using cached values is more reliable than re-evaluating formulas, as the input
-        file has been opened and calculated in Excel.
+        1. Load the CURRENT quarter's Management Accounts file
+        2. Find both the quarterly column and the LTM column
+        3. Copy quarterly values to column B, LTM values to column C
         """
         try:
-            # First try to load with data_only=True to get CACHED Excel values
             source_wb_data = openpyxl.load_workbook(source_path, data_only=True)
-            
-            # Also load with data_only=False to get formulas (for fallback evaluation)
             source_wb_formulas = openpyxl.load_workbook(source_path, data_only=False)
             
             target_sheet = self.workbook[target_sheet_name]
             
-            # Find the Management Cijfers sheet in both workbooks
             cijfers_sheet_data = None
             cijfers_sheet_formulas = None
             bdo_sheet = None
@@ -225,8 +218,6 @@ class ComplianceBuilder:
                     logger.info(f"Using Management Cijfers sheet: {name}")
                     break
             
-            # Find the BDO sheet for formula evaluation fallback
-            # Look for the current quarter's BDO sheet (e.g., "BDO - Q3-25" for Q3 2025)
             expected_bdo_name = f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}"
             for name in source_wb_formulas.sheetnames:
                 if name == expected_bdo_name:
@@ -235,7 +226,6 @@ class ComplianceBuilder:
                     logger.info(f"Found BDO sheet for formula evaluation: {name}")
                     break
             
-            # Fallback: search for any BDO sheet with current quarter
             if bdo_sheet is None:
                 for name in source_wb_formulas.sheetnames:
                     if 'BDO -' in name and f"Q{self.config.quarter}-" in name:
@@ -250,25 +240,20 @@ class ComplianceBuilder:
                 source_wb_formulas.close()
                 return
             
-            # Use the data workbook's sheet for values (if available)
             cijfers_sheet = cijfers_sheet_data
             
-            # DYNAMICALLY find the LTM column in Management Cijfers
-            # Search row 22 from RIGHT TO LEFT to find the most recent LTM column
+            # Find LTM column (rightmost column with 'LTM' in row 22 header)
             ltm_column = None
             for col in range(cijfers_sheet.max_column, 0, -1):
                 cell_val = cijfers_sheet.cell(row=22, column=col).value
                 if cell_val:
                     cell_str = str(cell_val)
-                    # Accept any LTM header at the rightmost position
                     if 'LTM' in cell_str:
                         ltm_column = col
                         logger.info(f"Found LTM column at {get_column_letter(col)} ({col}) via row 22 header: '{cell_val}'")
                         break
             
-            # If not found in row 22, try Balance Sheet section
             if ltm_column is None:
-                # Find the rightmost column with data in row 3 (Deferred Tax Asset)
                 for col in range(cijfers_sheet.max_column, 0, -1):
                     cell_val = cijfers_sheet.cell(row=3, column=col).value
                     if cell_val is not None and isinstance(cell_val, (int, float)):
@@ -280,11 +265,23 @@ class ComplianceBuilder:
                 logger.warning("Could not find LTM column dynamically, falling back to column 27 (AA)")
                 ltm_column = 27
             
-            # Create mapping from target row to source row
-            # Target row in Compliance Certificate -> Source row in Management Cijfers
-            # The CC sheet has rows offset by -1 compared to Management Cijfers
-            # Balance Sheet section: rows 2-17 -> source rows 3-18
-            # P&L section: rows 22-67 -> source rows 23-68
+            # Find quarterly column (left of LTM, matching quarter header without 'LTM')
+            quarter_column = None
+            quarter_header = f"Q{self.config.quarter} {self.config.year}"
+            for col in range(ltm_column - 1, 0, -1):
+                cell_val = cijfers_sheet.cell(row=22, column=col).value
+                if cell_val:
+                    cell_str = str(cell_val)
+                    if quarter_header in cell_str and 'LTM' not in cell_str:
+                        quarter_column = col
+                        logger.info(f"Found quarterly column at {get_column_letter(col)} ({col}) via header: '{cell_val}'")
+                        break
+            
+            if quarter_column is None:
+                quarter_column = ltm_column - 1
+                logger.info(f"Quarterly column defaulted to {get_column_letter(quarter_column)} ({quarter_column})")
+            
+            # Row mapping: target row in CC -> source row in Management Cijfers
             target_to_source_mapping = {}
             
             # Balance Sheet section (target rows 2-17 -> source rows 3-18)
@@ -292,90 +289,118 @@ class ComplianceBuilder:
                 target_to_source_mapping[target_row] = target_row + 1
             
             # P&L section (target rows 22-67 -> source rows 23-68)
-            # Skip row 21 as it's the title which we set separately
             for target_row in range(22, 68):
                 target_to_source_mapping[target_row] = target_row + 1
             
             # Bank account overview section (target rows 72-78 -> source rows 107-113)
-            # Skip row 71 as it's the header which we set separately
             for target_row in range(72, 79):
                 target_to_source_mapping[target_row] = target_row + 35
             
-            # Update Row 1: Header with CURRENT quarter's end date
+            # Update headers
             period_end = self.config.period_end
             target_sheet.cell(row=1, column=3).value = period_end
             target_sheet.cell(row=1, column=3).number_format = 'YYYY-MM-DD'
             logger.info(f"Set header date to current quarter end: {period_end}")
             
-            # Update Row 21: P&L section title to show CURRENT quarter's LTM
-            # (since this sheet contains current quarter's data)
+            # Column B header: kwartaal title
+            target_sheet.cell(row=21, column=2).value = self.config.quarter_str
+            # Column C header: LTM title
             ltm_title = f"LTM {self.config.quarter_str}"
             target_sheet.cell(row=21, column=3).value = ltm_title
-            logger.info(f"Set P&L title (row 21) to: {ltm_title}")
+            logger.info(f"Set P&L headers: col B = '{self.config.quarter_str}', col C = '{ltm_title}'")
             
-            # Update Row 71: Bank account overview header with current quarter end date
-            # Format as "Per DD-M-YYYY" (e.g., "Per 30-9-2025")
             bank_header = f"Per {period_end.day}-{period_end.month}-{period_end.year}"
             target_sheet.cell(row=71, column=3).value = bank_header
             logger.info(f"Set bank account header (row 71) to: {bank_header}")
             
-            items_copied = 0
+            # --- Evaluate LTM values ---
+            evaluated_ltm = {}
             
-            # First pass: Evaluate and store all values from source
-            # We need to do this because some formulas reference other rows in the same column
-            evaluated_values = {}
-            
-            def evaluate_cell(source_row: int) -> float:
-                """Recursively evaluate a cell's value, handling internal references."""
-                if source_row in evaluated_values:
-                    return evaluated_values[source_row]
+            def evaluate_ltm_cell(source_row: int) -> float:
+                if source_row in evaluated_ltm:
+                    return evaluated_ltm[source_row]
                 
-                # Try cached value first (from data_only workbook)
                 value = cijfers_sheet_data.cell(row=source_row, column=ltm_column).value
                 if value is not None and isinstance(value, (int, float)):
-                    evaluated_values[source_row] = float(value)
+                    evaluated_ltm[source_row] = float(value)
                     return float(value)
                 
-                # Get the cell value from formulas workbook
                 formula = cijfers_sheet_formulas.cell(row=source_row, column=ltm_column).value
                 
-                # Handle None
                 if formula is None:
-                    evaluated_values[source_row] = None
+                    evaluated_ltm[source_row] = None
                     return None
                 
-                # Handle numeric values (e.g., 0 entered directly)
                 if isinstance(formula, (int, float)):
-                    evaluated_values[source_row] = float(formula)
+                    evaluated_ltm[source_row] = float(formula)
                     return float(formula)
                 
-                # Handle text values (like "LTM Q3 2025")
                 if isinstance(formula, str) and not formula.startswith('='):
-                    evaluated_values[source_row] = formula
+                    evaluated_ltm[source_row] = formula
                     return None
                 
-                # Evaluate the formula
                 result = self._evaluate_formula_with_internal_refs(
-                    formula, bdo_sheet, bdo_sheet_name, ltm_column, 
-                    cijfers_sheet_formulas, evaluate_cell
+                    formula, bdo_sheet, bdo_sheet_name, ltm_column,
+                    cijfers_sheet_formulas, evaluate_ltm_cell
                 )
-                evaluated_values[source_row] = result
+                evaluated_ltm[source_row] = result
                 return result
             
-            # Evaluate all source rows
-            for target_row, source_row in target_to_source_mapping.items():
-                evaluate_cell(source_row)
+            # --- Evaluate quarterly values ---
+            evaluated_quarter = {}
             
-            # Second pass: Copy evaluated values to target sheet
-            for target_row, source_row in target_to_source_mapping.items():
-                value = evaluated_values.get(source_row)
+            def evaluate_quarter_cell(source_row: int) -> float:
+                if source_row in evaluated_quarter:
+                    return evaluated_quarter[source_row]
                 
+                value = cijfers_sheet_data.cell(row=source_row, column=quarter_column).value
+                if value is not None and isinstance(value, (int, float)):
+                    evaluated_quarter[source_row] = float(value)
+                    return float(value)
+                
+                formula = cijfers_sheet_formulas.cell(row=source_row, column=quarter_column).value
+                
+                if formula is None:
+                    evaluated_quarter[source_row] = None
+                    return None
+                
+                if isinstance(formula, (int, float)):
+                    evaluated_quarter[source_row] = float(formula)
+                    return float(formula)
+                
+                if isinstance(formula, str) and not formula.startswith('='):
+                    evaluated_quarter[source_row] = formula
+                    return None
+                
+                result = self._evaluate_formula_with_internal_refs(
+                    formula, bdo_sheet, bdo_sheet_name, quarter_column,
+                    cijfers_sheet_formulas, evaluate_quarter_cell
+                )
+                evaluated_quarter[source_row] = result
+                return result
+            
+            # Evaluate all source rows for both columns
+            for target_row, source_row in target_to_source_mapping.items():
+                evaluate_ltm_cell(source_row)
+                evaluate_quarter_cell(source_row)
+            
+            # Copy LTM values to column C (existing behavior)
+            ltm_copied = 0
+            for target_row, source_row in target_to_source_mapping.items():
+                value = evaluated_ltm.get(source_row)
                 if value is not None:
                     target_sheet.cell(row=target_row, column=3).value = value
-                    items_copied += 1
-                    logger.debug(f"Copied value {value} to row {target_row} from source row {source_row}")
+                    ltm_copied += 1
             
-            logger.info(f"Copied {items_copied} values to {target_sheet_name}")
+            # Copy quarterly values to column B (new)
+            quarter_copied = 0
+            for target_row, source_row in target_to_source_mapping.items():
+                value = evaluated_quarter.get(source_row)
+                if value is not None:
+                    target_sheet.cell(row=target_row, column=2).value = value
+                    quarter_copied += 1
+            
+            logger.info(f"Copied to {target_sheet_name}: {quarter_copied} kwartaal values (col B), {ltm_copied} LTM values (col C)")
             source_wb_data.close()
             source_wb_formulas.close()
             
@@ -1024,6 +1049,24 @@ class ComplianceBuilder:
         
         if updated_count > 0:
             logger.info(f"Updated {updated_count} formulas in Suppl. Calc to reference {ma_sheet_name}")
+        
+        # Verify and fix column references: Suppl. Calc should reference column B
+        # in Q{n} Management Accounts (kwartaal values), not column C (LTM values)
+        fix_count = 0
+        for row in range(1, sheet.max_row + 1):
+            for col in range(1, sheet.max_column + 1):
+                cell = sheet.cell(row=row, column=col)
+                if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                    val = cell.value
+                    if f"'{ma_sheet_name}'!" in val:
+                        # Check if it references column C and fix to column B
+                        old_ref = f"'{ma_sheet_name}'!C"
+                        new_ref = f"'{ma_sheet_name}'!B"
+                        if old_ref in val:
+                            cell.value = val.replace(old_ref, new_ref)
+                            fix_count += 1
+        if fix_count > 0:
+            logger.info(f"Fixed {fix_count} Suppl. Calc formula(s) to reference column B in {ma_sheet_name}")
     
     def _update_sfa_cc_sheet(self):
         """
@@ -1105,30 +1148,45 @@ class ComplianceBuilder:
                             new_value = new_value.replace("!!", "!")
                             logger.debug(f"Updated MA reference: {old_pattern} → {new_ma_name}")
                     
-                    # Update Suppl. Calc NTM column references
-                    if old_ntm_col_letter and new_ntm_col_letter and "'Suppl. Calc'" in new_value:
-                        # Replace column letter references for NTM (e.g., S5 → T5)
-                        # Pattern with $ signs: 'Suppl. Calc'!$S$5 or 'Suppl. Calc'!$S5
-                        pattern = rf"'Suppl\. Calc'!\${old_ntm_col_letter}(\$?\d+)"
-                        replacement = f"'Suppl. Calc'!${new_ntm_col_letter}\\1"
-                        new_value = re.sub(pattern, replacement, new_value)
+                    # Update ALL Suppl. Calc column references at or beyond the
+                    # insertion point (old NTM position). When we insert a column
+                    # at the NTM position, all columns at or to the right shift +1.
+                    # This handles both the NTM shift and any columns beyond it
+                    # (e.g., growth rate columns), and works regardless of whether
+                    # old quarters were hidden or removed.
+                    if old_ntm_col_letter and "'Suppl. Calc'" in new_value:
+                        from openpyxl.utils import column_index_from_string
+                        old_ntm_idx = column_index_from_string(old_ntm_col_letter)
                         
-                        # Pattern without $ signs: 'Suppl. Calc'!S5
-                        pattern = rf"'Suppl\. Calc'!{old_ntm_col_letter}(\d+)"
-                        replacement = f"'Suppl. Calc'!{new_ntm_col_letter}\\1"
-                        new_value = re.sub(pattern, replacement, new_value)
+                        def _shift_suppl_calc_col(match):
+                            dollar1 = match.group(1)
+                            col_letter = match.group(2)
+                            dollar2 = match.group(3)
+                            row_num = match.group(4)
+                            col_idx = column_index_from_string(col_letter)
+                            if col_idx >= old_ntm_idx:
+                                shifted = get_column_letter(col_idx + 1)
+                                return f"'Suppl. Calc'!{dollar1}{shifted}{dollar2}{row_num}"
+                            return match.group(0)
                         
-                        logger.debug(f"Updated Suppl. Calc NTM reference: {old_ntm_col_letter} → {new_ntm_col_letter}")
+                        suppl_pattern = r"'Suppl\. Calc'!(\$?)([A-Z]+)(\$?)(\d+)"
+                        new_value = re.sub(suppl_pattern, _shift_suppl_calc_col, new_value)
                     
                     # Update Impact Unit Sales column references similarly
-                    if old_ntm_col_letter and new_ntm_col_letter and "'Impact Unit Sales'" in new_value:
-                        pattern = rf"'Impact Unit Sales'!\${old_ntm_col_letter}(\$?\d+)"
-                        replacement = f"'Impact Unit Sales'!${new_ntm_col_letter}\\1"
-                        new_value = re.sub(pattern, replacement, new_value)
+                    if old_ntm_col_letter and "'Impact Unit Sales'" in new_value:
+                        def _shift_ius_col(match):
+                            dollar1 = match.group(1)
+                            col_letter = match.group(2)
+                            dollar2 = match.group(3)
+                            row_num = match.group(4)
+                            col_idx = column_index_from_string(col_letter)
+                            if col_idx >= old_ntm_idx:
+                                shifted = get_column_letter(col_idx + 1)
+                                return f"'Impact Unit Sales'!{dollar1}{shifted}{dollar2}{row_num}"
+                            return match.group(0)
                         
-                        pattern = rf"'Impact Unit Sales'!{old_ntm_col_letter}(\d+)"
-                        replacement = f"'Impact Unit Sales'!{new_ntm_col_letter}\\1"
-                        new_value = re.sub(pattern, replacement, new_value)
+                        ius_pattern = r"'Impact Unit Sales'!(\$?)([A-Z]+)(\$?)(\d+)"
+                        new_value = re.sub(ius_pattern, _shift_ius_col, new_value)
                     
                     if new_value != original_value:
                         formula_count += 1
@@ -1150,6 +1208,11 @@ class ComplianceBuilder:
         g44_formula = f"='{ma_sheet_name}'!C49"
         sheet.cell(row=44, column=7).value = g44_formula
         logger.info(f"Set G44 to {g44_formula}")
+        
+        # Update G68 (links to bank loan / senior loan in MA sheet)
+        g68_formula = f"=-'{ma_sheet_name}'!C11"
+        sheet.cell(row=68, column=7).value = g68_formula
+        logger.info(f"Set G68 to {g68_formula}")
         
         # Update signature page dates (typically in rows 82+)
         self._update_signature_page_dates(sheet)
@@ -1915,6 +1978,48 @@ class ComplianceBuilder:
         if total_updated > 0:
             logger.info(f"Updated {total_updated} date/text references across all sheets")
     
+    def _clear_manual_input_cells(self):
+        """Clear cells that require manual input - they must remain empty.
+        
+        These cells are populated manually by the client after automation runs.
+        Setting them to None ensures no stale or incorrect values remain.
+        """
+        manual_cells = {
+            'SFA CC': [
+                (46, 7),   # G46
+                (73, 7),   # G73
+            ],
+            'Suppl. Calc': [
+                (41, 15),  # O41
+                (42, 15),  # O42
+            ],
+            'Impact Unit Sales': [
+                (3, 4),    # D3
+                (4, 4),    # D4
+                (5, 4),    # D5
+                (10, 4),   # D10
+                (10, 5),   # E10
+                (10, 6),   # F10
+                (10, 7),   # G10
+            ],
+        }
+        
+        for sheet_name, cells in manual_cells.items():
+            if sheet_name not in self.workbook.sheetnames:
+                logger.debug(f"Sheet '{sheet_name}' not found, skipping manual cell clearing")
+                continue
+            
+            sheet = self.workbook[sheet_name]
+            cleared = 0
+            for row, col in cells:
+                cell = sheet.cell(row=row, column=col)
+                if cell.value is not None:
+                    cell.value = None
+                    cleared += 1
+            
+            if cleared > 0:
+                logger.info(f"Cleared {cleared} manual input cell(s) in '{sheet_name}'")
+
     def _copy_column_formatting(self, sheet, source_col: int, target_col: int):
         """Copy column formatting from source to target."""
         source_letter = get_column_letter(source_col)

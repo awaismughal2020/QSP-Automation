@@ -98,6 +98,9 @@ class ManagementAccountsBuilder:
         
         # Account code to row mapping in the PREVIOUS BDO sheet (for row offset calculation)
         self._prev_bdo_row_map = {}
+        
+        # Sheets that must never be modified (existing BDO/kwartaal sheets)
+        self._protected_sheets: set = set()
     
     def _load_formula_templates(self) -> Dict[int, Dict[str, Any]]:
         """Load formula templates that define the account code mapping for each row."""
@@ -202,6 +205,15 @@ class ManagementAccountsBuilder:
         # Load previous quarter file
         self.workbook = openpyxl.load_workbook(self.previous_path)
         logger.info(f"Loaded previous file with {len(self.workbook.sheetnames)} sheets")
+        
+        # Mark all existing BDO/kwartaal sheets as protected - they must never be modified
+        self._protected_sheets = {
+            name for name in self.workbook.sheetnames
+            if name.startswith('BDO') or name != self.config.summary_sheet_name
+        }
+        # The summary sheet (Management Cijfers) is the only pre-existing sheet we modify
+        self._protected_sheets.discard(self.config.summary_sheet_name)
+        logger.info(f"Protected sheets (will not be modified): {sorted(self._protected_sheets)}")
         
         # Get previous BDO sheet name and build row map
         bdo_sheets = [name for name in self.workbook.sheetnames if name.startswith('BDO')]
@@ -873,30 +885,49 @@ class ManagementAccountsBuilder:
         ltm_header.fill = blue_fill
         ltm_header.alignment = copy(prev_header_cell.alignment) if prev_header_cell.has_style else None
         
-        # Copy number formatting for all P&L rows from previous column
+        # Copy ALL styling (font, fill, border, alignment, number_format) from
+        # previous quarter column for every data cell to match template exactly.
         client_number_format = '_(* #,##0_);_(* \\(#,##0\\);_(* "-"??_);_(@_)'
-        self._copy_number_formatting(summary_sheet, prev_quarter_col, new_quarter_col, 
-                                     start_row=22, end_row=summary_sheet.max_row)
-        self._copy_number_formatting(summary_sheet, new_quarter_col, new_ltm_col,
-                                     start_row=22, end_row=summary_sheet.max_row)
         
-        # Apply styling to new quarter column data cells: Calibri/11/non-bold
+        # New quarter column: copy full style from previous quarter, then set Calibri/11/non-bold
         calibri_font = Font(name='Calibri', size=11, bold=False)
         for row_idx in range(23, summary_sheet.max_row + 1):
+            prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_quarter_col)
+            if prev_cell.has_style:
+                cell.alignment = copy(prev_cell.alignment)
+                cell.border = copy(prev_cell.border)
+                cell.fill = copy(prev_cell.fill)
+                cell.number_format = prev_cell.number_format if prev_cell.number_format != 'General' else client_number_format
+            elif cell.number_format == 'General':
+                cell.number_format = client_number_format
             if cell.value is not None:
                 cell.font = calibri_font
-                if cell.number_format == 'General':
-                    cell.number_format = client_number_format
         
-        # Apply styling to LTM column data cells: Avenir Book/10/bold
+        # LTM column: copy full style from the new quarter column, then set Avenir Book/10/bold
         avenir_font = Font(name='Avenir Book', size=10, bold=True)
         for row_idx in range(23, summary_sheet.max_row + 1):
+            src_cell = summary_sheet.cell(row=row_idx, column=new_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
+            if src_cell.has_style:
+                cell.alignment = copy(src_cell.alignment)
+                cell.border = copy(src_cell.border)
+                cell.fill = copy(src_cell.fill)
+                cell.number_format = src_cell.number_format if src_cell.number_format != 'General' else client_number_format
+            elif cell.number_format == 'General':
+                cell.number_format = client_number_format
             if cell.value is not None:
                 cell.font = avenir_font
-                if cell.number_format == 'General':
-                    cell.number_format = client_number_format
+        
+        # Copy column width from previous quarter column
+        prev_col_letter = get_column_letter(prev_quarter_col)
+        new_q_letter = get_column_letter(new_quarter_col)
+        new_ltm_letter_dim = get_column_letter(new_ltm_col)
+        if prev_col_letter in summary_sheet.column_dimensions:
+            prev_width = summary_sheet.column_dimensions[prev_col_letter].width
+            if prev_width:
+                summary_sheet.column_dimensions[new_q_letter].width = prev_width
+                summary_sheet.column_dimensions[new_ltm_letter_dim].width = prev_width
         
         # Step 7: Update LTM column SUM formulas to include new quarter column
         self._update_ltm_sum_ranges(summary_sheet, new_ltm_col, new_quarter_col)
@@ -1678,29 +1709,34 @@ class ManagementAccountsBuilder:
             logger.info(f"Updated {updated_count} internal formulas in column {target_letter}")
     
     def _update_date_references(self):
-        """Update all date references throughout the workbook."""
+        """Update date references only in the Management Cijfers summary sheet.
+        
+        IMPORTANT: Only the summary sheet is modified. All other sheets
+        (especially BDO/kwartaal sheets) are protected and never touched.
+        """
         old_date_patterns = self._generate_date_patterns(self._get_previous_period_end())
         new_date_patterns = self._generate_date_patterns(self.config.period_end)
         
-        summary_sheets = [name for name in self.workbook.sheetnames 
-                         if 'Management Cijfers' in name or 'Cijfers' in name]
+        target_sheet_name = self.config.summary_sheet_name
+        if target_sheet_name not in self.workbook.sheetnames:
+            logger.warning(f"Summary sheet '{target_sheet_name}' not found for date reference update")
+            return
         
-        for sheet_name in summary_sheets:
-            sheet = self.workbook[sheet_name]
-            
-            for row_idx in range(1, sheet.max_row + 1):
-                for col_idx in range(1, min(sheet.max_column + 1, 10)):
-                    cell = sheet.cell(row=row_idx, column=col_idx)
-                    if cell.value and isinstance(cell.value, str):
-                        original = cell.value
-                        new_value = original
-                        
-                        for old_pattern, new_pattern in zip(old_date_patterns, new_date_patterns):
-                            if old_pattern in new_value:
-                                new_value = new_value.replace(old_pattern, new_pattern)
-                        
-                        if new_value != original:
-                            cell.value = new_value
+        sheet = self.workbook[target_sheet_name]
+        
+        for row_idx in range(1, sheet.max_row + 1):
+            for col_idx in range(1, min(sheet.max_column + 1, 10)):
+                cell = sheet.cell(row=row_idx, column=col_idx)
+                if cell.value and isinstance(cell.value, str):
+                    original = cell.value
+                    new_value = original
+                    
+                    for old_pattern, new_pattern in zip(old_date_patterns, new_date_patterns):
+                        if old_pattern in new_value:
+                            new_value = new_value.replace(old_pattern, new_pattern)
+                    
+                    if new_value != original:
+                        cell.value = new_value
     
     def _get_previous_period_end(self) -> datetime:
         """Get the previous quarter's period end date."""
@@ -2135,10 +2171,17 @@ class ManagementAccountsBuilder:
             )
         
         # --- Pass 1b: BDO ground truth check ---
-        bdo_resultaat = self._read_bdo_resultaat_na_belasting()
-        validation['bdo_resultaat'] = bdo_resultaat
+        # Profits are stored as NEGATIVE in BDO (Dutch trial balance convention).
+        # Management Cijfers uses positive-for-profit (formula templates negate via sign: "-").
+        # The ground truth comparison must account for this sign difference.
+        bdo_resultaat_raw = self._read_bdo_resultaat_na_belasting()
+        validation['bdo_resultaat_raw'] = bdo_resultaat_raw
         
-        if bdo_resultaat is not None:
+        if bdo_resultaat_raw is not None:
+            # Negate BDO value: BDO stores profit as negative, MC stores as positive
+            bdo_resultaat = -bdo_resultaat_raw
+            validation['bdo_resultaat'] = bdo_resultaat
+            
             diff_dr = abs(bdo_resultaat - direct_result)
             diff_eq = abs(bdo_resultaat - equity_movement)
             dr_ok = diff_dr <= tolerance
@@ -2150,29 +2193,42 @@ class ManagementAccountsBuilder:
             if not dr_ok or not eq_ok:
                 validation['is_aligned'] = False
                 validation['messages'].append(
-                    f"BDO ground truth: Resultaat na belasting = {bdo_resultaat:,.2f}"
+                    f"BDO ground truth: Resultaat na belasting (kwartaal D-G) = {bdo_resultaat_raw:,.2f} "
+                    f"(sign-adjusted: {bdo_resultaat:,.2f})"
                 )
                 if not dr_ok:
                     validation['messages'].append(
-                        f"  vs Direct Result (P&L row 68) = {direct_result:,.2f}, "
-                        f"difference: {diff_dr:,.2f}"
+                        f"  Expected (BDO sign-adjusted): {bdo_resultaat:,.2f}"
+                    )
+                    validation['messages'].append(
+                        f"  Current  (Direct Result P&L row 68): {direct_result:,.2f}"
+                    )
+                    validation['messages'].append(
+                        f"  Difference: {diff_dr:,.2f}"
                     )
                 if not eq_ok:
                     validation['messages'].append(
-                        f"  vs Total Equity Movement (BS row 19) = {equity_movement:,.2f}, "
-                        f"difference: {diff_eq:,.2f}"
+                        f"  Expected (BDO sign-adjusted): {bdo_resultaat:,.2f}"
+                    )
+                    validation['messages'].append(
+                        f"  Current  (Equity Movement BS row 19): {equity_movement:,.2f}"
+                    )
+                    validation['messages'].append(
+                        f"  Difference: {diff_eq:,.2f}"
                     )
                 logger.warning(
-                    f"VALIDATION WARNING: BDO Resultaat na belasting ({bdo_resultaat:,.2f}) "
+                    f"VALIDATION WARNING: BDO Resultaat na belasting "
+                    f"(raw={bdo_resultaat_raw:,.2f}, adjusted={bdo_resultaat:,.2f}) "
                     f"differs from Direct Result ({direct_result:,.2f}, Δ={diff_dr:,.2f}) "
                     f"and/or Equity Movement ({equity_movement:,.2f}, Δ={diff_eq:,.2f})"
                 )
             else:
                 logger.info(
-                    f"BDO ground truth check passed: Resultaat={bdo_resultaat:,.2f} "
-                    f"≈ DR={direct_result:,.2f} ≈ EM={equity_movement:,.2f}"
+                    f"BDO ground truth check passed: Resultaat(raw={bdo_resultaat_raw:,.2f}, "
+                    f"adjusted={bdo_resultaat:,.2f}) ≈ DR={direct_result:,.2f} ≈ EM={equity_movement:,.2f}"
                 )
         else:
+            validation['bdo_resultaat'] = None
             validation['messages'].append(
                 "BDO ground truth: Could not locate 'Resultaat na belasting' row in BDO sheet"
             )

@@ -906,8 +906,10 @@ class FinalPDFOrchestrator:
             
             # ============================================================
             # STEP 1: Update Q{n} Management Accounts sheet
+            # Copy both kwartaal (col B) and LTM (col C) values
             # ============================================================
             q_ma_updated = 0
+            q_ma_quarter_updated = 0
             if q_ma_sheet_name in cc_wb.sheetnames:
                 target_sheet = cc_wb[q_ma_sheet_name]
                 
@@ -919,13 +921,24 @@ class FinalPDFOrchestrator:
                 for t in range(72, 79):     # Bank account rows
                     target_to_source[t] = t + 35
                 
+                # Copy LTM values to column C
                 for target_row, source_row in target_to_source.items():
                     value = cijfers_sheet.cell(row=source_row, column=ltm_column).value
                     if value is not None:
                         target_sheet.cell(row=target_row, column=3).value = value
                         q_ma_updated += 1
                 
-                logger.info(f"[Phase 3] Updated {q_ma_updated} values in '{q_ma_sheet_name}'")
+                # Copy quarterly values to column B
+                for target_row, source_row in target_to_source.items():
+                    value = cijfers_sheet.cell(row=source_row, column=quarter_column).value
+                    if value is not None:
+                        target_sheet.cell(row=target_row, column=2).value = value
+                        q_ma_quarter_updated += 1
+                
+                logger.info(
+                    f"[Phase 3] Updated '{q_ma_sheet_name}': "
+                    f"{q_ma_quarter_updated} kwartaal (col B), {q_ma_updated} LTM (col C)"
+                )
             else:
                 logger.warning(f"[Phase 3] Sheet '{q_ma_sheet_name}' not found in CC")
             
