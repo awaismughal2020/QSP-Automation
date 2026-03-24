@@ -820,11 +820,19 @@ class ManagementAccountsBuilder:
             elif cell.number_format == 'General':
                 cell.number_format = client_number_format
         
-        # LTM column: the shifted cells already have old-LTM styling (fill, font,
-        # borders).  Only ensure number_format is not General.
+        # LTM column: explicitly copy full styling from the previous quarter
+        # column to ensure fill (blue bar rows), font (green color for LTM
+        # values), border, and alignment are consistent across all rows.
         for row_idx in range(23, summary_sheet.max_row + 1):
+            prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
-            if cell.number_format == 'General':
+            if prev_cell.has_style:
+                cell.font = copy(prev_cell.font)
+                cell.alignment = copy(prev_cell.alignment)
+                cell.border = copy(prev_cell.border)
+                cell.fill = copy(prev_cell.fill)
+                cell.number_format = prev_cell.number_format if prev_cell.number_format != 'General' else client_number_format
+            elif cell.number_format == 'General':
                 cell.number_format = client_number_format
         
         # Copy column width from previous quarter column
@@ -1374,6 +1382,7 @@ class ManagementAccountsBuilder:
                 target_cell.alignment = copy(source_cell.alignment)
                 target_cell.number_format = source_cell.number_format
                 target_cell.border = copy(source_cell.border)
+                target_cell.fill = copy(source_cell.fill)
         
         logger.info(f"Copied {section_name} section (rows {start_row}-{end_row}): {copied_count} formulas from {source_letter} to {target_letter}")
     
@@ -1423,6 +1432,7 @@ class ManagementAccountsBuilder:
                 target_cell.alignment = copy(source_cell.alignment)
                 target_cell.number_format = source_cell.number_format
                 target_cell.border = copy(source_cell.border)
+                target_cell.fill = copy(source_cell.fill)
         
         logger.info(f"Copied column {source_letter} to {target_letter} (with column reference updates)")
     

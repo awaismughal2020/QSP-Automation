@@ -1469,7 +1469,16 @@ class ComplianceBuilder:
                         found_value = get_cell_value(source_rows, use_column)
                     
                     if found_value is not None:
-                        suppl_sheet.cell(row=suppl_row, column=target_column).value = found_value
+                        target_cell = suppl_sheet.cell(row=suppl_row, column=target_column)
+                        target_cell.value = found_value
+                        prev_fmt_cell = suppl_sheet.cell(row=suppl_row, column=target_column - 1)
+                        if prev_fmt_cell.number_format and prev_fmt_cell.number_format != 'General':
+                            target_cell.number_format = prev_fmt_cell.number_format
+                        if prev_fmt_cell.has_style:
+                            target_cell.font = copy(prev_fmt_cell.font)
+                            target_cell.border = copy(prev_fmt_cell.border)
+                            target_cell.fill = copy(prev_fmt_cell.fill)
+                            target_cell.alignment = copy(prev_fmt_cell.alignment)
                         values_copied += 1
                         logger.debug(f"Copied {found_value:,.2f} to Suppl. Calc row {suppl_row} ({suppl_keyword_str})")
             
@@ -1529,7 +1538,16 @@ class ComplianceBuilder:
         }
         
         for row, formula in formula_rows.items():
-            suppl_sheet.cell(row=row, column=target_column).value = formula
+            cell = suppl_sheet.cell(row=row, column=target_column)
+            cell.value = formula
+            prev_cell = suppl_sheet.cell(row=row, column=target_column - 1)
+            if prev_cell.has_style:
+                cell.font = copy(prev_cell.font)
+                cell.alignment = copy(prev_cell.alignment)
+                cell.border = copy(prev_cell.border)
+                cell.fill = copy(prev_cell.fill)
+                if prev_cell.number_format and prev_cell.number_format != 'General':
+                    cell.number_format = prev_cell.number_format
         
         logger.info(f"Set {len(formula_rows)} formula rows in column {col_letter}")
         
@@ -1538,7 +1556,6 @@ class ComplianceBuilder:
         for col in range(target_column + 1, 20):  # Up to S(19)
             c_letter = get_column_letter(col)
             for row, _ in formula_rows.items():
-                # Generate the formula for this column
                 if row == 8:
                     formula = f"={c_letter}6+{c_letter}5+{c_letter}7"
                 elif row == 13:
@@ -1556,7 +1573,16 @@ class ComplianceBuilder:
                 elif row == 43:
                     formula = f"=SUM({c_letter}41:{c_letter}42)"
                 
-                suppl_sheet.cell(row=row, column=col).value = formula
+                cell = suppl_sheet.cell(row=row, column=col)
+                cell.value = formula
+                prev_cell = suppl_sheet.cell(row=row, column=col - 1)
+                if prev_cell.has_style:
+                    cell.font = copy(prev_cell.font)
+                    cell.alignment = copy(prev_cell.alignment)
+                    cell.border = copy(prev_cell.border)
+                    cell.fill = copy(prev_cell.fill)
+                    if prev_cell.number_format and prev_cell.number_format != 'General':
+                        cell.number_format = prev_cell.number_format
     
     def _update_suppl_calc_quarter_formulas(self, suppl_sheet, target_column: int):
         """
@@ -1605,17 +1631,25 @@ class ComplianceBuilder:
                 logger.info(f"Populating empty forecast col {n_letter} from {p_letter}")
 
                 for row in range(4, suppl_sheet.max_row + 1):
-                    src = suppl_sheet.cell(row=row, column=prev_fc).value
-                    tgt = suppl_sheet.cell(row=row, column=new_fc).value
-                    if src is not None and tgt is None:
+                    src_cell = suppl_sheet.cell(row=row, column=prev_fc)
+                    tgt_cell = suppl_sheet.cell(row=row, column=new_fc)
+                    src = src_cell.value
+                    if src is not None and tgt_cell.value is None:
                         if isinstance(src, str) and src.startswith('='):
                             shifted = re.sub(rf'\b{re.escape(p_letter)}(\d+)',
                                              rf'{n_letter}\1', src)
                             shifted = re.sub(rf'\b{re.escape(p2_letter)}(\d+)',
                                              rf'{p_letter}\1', shifted)
-                            suppl_sheet.cell(row=row, column=new_fc).value = shifted
+                            tgt_cell.value = shifted
                         else:
-                            suppl_sheet.cell(row=row, column=new_fc).value = src
+                            tgt_cell.value = src
+                        if src_cell.has_style:
+                            tgt_cell.font = copy(src_cell.font)
+                            tgt_cell.alignment = copy(src_cell.alignment)
+                            tgt_cell.border = copy(src_cell.border)
+                            tgt_cell.fill = copy(src_cell.fill)
+                            if src_cell.number_format and src_cell.number_format != 'General':
+                                tgt_cell.number_format = src_cell.number_format
 
                 prev_hdr = suppl_sheet.cell(row=2, column=prev_fc).value
                 if prev_hdr and 'Q' in str(prev_hdr):
@@ -1642,27 +1676,54 @@ class ComplianceBuilder:
 
         for col in range(target_column + 1, ntm_col):
             cl = get_column_letter(col)
-            suppl_sheet.cell(row=6, column=col).value = f"={cl}5*${rate_letter}$6"
+            cell = suppl_sheet.cell(row=6, column=col)
+            cell.value = f"={cl}5*${rate_letter}$6"
+            prev_cell = suppl_sheet.cell(row=6, column=col - 1)
+            if prev_cell.has_style:
+                cell.font = copy(prev_cell.font)
+                cell.alignment = copy(prev_cell.alignment)
+                cell.border = copy(prev_cell.border)
+                cell.fill = copy(prev_cell.fill)
+                if prev_cell.number_format and prev_cell.number_format != 'General':
+                    cell.number_format = prev_cell.number_format
 
         # === 3. Rows 31-35 formulas for actual + forecast columns ===
-        suppl_sheet.cell(row=31, column=target_column).value = f"={target_col_letter}29"
-        suppl_sheet.cell(row=32, column=target_column).value = (
-            f"=-({prev_col_letter}41*(1.75%)+({prev_col_letter}41*4%*30%))/4")
-        suppl_sheet.cell(row=33, column=target_column).value = (
-            f"=-({prev_col_letter}41*70%*2.6%)/4")
-        suppl_sheet.cell(row=35, column=target_column).value = (
-            f"={target_col_letter}33+{target_col_letter}32+{target_col_letter}31")
+        for r, formula in [
+            (31, f"={target_col_letter}29"),
+            (32, f"=-({prev_col_letter}41*(1.75%)+({prev_col_letter}41*4%*30%))/4"),
+            (33, f"=-({prev_col_letter}41*70%*2.6%)/4"),
+            (35, f"={target_col_letter}33+{target_col_letter}32+{target_col_letter}31"),
+        ]:
+            cell = suppl_sheet.cell(row=r, column=target_column)
+            cell.value = formula
+            prev_cell = suppl_sheet.cell(row=r, column=target_column - 1)
+            if prev_cell.has_style:
+                cell.font = copy(prev_cell.font)
+                cell.alignment = copy(prev_cell.alignment)
+                cell.border = copy(prev_cell.border)
+                cell.fill = copy(prev_cell.fill)
+                if prev_cell.number_format and prev_cell.number_format != 'General':
+                    cell.number_format = prev_cell.number_format
 
         for col in range(target_column + 1, ntm_col):
             cl = get_column_letter(col)
             pl = get_column_letter(col - 1)
-            suppl_sheet.cell(row=31, column=col).value = f"={cl}29"
-            suppl_sheet.cell(row=32, column=col).value = (
-                f"=-({pl}41*(1.75%)+({pl}41*4%*30%))/4")
-            suppl_sheet.cell(row=33, column=col).value = (
-                f"=-({pl}41*70%*2.6%)/4")
-            suppl_sheet.cell(row=35, column=col).value = (
-                f"={cl}33+{cl}32+{cl}31")
+            for r, formula in [
+                (31, f"={cl}29"),
+                (32, f"=-({pl}41*(1.75%)+({pl}41*4%*30%))/4"),
+                (33, f"=-({pl}41*70%*2.6%)/4"),
+                (35, f"={cl}33+{cl}32+{cl}31"),
+            ]:
+                cell = suppl_sheet.cell(row=r, column=col)
+                cell.value = formula
+                prev_cell = suppl_sheet.cell(row=r, column=col - 1)
+                if prev_cell.has_style:
+                    cell.font = copy(prev_cell.font)
+                    cell.alignment = copy(prev_cell.alignment)
+                    cell.border = copy(prev_cell.border)
+                    cell.fill = copy(prev_cell.fill)
+                    if prev_cell.number_format and prev_cell.number_format != 'General':
+                        cell.number_format = prev_cell.number_format
 
         # === 4. NTM SUM formulas: 4 forecast columns (excl. actual) ===
         ntm_sum_start = get_column_letter(target_column + 1)
@@ -1688,6 +1749,14 @@ class ComplianceBuilder:
                 if has_data:
                     cell.value = f"=SUM({ntm_sum_start}{row}:{ntm_sum_end}{row})"
                     logger.debug(f"Set new NTM formula at {ntm_letter}{row}")
+            prev_ntm_cell = suppl_sheet.cell(row=row, column=ntm_col - 1)
+            if prev_ntm_cell.has_style:
+                if prev_ntm_cell.number_format and prev_ntm_cell.number_format != 'General':
+                    cell.number_format = prev_ntm_cell.number_format
+                cell.font = copy(prev_ntm_cell.font)
+                cell.alignment = copy(prev_ntm_cell.alignment)
+                cell.border = copy(prev_ntm_cell.border)
+                cell.fill = copy(prev_ntm_cell.fill)
 
         logger.info("Completed Suppl. Calc formula updates (dynamic NTM)")
     

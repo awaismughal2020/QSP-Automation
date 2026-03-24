@@ -903,10 +903,12 @@ class FinalPDFOrchestrator:
             
             # --- Open CC for editing (data_only=False to preserve formulas) ---
             cc_wb = openpyxl.load_workbook(updated_cc_path)
+            from copy import copy as copy_style
             
             # ============================================================
             # STEP 1: Update Q{n} Management Accounts sheet
             # Copy both kwartaal (col B) and LTM (col C) values
+            # Preserve existing cell formatting (font color, number_format, etc.)
             # ============================================================
             q_ma_updated = 0
             q_ma_quarter_updated = 0
@@ -921,18 +923,20 @@ class FinalPDFOrchestrator:
                 for t in range(72, 79):     # Bank account rows
                     target_to_source[t] = t + 35
                 
-                # Copy LTM values to column C
+                # Copy LTM values to column C, preserving existing cell styles
                 for target_row, source_row in target_to_source.items():
                     value = cijfers_sheet.cell(row=source_row, column=ltm_column).value
                     if value is not None:
-                        target_sheet.cell(row=target_row, column=3).value = value
+                        cell = target_sheet.cell(row=target_row, column=3)
+                        cell.value = value
                         q_ma_updated += 1
                 
-                # Copy quarterly values to column B
+                # Copy quarterly values to column B, preserving existing cell styles
                 for target_row, source_row in target_to_source.items():
                     value = cijfers_sheet.cell(row=source_row, column=quarter_column).value
                     if value is not None:
-                        target_sheet.cell(row=target_row, column=2).value = value
+                        cell = target_sheet.cell(row=target_row, column=2)
+                        cell.value = value
                         q_ma_quarter_updated += 1
                 
                 logger.info(
@@ -999,7 +1003,16 @@ class FinalPDFOrchestrator:
                                 any_found = True
                         
                         if any_found:
-                            suppl_sheet.cell(row=row_idx, column=suppl_target_col).value = total
+                            cell = suppl_sheet.cell(row=row_idx, column=suppl_target_col)
+                            cell.value = total
+                            prev_cell = suppl_sheet.cell(row=row_idx, column=suppl_target_col - 1)
+                            if prev_cell.has_style:
+                                cell.font = copy_style(prev_cell.font)
+                                cell.alignment = copy_style(prev_cell.alignment)
+                                cell.border = copy_style(prev_cell.border)
+                                cell.fill = copy_style(prev_cell.fill)
+                                if prev_cell.number_format and prev_cell.number_format != 'General':
+                                    cell.number_format = prev_cell.number_format
                             suppl_updated += 1
                 
                 logger.info(f"[Phase 3] Updated {suppl_updated} values in Suppl. Calc col {get_column_letter(suppl_target_col)}")
