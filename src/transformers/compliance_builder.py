@@ -853,66 +853,114 @@ class ComplianceBuilder:
         
         return items_copied
     
+    @staticmethod
+    def _parse_quarter_label(label: str):
+        """Parse a quarter label like '26Q3' into (year_short, quarter_num)."""
+        label = str(label).strip()
+        if 'Q' not in label:
+            return None
+        parts = label.split('Q')
+        try:
+            return int(parts[0]), int(parts[1])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _next_quarter_label(yr: int, q: int) -> str:
+        """Advance one quarter and return label like '26Q4'."""
+        q += 1
+        if q > 4:
+            q, yr = 1, yr + 1
+        return f"{yr}Q{q}"
+
     def _update_suppl_calc_sheet(self):
         """
-        Update Suppl. Calc sheet by adding NEXT forecast quarter.
-        
-        The Q2 file already has 25Q3 forecasts. When building Q3:
-        - We need to add 26Q3 (the next forecast quarter)
-        - This shifts NTM column from S to T
-        - This allows SFA CC formulas to reference the new NTM column
+        Update Suppl. Calc sheet by inserting all missing forecast quarters
+        up to and including next_forecast_quarter (current_quarter + 4).
+
+        For Q3 2025 the target label is 26Q3 (one insert needed).
+        For Q4 2025 the target label is 26Q4 — if 26Q3 is also missing it
+        is inserted first so NTM covers four consecutive forecast quarters.
         """
         if 'Suppl. Calc' not in self.workbook.sheetnames:
             logger.warning("Suppl. Calc sheet not found")
             return
-        
+
         sheet = self.workbook['Suppl. Calc']
-        
-        # Find the NTM (Next Twelve Months) column - this is where we insert
+
         ntm_col = None
         for col in range(1, sheet.max_column + 5):
             cell = sheet.cell(row=2, column=col)
-            if cell.value and str(cell.value).upper() == 'NTM':
+            if cell.value and str(cell.value).strip().upper() == 'NTM':
                 ntm_col = col
                 break
-        
+
         if ntm_col is None:
             logger.warning("NTM column not found in Suppl. Calc")
             return
-        
-        # Calculate the next forecast quarter (current quarter + 4)
-        # E.g., for Q3 2025, the next forecast to add is Q3 2026 (26Q3)
-        next_forecast_quarter = f"{str(self.config.year + 1)[-2:]}Q{self.config.quarter}"
-        
-        # Check if the next forecast quarter already exists
+
+        logger.info(f"Found NTM column at {get_column_letter(ntm_col)} ({ntm_col})")
+
+        target_label = f"{str(self.config.year + 1)[-2:]}Q{self.config.quarter}"
+
+        # Find the last existing forecast column (the one just before NTM)
+        last_fc_hdr = sheet.cell(row=2, column=ntm_col - 1).value
+        last_parsed = self._parse_quarter_label(last_fc_hdr) if last_fc_hdr else None
+        target_parsed = self._parse_quarter_label(target_label)
+
+        if target_parsed is None:
+            logger.warning(f"Cannot parse target quarter label: {target_label}")
+            return
+
+        # Build the list of quarters to insert (everything after last existing
+        # forecast up to and including the target).
+        to_insert: list[str] = []
+        if last_parsed is not None:
+            yr, q = last_parsed
+            while True:
+                nxt = self._next_quarter_label(yr, q)
+                to_insert.append(nxt)
+                if nxt == target_label:
+                    break
+                p = self._parse_quarter_label(nxt)
+                if p is None:
+                    break
+                yr, q = p
+                if len(to_insert) > 8:
+                    break
+        else:
+            to_insert = [target_label]
+
+        # Remove any labels that already exist
+        existing = set()
         for col in range(1, sheet.max_column + 1):
-            if sheet.cell(row=2, column=col).value == next_forecast_quarter:
-                logger.info(f"Column {next_forecast_quarter} already exists")
-                return
-        
-        # Insert a new column at the NTM position (shifts NTM to the right)
-        logger.info(f"Inserting column for {next_forecast_quarter} at position {ntm_col} (NTM column)")
-        sheet.insert_cols(ntm_col)
-        
-        # Add the new forecast quarter header
-        header_cell = sheet.cell(row=2, column=ntm_col)
-        header_cell.value = next_forecast_quarter
-        header_cell.font = Font(bold=True)
-        header_cell.alignment = Alignment(horizontal='center')
-        
-        # Add "Forecast" label
-        type_cell = sheet.cell(row=3, column=ntm_col)
-        type_cell.value = "Forecast"
-        type_cell.alignment = Alignment(horizontal='center')
-        
-        # Copy formatting from previous column
-        self._copy_column_formatting(sheet, ntm_col - 1, ntm_col)
-        
-        # Store the new NTM column position (shifted by 1)
-        self._new_ntm_col = ntm_col + 1
-        self._old_ntm_col = ntm_col  # This was the old NTM position
-        
-        logger.info(f"Added {next_forecast_quarter} column, NTM shifted to column {self._new_ntm_col}")
+            hdr = sheet.cell(row=2, column=col).value
+            if hdr:
+                existing.add(str(hdr).strip())
+        to_insert = [lbl for lbl in to_insert if lbl not in existing]
+
+        if not to_insert:
+            logger.info(f"All forecast quarters up to {target_label} already exist")
+            return
+
+        # Insert each missing quarter at the current NTM position
+        inserted = 0
+        for label in to_insert:
+            logger.info(f"Inserting column for {label} at position {ntm_col + inserted} (NTM column)")
+            ins_pos = ntm_col + inserted
+            sheet.insert_cols(ins_pos)
+            sheet.cell(row=2, column=ins_pos).value = label
+            sheet.cell(row=2, column=ins_pos).font = Font(bold=True)
+            sheet.cell(row=2, column=ins_pos).alignment = Alignment(horizontal='center')
+            sheet.cell(row=3, column=ins_pos).value = "Forecast"
+            sheet.cell(row=3, column=ins_pos).alignment = Alignment(horizontal='center')
+            self._copy_column_formatting(sheet, ins_pos - 1, ins_pos)
+            inserted += 1
+
+        self._new_ntm_col = ntm_col + inserted
+        self._old_ntm_col = ntm_col
+        logger.info(f"Inserted {inserted} forecast column(s) ({', '.join(to_insert)}), "
+                    f"NTM shifted to column {get_column_letter(self._new_ntm_col)} ({self._new_ntm_col})")
     
     def _update_impact_unit_sales_sheet(self):
         """
@@ -1513,180 +1561,135 @@ class ComplianceBuilder:
     def _update_suppl_calc_quarter_formulas(self, suppl_sheet, target_column: int):
         """
         Update Suppl. Calc sheet formulas for quarter progression.
-        
-        This handles:
-        1. Updating Column T formulas to reference the new actual column (O→P, P→Q, etc.)
-        2. Shifting empty S column to have R column data
-        3. Updating Row 6 formula pattern
-        4. Setting proper formulas for rows 31-35 (not values)
-        
-        Args:
-            suppl_sheet: The Suppl. Calc worksheet
-            target_column: Current quarter's column index (O=15 for Q3)
+
+        All column positions (NTM, forecast range, rate) are resolved dynamically
+        from row-2 headers rather than hardcoded column indices.
         """
         from openpyxl.utils import get_column_letter
-        
+
         target_col_letter = get_column_letter(target_column)
         prev_col_letter = get_column_letter(target_column - 1) if target_column > 1 else 'N'
-        
-        # === 1. Update Column T (and subsequent NTM columns) formulas ===
-        # Column T is typically column 20, but for NTM calculations, update SUM ranges
-        # The NTM column sums from O:R (or the 4 quarterly columns)
-        # After Q3 actual data, formulas should reference P onwards for forecasts
-        
-        # Find the NTM/Total column (usually T=20)
-        ntm_column = 20  # Column T
-        
-        # Update NTM column formulas to reflect the new range
-        # After adding actual to O, the SUM should shift: SUM(O6:R6) stays the same
-        # but individual cell references like O5*$V$6 in forecast columns should shift
-        logger.info("Updating Suppl. Calc formulas for quarter progression")
-        
-        # === 2. Copy R column data to S column ===
-        # S is column 19, R is column 18
-        # Even if S has some data (headers, row 7), it may be missing most values
-        s_column = 19
-        r_column = 18
-        
-        # Check how many data rows in S are empty vs R
-        # If S is mostly empty compared to R, copy R to S
-        r_data_count = 0
-        s_data_count = 0
-        for check_row in range(5, 46):  # Data rows
-            if suppl_sheet.cell(row=check_row, column=r_column).value is not None:
-                r_data_count += 1
-            if suppl_sheet.cell(row=check_row, column=s_column).value is not None:
-                s_data_count += 1
-        
-        s_needs_copy = s_data_count < r_data_count * 0.5  # S has less than half the data of R
-        
-        if s_needs_copy:
-            logger.info(f"Column S has {s_data_count} cells vs R's {r_data_count} - copying R to S")
-            # Copy R to S for all data rows, adjusting formulas
-            for row in range(4, suppl_sheet.max_row + 1):
-                r_val = suppl_sheet.cell(row=row, column=r_column).value
-                s_val = suppl_sheet.cell(row=row, column=s_column).value
-                
-                # Only copy if R has data and S is empty
-                if r_val is not None and s_val is None:
-                    # If it's a formula, adjust references from R to S
-                    if isinstance(r_val, str) and r_val.startswith('='):
-                        # Smart formula adjustment: R references become S references
-                        # Also need to update Q references to R for relative formulas
-                        new_formula = r_val
-                        # Replace cell references: Q→R, R→S in formulas
-                        import re
-                        # Replace R column references with S
-                        new_formula = re.sub(r'\bR(\d+)', r'S\1', new_formula)
-                        # Replace Q column references with R (for formulas like =Q41-350000)
-                        new_formula = re.sub(r'\bQ(\d+)', r'R\1', new_formula)
-                        suppl_sheet.cell(row=row, column=s_column).value = new_formula
-                    else:
-                        suppl_sheet.cell(row=row, column=s_column).value = r_val
-            
-            # Update S column header (row 2) - should be next quarter after R
-            r_header = suppl_sheet.cell(row=2, column=r_column).value
-            if r_header:
-                # Parse header like "26Q2" and increment to "26Q3"
-                if 'Q' in str(r_header):
-                    year_part = str(r_header).split('Q')[0]
-                    q_part = int(str(r_header).split('Q')[1])
-                    new_q = q_part + 1
-                    new_year = year_part
-                    if new_q > 4:
-                        new_q = 1
-                        new_year = str(int(year_part) + 1)
-                    suppl_sheet.cell(row=2, column=s_column).value = f"{new_year}Q{new_q}"
-            
-            # Update S3 header
-            suppl_sheet.cell(row=3, column=s_column).value = "Forecast"
-        else:
-            s_needs_copy = False
-        
-        # === 3. Update Row 6 formula pattern ===
-        # Row 6 formula in forecast columns: =P5*$W$6, =Q5*$W$6, etc.
-        # The reference column (W) contains the -3.5% growth rate
-        # Find the column with the growth rate value (should be one after NTM column + 2)
-        # NTM is at T(20), so the rate is at W(23) for Q3, moves to X(24) for Q4, etc.
-        
-        # Find where row 6 has the -3.5% value (or similar rate)
+
+        # --- Resolve NTM column dynamically ---
+        ntm_col = None
+        for col in range(1, suppl_sheet.max_column + 5):
+            hdr = suppl_sheet.cell(row=2, column=col).value
+            if hdr and str(hdr).strip().upper() == 'NTM':
+                ntm_col = col
+                break
+
+        if ntm_col is None:
+            logger.warning("NTM column not found in Suppl. Calc – skipping formula updates")
+            return
+
+        ntm_letter = get_column_letter(ntm_col)
+        last_fc_col = ntm_col - 1
+        last_fc_letter = get_column_letter(last_fc_col)
+        logger.info(f"Dynamic NTM at {ntm_letter} ({ntm_col}), "
+                    f"forecast range {get_column_letter(target_column + 1)}-{last_fc_letter}")
+
+        # === 1. Populate newly-inserted forecast column if mostly empty ===
+        new_fc = last_fc_col
+        prev_fc = last_fc_col - 1
+
+        if prev_fc > target_column:
+            new_cnt = sum(1 for r in range(5, 46)
+                         if suppl_sheet.cell(row=r, column=new_fc).value is not None)
+            prev_cnt = sum(1 for r in range(5, 46)
+                          if suppl_sheet.cell(row=r, column=prev_fc).value is not None)
+
+            if new_cnt < prev_cnt * 0.5:
+                p_letter = get_column_letter(prev_fc)
+                n_letter = get_column_letter(new_fc)
+                p2_letter = get_column_letter(prev_fc - 1) if prev_fc > 1 else p_letter
+                logger.info(f"Populating empty forecast col {n_letter} from {p_letter}")
+
+                for row in range(4, suppl_sheet.max_row + 1):
+                    src = suppl_sheet.cell(row=row, column=prev_fc).value
+                    tgt = suppl_sheet.cell(row=row, column=new_fc).value
+                    if src is not None and tgt is None:
+                        if isinstance(src, str) and src.startswith('='):
+                            shifted = re.sub(rf'\b{re.escape(p_letter)}(\d+)',
+                                             rf'{n_letter}\1', src)
+                            shifted = re.sub(rf'\b{re.escape(p2_letter)}(\d+)',
+                                             rf'{p_letter}\1', shifted)
+                            suppl_sheet.cell(row=row, column=new_fc).value = shifted
+                        else:
+                            suppl_sheet.cell(row=row, column=new_fc).value = src
+
+                prev_hdr = suppl_sheet.cell(row=2, column=prev_fc).value
+                if prev_hdr and 'Q' in str(prev_hdr):
+                    parts = str(prev_hdr).split('Q')
+                    yr, q = parts[0], int(parts[1])
+                    q += 1
+                    if q > 4:
+                        q, yr = 1, str(int(yr) + 1)
+                    suppl_sheet.cell(row=2, column=new_fc).value = f"{yr}Q{q}"
+                suppl_sheet.cell(row=3, column=new_fc).value = "Forecast"
+
+        # === 2. Row 6 formula pattern: =col5*$RATE$6 ===
         rate_col = None
-        for col in range(ntm_column + 1, ntm_column + 10):
+        for col in range(ntm_col + 1, ntm_col + 10):
             val = suppl_sheet.cell(row=6, column=col).value
             if val is not None and isinstance(val, (int, float)) and val != 0:
                 rate_col = col
                 break
-        
         if rate_col is None:
-            # Default to W (23) if not found
-            rate_col = 23
-        
-        rate_col_letter = get_column_letter(rate_col)
-        logger.info(f"Row 6 rate column: {rate_col_letter} (value: {suppl_sheet.cell(row=6, column=rate_col).value})")
-        
-        # Update formulas for columns P through S to use the correct rate column
-        for col in range(16, 20):  # P(16) to S(19)
-            col_letter = get_column_letter(col)
-            expected_formula = f"={col_letter}5*${rate_col_letter}$6"
-            suppl_sheet.cell(row=6, column=col).value = expected_formula
-            logger.debug(f"Updated {col_letter}6 formula to {expected_formula}")
-        
-        # Make sure S6 has the formula if S was copied
-        if s_needs_copy:
-            suppl_sheet.cell(row=6, column=s_column).value = f"=S5*${rate_col_letter}$6"
-        
-        # === 4. Set proper formulas for rows 31-35 ===
-        # These should have formulas, not values
-        # O31 = "=O29"
-        # O32 = "=-(N41*(1.75%)+(N41*4%*30%))/4"  <- references previous column (N for O)
-        # O33 = "=-(N41*70%*2.6%)/4"  <- references previous column
-        # O35 = "=O33+O32+O31"
-        
-        # Set formulas for the target column (current quarter)
+            rate_col = ntm_col + 3
+        rate_letter = get_column_letter(rate_col)
+        logger.info(f"Row 6 rate column: {rate_letter} "
+                    f"(value: {suppl_sheet.cell(row=6, column=rate_col).value})")
+
+        for col in range(target_column + 1, ntm_col):
+            cl = get_column_letter(col)
+            suppl_sheet.cell(row=6, column=col).value = f"={cl}5*${rate_letter}$6"
+
+        # === 3. Rows 31-35 formulas for actual + forecast columns ===
         suppl_sheet.cell(row=31, column=target_column).value = f"={target_col_letter}29"
-        suppl_sheet.cell(row=32, column=target_column).value = f"=-({prev_col_letter}41*(1.75%)+({prev_col_letter}41*4%*30%))/4"
-        suppl_sheet.cell(row=33, column=target_column).value = f"=-({prev_col_letter}41*70%*2.6%)/4"
-        suppl_sheet.cell(row=35, column=target_column).value = f"={target_col_letter}33+{target_col_letter}32+{target_col_letter}31"
-        
-        logger.info(f"Updated rows 31-35 in column {target_col_letter} with proper formulas")
-        
-        # Also update formulas for subsequent columns (P, Q, R, S) to maintain consistency
-        for col in range(target_column + 1, 20):  # Up to S(19)
-            col_letter = get_column_letter(col)
-            prev_letter = get_column_letter(col - 1)
-            
-            # Update row 31
-            suppl_sheet.cell(row=31, column=col).value = f"={col_letter}29"
-            # Update row 32 - references previous column for row 41
-            suppl_sheet.cell(row=32, column=col).value = f"=-({prev_letter}41*(1.75%)+({prev_letter}41*4%*30%))/4"
-            # Update row 33 - references previous column for row 41
-            suppl_sheet.cell(row=33, column=col).value = f"=-({prev_letter}41*70%*2.6%)/4"
-            # Update row 35 - sum of 31, 32, 33
-            suppl_sheet.cell(row=35, column=col).value = f"={col_letter}33+{col_letter}32+{col_letter}31"
-            
-            logger.debug(f"Updated rows 31-35 formulas in column {col_letter}")
-        
-        # === 5. Update Column T (NTM) SUM ranges ===
-        # After adding actual data to O, NTM SUM should start from P (next forecast column)
-        # Change =SUM(O5:R5) or =SUM(O5:S5) to =SUM(P5:S5)
-        # The new start column is one after the target (actual) column
-        new_sum_start = get_column_letter(target_column + 1)  # P for Q3
-        
-        for row in range(4, 42):  # Rows 4 to 41 as specified
-            t_val = suppl_sheet.cell(row=row, column=ntm_column).value
-            if t_val and isinstance(t_val, str) and '=SUM(' in t_val:
-                # Update SUM range: change start from O to P, end to S
-                # Pattern: =SUM(O5:R5) or =SUM(O5:S5) -> =SUM(P5:S5)
+        suppl_sheet.cell(row=32, column=target_column).value = (
+            f"=-({prev_col_letter}41*(1.75%)+({prev_col_letter}41*4%*30%))/4")
+        suppl_sheet.cell(row=33, column=target_column).value = (
+            f"=-({prev_col_letter}41*70%*2.6%)/4")
+        suppl_sheet.cell(row=35, column=target_column).value = (
+            f"={target_col_letter}33+{target_col_letter}32+{target_col_letter}31")
+
+        for col in range(target_column + 1, ntm_col):
+            cl = get_column_letter(col)
+            pl = get_column_letter(col - 1)
+            suppl_sheet.cell(row=31, column=col).value = f"={cl}29"
+            suppl_sheet.cell(row=32, column=col).value = (
+                f"=-({pl}41*(1.75%)+({pl}41*4%*30%))/4")
+            suppl_sheet.cell(row=33, column=col).value = (
+                f"=-({pl}41*70%*2.6%)/4")
+            suppl_sheet.cell(row=35, column=col).value = (
+                f"={cl}33+{cl}32+{cl}31")
+
+        # === 4. NTM SUM formulas: 4 forecast columns (excl. actual) ===
+        ntm_sum_start = get_column_letter(target_column + 1)
+        ntm_sum_end = last_fc_letter
+
+        for row in range(4, 42):
+            cell = suppl_sheet.cell(row=row, column=ntm_col)
+            val = cell.value
+            if val and isinstance(val, str) and '=SUM(' in val:
                 new_formula = re.sub(
                     r'=SUM\([A-Z]+(\d+):[A-Z]+(\d+)\)',
-                    f'=SUM({new_sum_start}\\1:S\\2)',
-                    t_val
+                    f'=SUM({ntm_sum_start}\\1:{ntm_sum_end}\\2)',
+                    val
                 )
-                if new_formula != t_val:
-                    suppl_sheet.cell(row=row, column=ntm_column).value = new_formula
-                    logger.debug(f"Updated T{row}: {t_val} -> {new_formula}")
-        
-        logger.info("Completed Suppl. Calc formula updates")
+                if new_formula != val:
+                    cell.value = new_formula
+                    logger.debug(f"Updated {ntm_letter}{row}: {val} -> {new_formula}")
+            elif val is None or (isinstance(val, str) and not val.startswith('=')):
+                has_data = any(
+                    suppl_sheet.cell(row=row, column=c).value is not None
+                    for c in range(target_column, ntm_col)
+                )
+                if has_data:
+                    cell.value = f"=SUM({ntm_sum_start}{row}:{ntm_sum_end}{row})"
+                    logger.debug(f"Set new NTM formula at {ntm_letter}{row}")
+
+        logger.info("Completed Suppl. Calc formula updates (dynamic NTM)")
     
     def _update_signature_page_dates(self, sheet):
         """

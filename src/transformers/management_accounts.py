@@ -281,138 +281,61 @@ class ManagementAccountsBuilder:
     
     def _copy_bdo_data_to_new_sheet(self, bdo_result: BDOParseResult):
         """
-        Create new BDO sheet by:
-        1. Cloning the previous BDO sheet (to preserve historical quarterly data)
-        2. Shifting columns: old D→C, E→D, F→E, G→F (dropping oldest quarter)
-        3. Updating column G with new quarter data from source Cijfers file
-        4. Updating column H to recalculate LTM sums
-        
-        This preserves the LTM calculation structure.
+        Create new BDO sheet as a verbatim copy of the uploaded Cijfers file.
+
+        Only the sheet title is changed to match the automation naming convention.
+        All cells (values + formulas), formatting, merged cells, column widths,
+        and row heights are preserved exactly as they appear in the source file.
         """
         new_sheet_name = self.config.bdo_sheet_name
-        
-        # Check if new sheet already exists
+
         if new_sheet_name in self.workbook.sheetnames:
             logger.warning(f"Sheet {new_sheet_name} already exists, will remove and recreate")
             del self.workbook[new_sheet_name]
-        
-        # Load source Cijfers file for new quarter data
+
         if not self.bdo_source_path or not self.bdo_source_path.exists():
             logger.warning("BDO source file not provided, will clone previous BDO sheet")
             self._clone_and_update_bdo_sheet(bdo_result)
             return
-        
-        # Load with data_only=False to preserve formulas in rows 125 and 127
-        bdo_wb_formulas = openpyxl.load_workbook(self.bdo_source_path, data_only=False)
-        source_sheet = bdo_wb_formulas.active
-        logger.info(f"Loading new quarter data from: {self.bdo_source_path}")
-        
-        # Find the previous BDO sheet to clone
-        if not self._prev_bdo_sheet_name or self._prev_bdo_sheet_name not in self.workbook.sheetnames:
-            logger.warning("No previous BDO sheet found, copying directly from source")
-            bdo_wb_values.close()
-            self._copy_bdo_data_direct(bdo_result)
-            return
-        
-        # Load previous workbook with data_only=True to get calculated values
-        # The current self.workbook has formulas, but we need cached calculated values
-        prev_wb_values = openpyxl.load_workbook(str(self.previous_path), data_only=True)
-        prev_sheet_values = prev_wb_values[self._prev_bdo_sheet_name]
-        prev_sheet_formatting = self.workbook[self._prev_bdo_sheet_name]
-        
-        # Find where to insert - before Management Cijfers sheet
+
+        bdo_wb = openpyxl.load_workbook(self.bdo_source_path, data_only=False)
+        source_sheet = bdo_wb.active
+        logger.info(f"Loading BDO source (verbatim copy) from: {self.bdo_source_path}")
+
         insert_index = len(self.workbook.sheetnames)
         for i, name in enumerate(self.workbook.sheetnames):
             if 'Management Cijfers' in name or 'Cijfers' in name:
                 insert_index = i
                 break
-        
-        # Create new sheet
+
         new_sheet = self.workbook.create_sheet(title=new_sheet_name, index=insert_index)
-        
+
         max_row = source_sheet.max_row
-        max_col = max(source_sheet.max_column, 8)
-        
-        # The source Cijfers file already contains:
-        # - Column A, B: Account codes and descriptions
-        # - Column C: Opening balance (for Balance Sheet) or None (for P&L)
-        # - Columns D, E, F: Historical quarterly data
-        # - Column G: Current quarter data
-        # - Column H: Calculated sum (C+D+E+F+G)
-        #
-        # We just need to copy all this directly and then append special rows from previous sheet
-        
-        # Copy all data from source file (columns A-G as values)
-        # Column H will be set with formulas later (after special rows are appended)
+        max_col = source_sheet.max_column
+
         for row in range(1, max_row + 1):
             for col in range(1, max_col + 1):
-                source_val = source_sheet.cell(row=row, column=col).value
-                target_cell = new_sheet.cell(row=row, column=col)
-                target_cell.value = source_val
-        
-        # Copy formatting from previous sheet by matching account codes
-        prev_account_rows = {}
-        for row_idx in range(1, prev_sheet_values.max_row + 1):
-            code = prev_sheet_values.cell(row=row_idx, column=1).value
-            if code:
-                prev_account_rows[str(code).strip()] = row_idx
-        
-        for row in range(1, max_row + 1):
-            source_code = source_sheet.cell(row=row, column=1).value
-            source_code_str = str(source_code).strip() if source_code else None
-            prev_row = prev_account_rows.get(source_code_str) if source_code_str else None
-            
-            if prev_row:
-                for col in range(1, max_col + 1):
-                    prev_format_cell = prev_sheet_formatting.cell(row=prev_row, column=col)
-                    target_cell = new_sheet.cell(row=row, column=col)
-                    
-                    if prev_format_cell.has_style:
-                        target_cell.font = copy(prev_format_cell.font)
-                        target_cell.alignment = copy(prev_format_cell.alignment)
-                        target_cell.number_format = prev_format_cell.number_format
-                        target_cell.border = copy(prev_format_cell.border)
-                        target_cell.fill = copy(prev_format_cell.fill)
-        
-        # Copy column widths
-        for col_letter, dim in prev_sheet_formatting.column_dimensions.items():
+                src_cell = source_sheet.cell(row=row, column=col)
+                tgt_cell = new_sheet.cell(row=row, column=col)
+                tgt_cell.value = src_cell.value
+                tgt_cell.font = copy(src_cell.font)
+                tgt_cell.alignment = copy(src_cell.alignment)
+                tgt_cell.number_format = src_cell.number_format
+                tgt_cell.border = copy(src_cell.border)
+                tgt_cell.fill = copy(src_cell.fill)
+
+        for col_letter, dim in source_sheet.column_dimensions.items():
             new_sheet.column_dimensions[col_letter].width = dim.width
-        
-        # Copy row heights
-        for row_idx, dim in prev_sheet_formatting.row_dimensions.items():
+
+        for row_idx, dim in source_sheet.row_dimensions.items():
             new_sheet.row_dimensions[row_idx].height = dim.height
-        
-        # Copy merged cells
-        for merged_range in prev_sheet_formatting.merged_cells.ranges:
+
+        for merged_range in source_sheet.merged_cells.ranges:
             new_sheet.merge_cells(str(merged_range))
-        
-        # Update column headers
-        new_sheet.cell(row=1, column=3).value = f"Eindbalans per {self._format_quarter_date(self.config.quarter, offset=-4)}"
-        new_sheet.cell(row=1, column=7).value = f"Mutaties {self.config.quarter}"
-        new_sheet.cell(row=1, column=8).value = f"Saldi per {self._format_quarter_date(self.config.quarter)}"
-        
-        # Build account code to row map from source Cijfers file
-        source_account_map = {}
-        for row_idx in range(1, source_sheet.max_row + 1):
-            code = source_sheet.cell(row=row_idx, column=1).value
-            if code:
-                source_account_map[str(code)] = row_idx
-        
-        # Add special rows with proper formulas (not just values)
-        # These rows are needed for LTM calculations in Management Cijfers
-        self._add_special_rows_with_formulas(new_sheet, source_sheet.max_row)
-        
-        # Set formulas in column H for ALL rows (after all data is copied)
-        # This ensures LTM sums are formulas, not just values
-        self._set_column_h_formulas(new_sheet, new_sheet.max_row)
-        
-        logger.info(f"Created new BDO sheet: {new_sheet_name}")
-        logger.info(f"  Cloned from: {self._prev_bdo_sheet_name}")
-        logger.info(f"  Updated column G with new quarter data from source file")
-        logger.info(f"  Recalculated column H (LTM sums)")
-        
-        bdo_wb_formulas.close()
-        prev_wb_values.close()
+
+        logger.info(f"Created verbatim BDO sheet: {new_sheet_name} ({max_row} rows x {max_col} cols)")
+
+        bdo_wb.close()
     
     def _format_quarter_date(self, quarter: str, offset: int = 0) -> str:
         """Format a quarter string into a date string for column headers."""
@@ -653,13 +576,11 @@ class ManagementAccountsBuilder:
                 target_cell = new_sheet.cell(row=row, column=col)
                 
                 target_cell.value = value_cell.value
-                
-                if format_cell.has_style:
-                    target_cell.font = copy(format_cell.font)
-                    target_cell.alignment = copy(format_cell.alignment)
-                    target_cell.number_format = format_cell.number_format
-                    target_cell.border = copy(format_cell.border)
-                    target_cell.fill = copy(format_cell.fill)
+                target_cell.font = copy(format_cell.font)
+                target_cell.alignment = copy(format_cell.alignment)
+                target_cell.number_format = format_cell.number_format
+                target_cell.border = copy(format_cell.border)
+                target_cell.fill = copy(format_cell.fill)
         
         for col_letter, dim in source_sheet_formatting.column_dimensions.items():
             new_sheet.column_dimensions[col_letter].width = dim.width
@@ -877,47 +798,34 @@ class ManagementAccountsBuilder:
             ltm_date_cell.border = copy(prev_ltm_date_cell.border)
             ltm_date_cell.fill = copy(prev_ltm_date_cell.fill)
         
-        # LTM column header (row 22): Calibri/11/bold/white on blue #4472C4
-        blue_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        # LTM column header (row 22): copy styling from old LTM header (now
+        # at new_ltm_col after the column insert) instead of hardcoding a font.
         ltm_header = summary_sheet.cell(row=22, column=new_ltm_col)
         ltm_header.value = f"LTM {self.config.quarter}"
-        ltm_header.font = Font(name='Calibri', size=11, bold=True, color="FFFFFF")
-        ltm_header.fill = blue_fill
-        ltm_header.alignment = copy(prev_header_cell.alignment) if prev_header_cell.has_style else None
         
-        # Copy ALL styling (font, fill, border, alignment, number_format) from
-        # previous quarter column for every data cell to match template exactly.
         client_number_format = '_(* #,##0_);_(* \\(#,##0\\);_(* "-"??_);_(@_)'
         
-        # New quarter column: copy full style from previous quarter, then set Calibri/11/non-bold
-        calibri_font = Font(name='Calibri', size=11, bold=False)
+        # New quarter column: copy ALL styling from the previous quarter column.
+        # The previous column already carries the correct Avenir book/10/bold font
+        # and per-row colours; we must not replace it with a hardcoded font.
         for row_idx in range(23, summary_sheet.max_row + 1):
             prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_quarter_col)
             if prev_cell.has_style:
+                cell.font = copy(prev_cell.font)
                 cell.alignment = copy(prev_cell.alignment)
                 cell.border = copy(prev_cell.border)
                 cell.fill = copy(prev_cell.fill)
                 cell.number_format = prev_cell.number_format if prev_cell.number_format != 'General' else client_number_format
             elif cell.number_format == 'General':
                 cell.number_format = client_number_format
-            if cell.value is not None:
-                cell.font = calibri_font
         
-        # LTM column: copy full style from the new quarter column, then set Avenir Book/10/bold
-        avenir_font = Font(name='Avenir Book', size=10, bold=True)
+        # LTM column: the shifted cells already have old-LTM styling (fill, font,
+        # borders).  Only ensure number_format is not General.
         for row_idx in range(23, summary_sheet.max_row + 1):
-            src_cell = summary_sheet.cell(row=row_idx, column=new_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
-            if src_cell.has_style:
-                cell.alignment = copy(src_cell.alignment)
-                cell.border = copy(src_cell.border)
-                cell.fill = copy(src_cell.fill)
-                cell.number_format = src_cell.number_format if src_cell.number_format != 'General' else client_number_format
-            elif cell.number_format == 'General':
+            if cell.number_format == 'General':
                 cell.number_format = client_number_format
-            if cell.value is not None:
-                cell.font = avenir_font
         
         # Copy column width from previous quarter column
         prev_col_letter = get_column_letter(prev_quarter_col)
