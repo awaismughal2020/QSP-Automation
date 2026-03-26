@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
+import os
 import yaml
 import glob
 from loguru import logger
@@ -16,6 +17,7 @@ from .parsers.bdo_parser import BDOParser
 from .parsers.rent_roll_parser import RentRollParser
 from .parsers.sales_tracker_parser import SalesTrackerParser
 from .transformers.management_accounts import ManagementAccountsBuilder, ManagementAccountsConfig
+from .transformers.ai_verification import AIVerificationOrchestrator, VerificationConfig
 from .transformers.compliance_builder import ComplianceBuilder, ComplianceConfig
 from .transformers.compliance_calc import ComplianceCalculator
 from .generators.word_updater import WordTemplateUpdater, ReportValues
@@ -161,6 +163,74 @@ class QuarterlyReportOrchestrator:
         self.covenant_validator = CovenantValidator()
         self.reconciliation_validator = ReconciliationValidator()
         
+    def _run_ai_verification(self, ma_output: Path, bdo_result, results: dict) -> Path:
+        """
+        Run AI verification on the generated Management Accounts workbook.
+        Returns the path to use downstream (verified file if patches applied,
+        original otherwise).
+        """
+        try:
+            prev_q = self.config.quarter - 1
+            prev_y = self.config.year
+            if prev_q == 0:
+                prev_q = 4
+                prev_y -= 1
+
+            verify_config = VerificationConfig(
+                quarter=self.config.quarter_str,
+                year=self.config.year,
+                quarter_num=self.config.quarter,
+                period_end=self.config.period_end.strftime('%d-%m-%Y'),
+                bdo_sheet_name=f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}",
+                summary_sheet_name=f"Management Cijfers - {self.config.quarter_str}",
+                previous_quarter_label=f"Q{prev_q} {prev_y}",
+            )
+
+            ai_orchestrator = AIVerificationOrchestrator(
+                config=verify_config,
+                api_key=os.environ.get('ANTHROPIC_API_KEY'),
+            )
+
+            verification = ai_orchestrator.run(
+                workbook_path=str(ma_output),
+                bdo_source_path=str(self.config.bdo_file),
+                bdo_result=bdo_result,
+            )
+
+            results['steps']['ai_verification'] = {
+                'status': verification.status,
+                'patches_applied': verification.patches_applied,
+                'revalidation_passed': verification.revalidation_passed,
+                'issues_found': len(verification.issues),
+                'notes': verification.notes,
+            }
+
+            if verification.error:
+                results['warnings'].append(f"AI verification error: {verification.error}")
+
+            verified_path = Path(verification.verified_file)
+            if verified_path.exists() and verified_path != ma_output:
+                results['output_files'].append(str(verified_path))
+
+            if verification.patches_applied > 0:
+                logger.info(
+                    f"AI verification applied {verification.patches_applied} patches, "
+                    f"revalidation={'passed' if verification.revalidation_passed else 'FAILED'}"
+                )
+            else:
+                logger.info(f"AI verification: {verification.status}")
+
+            return verified_path if verified_path.exists() else ma_output
+
+        except Exception as e:
+            logger.warning(f"AI verification step failed (non-fatal): {e}")
+            results['steps']['ai_verification'] = {
+                'status': 'error',
+                'error': str(e),
+            }
+            results['warnings'].append(f"AI verification skipped: {e}")
+            return ma_output
+
     def run(self, dry_run: bool = False) -> dict:
         """
         Execute the complete quarterly reporting workflow.
@@ -255,6 +325,10 @@ class QuarterlyReportOrchestrator:
                 'validation': ma_validation
             }
             results['output_files'].append(str(ma_output))
+            
+            # Step 4a: AI Verification of Management Accounts
+            logger.info("Step 4a: Running AI verification on Management Accounts")
+            ma_verified = self._run_ai_verification(ma_output, bdo_result, results)
             
             # Step 4b: Build Compliance Certificate
             # The Q{n} Management Accounts sheet should contain CURRENT quarter's LTM data.
@@ -635,6 +709,10 @@ class QuarterlyReportOrchestrator:
                 'validation': ma_validation
             }
             results['output_files'].append(str(ma_output))
+            
+            # Step 4a: AI Verification of Management Accounts
+            logger.info("Step 4a: Running AI verification on Management Accounts")
+            ma_verified = self._run_ai_verification(ma_output, bdo_result, results)
             
             # Step 4b: Build Compliance Certificate
             logger.info("Step 4b: Building Compliance Certificate")

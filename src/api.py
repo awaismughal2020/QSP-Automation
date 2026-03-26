@@ -89,6 +89,15 @@ class GenerateRequest(BaseModel):
         }
 
 
+class AIVerificationStatus(BaseModel):
+    """AI verification step result."""
+    status: str = "skipped"
+    patches_applied: int = 0
+    revalidation_passed: bool = False
+    issues_found: int = 0
+    notes: str = ""
+
+
 class GenerateResponse(BaseModel):
     """Response model for report generation."""
     status: str
@@ -98,6 +107,7 @@ class GenerateResponse(BaseModel):
     warnings: Optional[List[str]] = None
     errors: Optional[List[str]] = None
     execution_time_seconds: Optional[float] = None
+    ai_verification: Optional[AIVerificationStatus] = None
 
 
 class GenerateAccountsRequest(BaseModel):
@@ -219,6 +229,20 @@ def resolve_input_path(path_str: str, base_dir: Path = None) -> Path:
         return INPUTS_DIR / path_str
 
 
+def _extract_ai_verification(result: dict) -> Optional[AIVerificationStatus]:
+    """Extract AI verification status from orchestrator results."""
+    ai_step = result.get('steps', {}).get('ai_verification')
+    if ai_step:
+        return AIVerificationStatus(
+            status=ai_step.get('status', 'skipped'),
+            patches_applied=ai_step.get('patches_applied', 0),
+            revalidation_passed=ai_step.get('revalidation_passed', False),
+            issues_found=ai_step.get('issues_found', 0),
+            notes=ai_step.get('notes', ''),
+        )
+    return None
+
+
 # API Endpoints
 
 @app.get("/", response_model=HealthResponse)
@@ -316,6 +340,8 @@ async def generate_report(request: GenerateRequest):
         execution_time = (datetime.now() - start_time).total_seconds()
         
         # Build response
+        ai_verification = _extract_ai_verification(result)
+
         if result.get('status') == 'success':
             return GenerateResponse(
                 status="success",
@@ -324,7 +350,8 @@ async def generate_report(request: GenerateRequest):
                 output_files=result.get('output_files', []),
                 warnings=result.get('warnings', []),
                 errors=[],
-                execution_time_seconds=execution_time
+                execution_time_seconds=execution_time,
+                ai_verification=ai_verification,
             )
         else:
             return GenerateResponse(
@@ -334,7 +361,8 @@ async def generate_report(request: GenerateRequest):
                 output_files=result.get('output_files', []),
                 warnings=result.get('warnings', []),
                 errors=result.get('errors', []),
-                execution_time_seconds=execution_time
+                execution_time_seconds=execution_time,
+                ai_verification=ai_verification,
             )
             
     except HTTPException:
@@ -459,6 +487,8 @@ async def generate_accounts(request: GenerateAccountsRequest):
         
         execution_time = (datetime.now() - start_time).total_seconds()
         
+        ai_verification = _extract_ai_verification(result)
+
         if result.get('status') == 'success':
             return GenerateResponse(
                 status="success",
@@ -467,7 +497,8 @@ async def generate_accounts(request: GenerateAccountsRequest):
                 output_files=result.get('output_files', []),
                 warnings=result.get('warnings', []),
                 errors=[],
-                execution_time_seconds=execution_time
+                execution_time_seconds=execution_time,
+                ai_verification=ai_verification,
             )
         else:
             return GenerateResponse(
@@ -477,7 +508,8 @@ async def generate_accounts(request: GenerateAccountsRequest):
                 output_files=result.get('output_files', []),
                 warnings=result.get('warnings', []),
                 errors=result.get('errors', []),
-                execution_time_seconds=execution_time
+                execution_time_seconds=execution_time,
+                ai_verification=ai_verification,
             )
             
     except HTTPException:

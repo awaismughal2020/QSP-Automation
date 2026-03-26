@@ -19,10 +19,11 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     
-    # Uncomment if you have a .env file
-    # env_file:
-    #   - .env
+    # Load variables from .env for substitution above
+    env_file:
+      - .env
     
     # Volume mounts
     volumes:
