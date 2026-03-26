@@ -1024,12 +1024,11 @@ class AIVerificationOrchestrator:
             VerificationResult with status, patches applied, and file paths
         """
         workbook_path = str(workbook_path)
-        verified_path = workbook_path.replace('.xlsx', '_AI_verified.xlsx')
 
         result = VerificationResult(
             status='PASS',
             original_file=workbook_path,
-            verified_file=verified_path,
+            verified_file=workbook_path,
         )
 
         try:
@@ -1079,10 +1078,7 @@ class AIVerificationOrchestrator:
                 result.status = 'ERROR'
                 result.error = claude_response.get('error', 'Unknown error')
                 result.notes = f"Claude API error: {result.error}"
-
-                import shutil
-                shutil.copy2(workbook_path, verified_path)
-                logger.warning(f"[AI Verify] Claude error — copied original as verified: {result.error}")
+                logger.warning(f"[AI Verify] Claude error — original file unchanged: {result.error}")
                 return result
 
             result.status = claude_response.get('status', 'PASS')
@@ -1091,14 +1087,12 @@ class AIVerificationOrchestrator:
             result.validation_summary = claude_response.get('validation_summary', {})
             result.notes = claude_response.get('notes', '')
 
-            # Phase D: Apply patches
+            # Phase D: Apply patches in-place to the original workbook
             if result.patches:
-                logger.info(f"[AI Verify] Phase D: Applying {len(result.patches)} patches...")
-                import shutil
-                shutil.copy2(workbook_path, verified_path)
+                logger.info(f"[AI Verify] Phase D: Applying {len(result.patches)} patches in-place...")
 
-                applier = PatchApplier(verified_path, self.config.summary_sheet_name)
-                applied, rejected = applier.apply(result.patches, verified_path)
+                applier = PatchApplier(workbook_path, self.config.summary_sheet_name)
+                applied, rejected = applier.apply(result.patches, workbook_path)
                 result.patches_applied = applied
 
                 if rejected:
@@ -1108,11 +1102,9 @@ class AIVerificationOrchestrator:
 
                 # Phase D+: Re-validate
                 logger.info("[AI Verify] Phase D+: Re-validating patched workbook...")
-                result.revalidation_passed = self._revalidate(verified_path, bdo_result)
+                result.revalidation_passed = self._revalidate(workbook_path, bdo_result)
 
             else:
-                import shutil
-                shutil.copy2(workbook_path, verified_path)
                 result.revalidation_passed = True
                 logger.info("[AI Verify] No patches needed — workbook passed verification")
 
@@ -1126,12 +1118,7 @@ class AIVerificationOrchestrator:
             logger.exception(f"[AI Verify] Verification failed: {e}")
             result.status = 'ERROR'
             result.error = str(e)
-
-            import shutil
-            try:
-                shutil.copy2(workbook_path, verified_path)
-            except Exception:
-                result.verified_file = workbook_path
+            result.verified_file = workbook_path
 
         return result
 

@@ -208,19 +208,15 @@ class QuarterlyReportOrchestrator:
             if verification.error:
                 results['warnings'].append(f"AI verification error: {verification.error}")
 
-            verified_path = Path(verification.verified_file)
-            if verified_path.exists() and verified_path != ma_output:
-                results['output_files'].append(str(verified_path))
-
             if verification.patches_applied > 0:
                 logger.info(
-                    f"AI verification applied {verification.patches_applied} patches, "
+                    f"AI verification applied {verification.patches_applied} patches in-place, "
                     f"revalidation={'passed' if verification.revalidation_passed else 'FAILED'}"
                 )
             else:
                 logger.info(f"AI verification: {verification.status}")
 
-            return verified_path if verified_path.exists() else ma_output
+            return ma_output
 
         except Exception as e:
             logger.warning(f"AI verification step failed (non-fatal): {e}")
@@ -299,7 +295,7 @@ class QuarterlyReportOrchestrator:
             
             # Step 4: Build Management Accounts
             logger.info("Step 4: Building Management Accounts")
-            ma_output = self.config.output_dir / f"Management Accounts {self.config.quarter_str} - Draft 1.xlsx"
+            ma_output = self.config.output_dir / f"Management Accounts {self.config.quarter_str} {self.config.year}.xlsx"
             ma_config = ManagementAccountsConfig(
                 quarter=self.config.quarter_str,
                 period_end=self.config.period_end,
@@ -324,15 +320,13 @@ class QuarterlyReportOrchestrator:
                 'output': str(ma_output),
                 'validation': ma_validation
             }
-            results['output_files'].append(str(ma_output))
-            
-            # Step 4a: AI Verification of Management Accounts
+            # Step 4a: AI Verification of Management Accounts (patches in-place)
             logger.info("Step 4a: Running AI verification on Management Accounts")
             ma_verified = self._run_ai_verification(ma_output, bdo_result, results)
+            results['output_files'].append(str(ma_verified))
             
             # Step 4b: Build Compliance Certificate
-            # The Q{n} Management Accounts sheet should contain CURRENT quarter's LTM data.
-            # We pass the newly generated Management Accounts file (ma_output).
+            # Uses the AI-verified MA file so any corrections are reflected downstream.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -344,8 +338,7 @@ class QuarterlyReportOrchestrator:
                 str(compliance_output),
                 compliance_config
             )
-            # Pass the newly generated Management Accounts file for Q{n} MA sheet data (LTM Q{n})
-            compliance_builder.build(bdo_result, str(ma_output))
+            compliance_builder.build(bdo_result, str(ma_verified))
             results['steps']['compliance_certificate'] = {
                 'status': 'success',
                 'output': str(compliance_output)
@@ -683,7 +676,7 @@ class QuarterlyReportOrchestrator:
             
             # Step 4: Build Management Accounts
             logger.info("Step 4: Building Management Accounts")
-            ma_output = self.config.output_dir / f"Management Accounts {self.config.quarter_str} - Draft 1.xlsx"
+            ma_output = self.config.output_dir / f"Management Accounts {self.config.quarter_str} {self.config.year}.xlsx"
             ma_config = ManagementAccountsConfig(
                 quarter=self.config.quarter_str,
                 period_end=self.config.period_end,
@@ -708,13 +701,13 @@ class QuarterlyReportOrchestrator:
                 'output': str(ma_output),
                 'validation': ma_validation
             }
-            results['output_files'].append(str(ma_output))
-            
-            # Step 4a: AI Verification of Management Accounts
+            # Step 4a: AI Verification of Management Accounts (patches in-place)
             logger.info("Step 4a: Running AI verification on Management Accounts")
             ma_verified = self._run_ai_verification(ma_output, bdo_result, results)
+            results['output_files'].append(str(ma_verified))
             
             # Step 4b: Build Compliance Certificate
+            # Uses the AI-verified MA file so any corrections are reflected downstream.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -726,7 +719,7 @@ class QuarterlyReportOrchestrator:
                 str(compliance_output),
                 compliance_config
             )
-            compliance_builder.build(bdo_result, str(ma_output))
+            compliance_builder.build(bdo_result, str(ma_verified))
             results['steps']['compliance_certificate'] = {
                 'status': 'success',
                 'output': str(compliance_output)

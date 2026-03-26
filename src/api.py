@@ -153,7 +153,7 @@ class GenerateWordReportRequest(BaseModel):
             "example": {
                 "year": 2025,
                 "quarter": 3,
-                "management_accounts_file": "outputs/Management Accounts Q3 2025 - Draft 1.xlsx",
+                "management_accounts_file": "outputs/Management Accounts Q3 2025.xlsx",
                 "compliance_certificate_file": "inputs/Compliance Certificate Berekening QSP - Q3 2025_edited.xlsx",
                 "rent_roll_file": "inputs/QSP_huurlijst_Q3.xlsx",
                 "sales_tracker_file": "inputs/Unit_Sales_tracker_Q3.xlsx",
@@ -179,7 +179,7 @@ class GenerateFinalPDFRequest(BaseModel):
                 "year": 2025,
                 "quarter": 3,
                 "word_report_file": "outputs/Quarterly QSP - Q3 2025 - Draft.docx",
-                "management_accounts_file": "outputs/Management Accounts Q3 2025 - Draft 1.xlsx",
+                "management_accounts_file": "outputs/Management Accounts Q3 2025.xlsx",
                 "compliance_certificate_file": "inputs/Compliance Certificate Berekening QSP - Q3 2025_final.xlsx",
                 "rent_roll_file": "inputs/QSP_huurlijst_Q3.xlsx",
                 "sales_tracker_file": "inputs/Unit_Sales_tracker_Q3.xlsx"
