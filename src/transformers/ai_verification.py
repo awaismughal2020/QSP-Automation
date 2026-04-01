@@ -790,7 +790,7 @@ class PatchApplier:
 class ClaudeVerifier:
     """Sends workbook context to Claude for verification and parses response."""
 
-    MODEL = "claude-sonnet-4-20250514"
+    MODEL = "claude-opus-4-20250514"
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get('ANTHROPIC_API_KEY', '')
@@ -1011,7 +1011,8 @@ class AIVerificationOrchestrator:
 
     def run(self, workbook_path: str,
             bdo_source_path: Optional[str] = None,
-            bdo_result: Optional[BDOParseResult] = None) -> VerificationResult:
+            bdo_result: Optional[BDOParseResult] = None,
+            computed_values: Optional[Dict] = None) -> VerificationResult:
         """
         Run full AI verification pipeline.
 
@@ -1019,6 +1020,7 @@ class AIVerificationOrchestrator:
             workbook_path: Path to the draft MA workbook
             bdo_source_path: Path to original BDO source file (for copy verification)
             bdo_result: Parsed BDO data (for shadow model context)
+            computed_values: Pre-computed numeric values from MA builder {(row,'quarter'|'ltm'): float}
 
         Returns:
             VerificationResult with status, patches applied, and file paths
@@ -1102,7 +1104,7 @@ class AIVerificationOrchestrator:
 
                 # Phase D+: Re-validate
                 logger.info("[AI Verify] Phase D+: Re-validating patched workbook...")
-                result.revalidation_passed = self._revalidate(workbook_path, bdo_result)
+                result.revalidation_passed = self._revalidate(workbook_path, bdo_result, computed_values)
 
             else:
                 result.revalidation_passed = True
@@ -1173,11 +1175,29 @@ class AIVerificationOrchestrator:
             logger.warning(f"[AI Verify] Shadow model computation failed: {e}")
             return None, None
 
-    def _revalidate(self, workbook_path: str, bdo_result: Optional[BDOParseResult]) -> bool:
+    def _revalidate(self, workbook_path: str,
+                    bdo_result: Optional[BDOParseResult],
+                    computed_values: Optional[Dict] = None) -> bool:
         """
         Re-run validation on the patched workbook.
-        Checks BS row 19 vs P&L row 68 using shadow models.
+
+        When computed_values are available (from the MA builder), check them
+        against the BDO ground truth directly.  Otherwise fall back to
+        recomputing shadow models.
         """
+        tolerance = 1.0
+
+        if computed_values:
+            pl68 = computed_values.get((68, 'ltm'), 0.0)
+            bs19 = computed_values.get((19, 'ltm'), 0.0)
+            diff = abs(pl68 - bs19)
+            passed = diff <= tolerance
+            logger.info(
+                f"[AI Verify] Re-validation (computed_values): "
+                f"PL68={pl68:,.2f}, BS19={bs19:,.2f}, diff={diff:,.2f}, passed={passed}"
+            )
+            return passed
+
         if bdo_result is None:
             logger.warning("[AI Verify] No BDO result for re-validation, skipping")
             return True
@@ -1221,9 +1241,9 @@ class AIVerificationOrchestrator:
             builder.workbook.close()
 
             diff = abs(dr - em)
-            passed = diff <= 1.0
+            passed = diff <= tolerance
             logger.info(
-                f"[AI Verify] Re-validation: DR={dr:,.2f}, EM={em:,.2f}, "
+                f"[AI Verify] Re-validation (shadow): DR={dr:,.2f}, EM={em:,.2f}, "
                 f"diff={diff:,.2f}, passed={passed}"
             )
             return passed

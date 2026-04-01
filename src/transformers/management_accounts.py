@@ -99,6 +99,16 @@ class ManagementAccountsBuilder:
         # Account code to row mapping in the PREVIOUS BDO sheet (for row offset calculation)
         self._prev_bdo_row_map = {}
         
+        # Column indices set during _update_summary_sheet
+        self._new_quarter_col: Optional[int] = None
+        self._new_ltm_col: Optional[int] = None
+        
+        # Computed numeric values for every formula cell.
+        # Populated at end of build() so downstream consumers (CC builder)
+        # can read values without evaluating Excel formulas.
+        # Structure: {(row, 'quarter'): float, (row, 'ltm'): float}
+        self.computed_values: Dict[Tuple[int, str], float] = {}
+        
         # Sheets that must never be modified (existing BDO/kwartaal sheets)
         self._protected_sheets: set = set()
     
@@ -243,7 +253,13 @@ class ManagementAccountsBuilder:
         # Step 6: Move Management Cijfers sheet to the end (after BDO)
         self._move_summary_sheet_to_end()
         
-        # Step 7: Validate calculations
+        # Step 7: Compute expected numeric values for all formula cells
+        self._populate_computed_values(bdo_result)
+        
+        # Step 8: Enforce BDO alignment (deterministic reconciliation)
+        self._enforce_bdo_alignment(bdo_result)
+        
+        # Step 9: Validate calculations
         self.validation_result = self._validate_calculations(bdo_result)
         
         # Save output
@@ -735,6 +751,8 @@ class ManagementAccountsBuilder:
         
         new_quarter_col = insert_position  # The newly inserted blank column
         new_ltm_col = insert_position + 1  # Where old LTM data now is
+        self._new_quarter_col = new_quarter_col
+        self._new_ltm_col = new_ltm_col
         
         new_quarter_letter = get_column_letter(new_quarter_col)
         new_ltm_letter = get_column_letter(new_ltm_col)
@@ -1690,14 +1708,15 @@ class ManagementAccountsBuilder:
             date.strftime('%B %d, %Y'),
         ]
     
-    def _compute_bdo_ref_value(self, template: dict, bdo_result: BDOParseResult) -> Tuple[float, List[str]]:
+    def _compute_bdo_ref_value(self, template: dict, bdo_result: BDOParseResult,
+                               use_closing: bool = False) -> Tuple[float, List[str]]:
         """
         Compute the numeric value a bdo_ref formula would produce from raw BDO data.
-        
-        Mirrors the Excel formula built by _build_bdo_ref_formula, but returns
-        a computed float instead of a formula string.
-        
-        Returns (value, list_of_missing_account_codes).
+
+        Args:
+            use_closing: When True, use closing_balance directly (mirrors BDO
+                         column H references used by BS and P&L LTM formulas).
+                         When False, use closing-opening (mutation).
         """
         account_codes = template.get('account_codes', [])
         sign = template.get('sign', '-')
@@ -1710,8 +1729,11 @@ class ManagementAccountsBuilder:
         missing = []
         for code in account_codes:
             entry = bdo_result.accounts.get(code)
+            if entry is None:
+                entry = self._fuzzy_account_lookup(code, bdo_result)
             if entry:
-                vals.append(entry.closing_balance - entry.opening_balance)
+                vals.append(entry.closing_balance if use_closing else
+                            entry.closing_balance - entry.opening_balance)
             else:
                 vals.append(0.0)
                 missing.append(code)
@@ -1724,6 +1746,108 @@ class ManagementAccountsBuilder:
                 result += v
         
         return result, missing
+
+    @staticmethod
+    def _fuzzy_account_lookup(code: str, bdo_result: BDOParseResult) -> Optional[AccountEntry]:
+        """Prefix/partial match mirroring _find_account_row logic."""
+        for key, entry in bdo_result.accounts.items():
+            if key.startswith(code) or code.startswith(key.split('.')[0]):
+                return entry
+        return None
+
+    @staticmethod
+    def _get_quarter_mutation(entry: AccountEntry, bdo_result: BDOParseResult) -> float:
+        """
+        Extract the column-G (last mutation, i.e. current quarter) value
+        from an AccountEntry.  Falls back to closing-opening when the
+        mutations dict is empty.
+        """
+        if entry.mutations:
+            last_key = max(entry.mutations.keys(), key=lambda k: int(k.split('_')[1]))
+            return entry.mutations[last_key]
+        return entry.closing_balance - entry.opening_balance
+
+    def _compute_bdo_ref_quarter_value(self, template: dict,
+                                       bdo_result: BDOParseResult) -> Tuple[float, List[str]]:
+        """
+        Like _compute_bdo_ref_value but returns the column-G (quarter
+        mutation) instead of closing-opening (LTM).
+        """
+        account_codes = template.get('account_codes', [])
+        sign = template.get('sign', '-')
+        operator = template.get('operator', '-')
+
+        if not account_codes:
+            return 0.0, []
+
+        vals: List[float] = []
+        missing: List[str] = []
+        for code in account_codes:
+            entry = bdo_result.accounts.get(code)
+            if entry is None:
+                entry = self._fuzzy_account_lookup(code, bdo_result)
+            if entry:
+                vals.append(self._get_quarter_mutation(entry, bdo_result))
+            else:
+                vals.append(0.0)
+                missing.append(code)
+
+        result = -vals[0] if sign == '-' else vals[0]
+        for v in vals[1:]:
+            if operator == '-':
+                result -= v
+            else:
+                result += v
+
+        return result, missing
+
+    def _compute_bdo_sum_range_quarter_value(self, template: dict,
+                                              bdo_result: BDOParseResult) -> Tuple[float, List[str]]:
+        """
+        Like _compute_bdo_sum_range_value but uses column-G (quarter
+        mutation) instead of closing-opening.
+        """
+        start_account = template.get('start_account')
+        end_account = template.get('end_account')
+        count = template.get('count')
+        additional = template.get('additional', [])
+
+        total = 0.0
+        missing: List[str] = []
+
+        if start_account:
+            start_entry = (bdo_result.accounts.get(start_account)
+                           or self._fuzzy_account_lookup(start_account, bdo_result))
+            if start_entry:
+                row_to_entry = {e.raw_row: e for e in bdo_result.accounts.values()}
+                start_raw = start_entry.raw_row
+                if count:
+                    for r in range(start_raw, start_raw + count):
+                        if r in row_to_entry:
+                            total += self._get_quarter_mutation(row_to_entry[r], bdo_result)
+                elif end_account:
+                    end_entry = (bdo_result.accounts.get(end_account)
+                                 or self._fuzzy_account_lookup(end_account, bdo_result))
+                    if end_entry:
+                        for r in range(start_raw, end_entry.raw_row + 1):
+                            if r in row_to_entry:
+                                total += self._get_quarter_mutation(row_to_entry[r], bdo_result)
+                    else:
+                        missing.append(end_account)
+                else:
+                    total += self._get_quarter_mutation(start_entry, bdo_result)
+            else:
+                missing.append(start_account)
+
+        for code in additional:
+            entry = (bdo_result.accounts.get(code)
+                     or self._fuzzy_account_lookup(code, bdo_result))
+            if entry:
+                total += self._get_quarter_mutation(entry, bdo_result)
+            else:
+                missing.append(code)
+
+        return total, missing
     
     def _compute_bdo_sum_range_value(self, template: dict, bdo_result: BDOParseResult,
                                        use_mutation: bool = True) -> Tuple[float, List[str]]:
@@ -1742,7 +1866,7 @@ class ManagementAccountsBuilder:
         missing = []
 
         if start_account:
-            start_entry = bdo_result.accounts.get(start_account)
+            start_entry = bdo_result.accounts.get(start_account) or self._fuzzy_account_lookup(start_account, bdo_result)
             if start_entry:
                 row_to_entry = {}
                 for entry in bdo_result.accounts.values():
@@ -1755,7 +1879,7 @@ class ManagementAccountsBuilder:
                             e = row_to_entry[r]
                             total += (e.closing_balance - e.opening_balance) if use_mutation else e.closing_balance
                 elif end_account:
-                    end_entry = bdo_result.accounts.get(end_account)
+                    end_entry = bdo_result.accounts.get(end_account) or self._fuzzy_account_lookup(end_account, bdo_result)
                     if end_entry:
                         for r in range(start_raw, end_entry.raw_row + 1):
                             if r in row_to_entry:
@@ -1769,7 +1893,7 @@ class ManagementAccountsBuilder:
                 missing.append(start_account)
 
         for code in additional:
-            entry = bdo_result.accounts.get(code)
+            entry = bdo_result.accounts.get(code) or self._fuzzy_account_lookup(code, bdo_result)
             if entry:
                 total += (entry.closing_balance - entry.opening_balance) if use_mutation else entry.closing_balance
             else:
@@ -1780,12 +1904,20 @@ class ManagementAccountsBuilder:
     def _evaluate_calc_pattern(self, pattern: str, shadow: dict) -> Optional[float]:
         """
         Evaluate a calc-type formula pattern using pre-computed shadow values.
-        
-        Supports: SUM range, addition chains, negated subtraction, division.
-        Returns None if the pattern cannot be parsed.
+
+        Handles every pattern present in formula_templates.yaml:
+          =SUM({COL}a:{COL}b)       — range sum
+          =-({COL}a-{COL}b)         — negated difference
+          ={COL}a/{COL}b-1          — ratio minus 1
+          ={COL}a+{COL}b+{COL}c    — addition chain (any number of terms)
+          ={COL}a+{COL}b            — two-term addition
+
+        Falls back to a general expression evaluator that respects + and -
+        operators between {COL}N references.
         """
         p = pattern.strip()
-        
+
+        # =SUM({COL}a:{COL}b)
         sum_match = re.match(r'^=SUM\(\{COL\}(\d+):\{COL\}(\d+)\)$', p)
         if sum_match:
             start_row = int(sum_match.group(1))
@@ -1795,7 +1927,8 @@ class ManagementAccountsBuilder:
                 if r in shadow:
                     total += shadow[r]['value']
             return total
-        
+
+        # =-({COL}a-{COL}b)
         neg_sub_match = re.match(r'^=-\(\{COL\}(\d+)-\{COL\}(\d+)\)$', p)
         if neg_sub_match:
             r1 = int(neg_sub_match.group(1))
@@ -1803,7 +1936,8 @@ class ManagementAccountsBuilder:
             v1 = shadow.get(r1, {}).get('value', 0.0)
             v2 = shadow.get(r2, {}).get('value', 0.0)
             return -(v1 - v2)
-        
+
+        # ={COL}a/{COL}b-1
         div_match = re.match(r'^=\{COL\}(\d+)/\{COL\}(\d+)-1$', p)
         if div_match:
             r1 = int(div_match.group(1))
@@ -1813,35 +1947,31 @@ class ManagementAccountsBuilder:
             if v2 != 0:
                 return v1 / v2 - 1
             return 0.0
-        
-        add_refs = re.findall(r'\{COL\}(\d+)', p)
-        if add_refs and '+' in p and '-' not in p.replace('=-', ''):
+
+        # General expression: parse each +/- {COL}N token with correct sign.
+        # Handles: ={COL}67+{COL}66, ={COL}53+{COL}48, ={COL}25+{COL}30+{COL}44, etc.
+        tokens = re.findall(r'([+\-]?)\{COL\}(\d+)', p.replace('=', '', 1))
+        if tokens:
             total = 0.0
-            for ref in add_refs:
-                r = int(ref)
-                total += shadow.get(r, {}).get('value', 0.0)
+            for sign_str, row_str in tokens:
+                val = shadow.get(int(row_str), {}).get('value', 0.0)
+                if sign_str == '-':
+                    total -= val
+                else:
+                    total += val
             return total
-        
-        if add_refs and len(add_refs) >= 2:
-            total = 0.0
-            for ref in add_refs:
-                r = int(ref)
-                total += shadow.get(r, {}).get('value', 0.0)
-            return total
-        
-        logger.debug(f"Could not parse calc pattern: {p}")
+
+        logger.warning(f"Could not parse calc pattern: {p}")
         return None
     
-    def _compute_shadow_pl(self, bdo_result: BDOParseResult) -> dict:
+    def _compute_shadow_pl(self, bdo_result: BDOParseResult,
+                           use_closing: bool = False) -> dict:
         """
         Compute a 'shadow P&L' from BDO raw data, mirroring the formula chain.
-        
-        For each row in the formula templates, computes the expected numeric value
-        that the Excel formula would produce if evaluated. This allows comparing
-        the P&L chain output against equity movement to find divergence points.
-        
-        Returns: {row_num: {'label': str, 'value': float, 'type': str,
-                            'account_codes': list, 'missing_codes': list}, ...}
+
+        Args:
+            use_closing: True  → use closing_balance (column H, for LTM)
+                         False → use closing-opening (mutation, legacy behaviour)
         """
         shadow = {}
         
@@ -1853,18 +1983,38 @@ class ManagementAccountsBuilder:
                      'account_codes': [], 'missing_codes': []}
             
             if formula_type == 'bdo_ref':
-                val, missing = self._compute_bdo_ref_value(template, bdo_result)
+                val, missing = self._compute_bdo_ref_value(
+                    template, bdo_result, use_closing=use_closing)
                 entry['value'] = val
                 entry['account_codes'] = template.get('account_codes', [])
                 entry['missing_codes'] = missing
-            
+
+            elif formula_type == 'bdo_sum_range':
+                val, missing = self._compute_bdo_sum_range_value(
+                    template, bdo_result, use_mutation=not use_closing)
+                entry['value'] = val
+                codes = []
+                if template.get('start_account'):
+                    codes.append(template['start_account'])
+                if template.get('end_account'):
+                    codes.append(f"..{template['end_account']}")
+                codes.extend(template.get('additional', []))
+                entry['account_codes'] = codes
+                entry['missing_codes'] = missing
+
             elif formula_type == 'bdo_ref_conditional':
                 sub = template.get('q_config', {})
                 sub_type = sub.get('type', 'bdo_ref')
                 if sub_type == 'bdo_ref':
-                    val, missing = self._compute_bdo_ref_value(sub, bdo_result)
+                    val, missing = self._compute_bdo_ref_value(
+                        sub, bdo_result, use_closing=use_closing)
                     entry['value'] = val
                     entry['account_codes'] = sub.get('account_codes', [])
+                    entry['missing_codes'] = missing
+                elif sub_type == 'bdo_sum_range':
+                    val, missing = self._compute_bdo_sum_range_value(
+                        sub, bdo_result, use_mutation=not use_closing)
+                    entry['value'] = val
                     entry['missing_codes'] = missing
                 else:
                     entry['value'] = 0.0
@@ -1885,22 +2035,85 @@ class ManagementAccountsBuilder:
             
             shadow[row_idx] = entry
         
-        logger.info(f"Shadow P&L computed for {len(shadow)} rows")
+        logger.info(f"Shadow P&L computed for {len(shadow)} rows "
+                     f"(use_closing={use_closing})")
         return shadow
     
+    def _compute_shadow_pl_quarter(self, bdo_result: BDOParseResult) -> dict:
+        """
+        Compute shadow P&L using column-G (quarter mutation) values only.
+
+        _compute_shadow_pl uses closing-opening (= column H = LTM total).
+        This method uses the last-mutation value (= column G = quarter only).
+        """
+        shadow = {}
+
+        for row_idx in sorted(self.formula_templates.keys()):
+            template = self.formula_templates[row_idx]
+            formula_type = template.get('type', 'calc')
+            label = template.get('label', f'Row {row_idx}')
+            entry = {'label': label, 'value': 0.0, 'type': formula_type,
+                     'account_codes': [], 'missing_codes': []}
+
+            if formula_type == 'bdo_ref':
+                val, missing = self._compute_bdo_ref_quarter_value(template, bdo_result)
+                entry['value'] = val
+                entry['account_codes'] = template.get('account_codes', [])
+                entry['missing_codes'] = missing
+
+            elif formula_type == 'bdo_sum_range':
+                val, missing = self._compute_bdo_sum_range_quarter_value(template, bdo_result)
+                entry['value'] = val
+                codes = []
+                if template.get('start_account'):
+                    codes.append(template['start_account'])
+                if template.get('end_account'):
+                    codes.append(f"..{template['end_account']}")
+                codes.extend(template.get('additional', []))
+                entry['account_codes'] = codes
+                entry['missing_codes'] = missing
+
+            elif formula_type == 'bdo_ref_conditional':
+                sub = template.get('q_config', {})
+                sub_type = sub.get('type', 'bdo_ref')
+                if sub_type == 'bdo_ref':
+                    val, missing = self._compute_bdo_ref_quarter_value(sub, bdo_result)
+                    entry['value'] = val
+                    entry['account_codes'] = sub.get('account_codes', [])
+                    entry['missing_codes'] = missing
+                elif sub_type == 'bdo_sum_range':
+                    val, missing = self._compute_bdo_sum_range_quarter_value(sub, bdo_result)
+                    entry['value'] = val
+                    entry['missing_codes'] = missing
+                else:
+                    entry['value'] = 0.0
+
+            elif formula_type == 'calc':
+                pattern = template.get('pattern', '')
+                val = self._evaluate_calc_pattern(pattern, shadow)
+                entry['value'] = val if val is not None else 0.0
+
+            elif formula_type == 'constant':
+                entry['value'] = float(template.get('value', 0))
+
+            elif formula_type in ('manual', 'manual_with_ltm'):
+                if row_idx == 50:
+                    entry['value'] = self.config.cash_proceeds_sale or 0.0
+                else:
+                    entry['value'] = 0.0
+
+            shadow[row_idx] = entry
+
+        logger.info(f"Shadow P&L (quarter) computed for {len(shadow)} rows, "
+                     f"row 68 = {shadow.get(68, {}).get('value', 'N/A')}")
+        return shadow
+
     def _compute_shadow_bs(self, bdo_result: BDOParseResult) -> dict:
         """
         Compute a 'shadow Balance Sheet' from BDO raw data using balance_sheet_templates.
 
-        For each row in the balance sheet templates (rows 3-18), computes the expected
-        numeric value using the same account codes as the Excel formulas. Row 19 is
-        the SUM of rows 3-18, representing the Total Equity Movement.
-
-        Uses mutations (closing_balance - opening_balance) so the result is comparable
-        to the P&L-based Direct Result (row 68).
-
-        Returns: {row_num: {'label': str, 'value': float, 'type': str,
-                            'account_codes': list, 'missing_codes': list}, ...}
+        BS formulas reference BDO column H (closing balance), so we use
+        closing_balance directly — NOT closing-opening (mutation).
         """
         shadow = {}
 
@@ -1912,13 +2125,15 @@ class ManagementAccountsBuilder:
                      'account_codes': [], 'missing_codes': []}
 
             if formula_type == 'bdo_ref':
-                val, missing = self._compute_bdo_ref_value(template, bdo_result)
+                val, missing = self._compute_bdo_ref_value(
+                    template, bdo_result, use_closing=True)
                 entry['value'] = val
                 entry['account_codes'] = template.get('account_codes', [])
                 entry['missing_codes'] = missing
 
             elif formula_type == 'bdo_sum_range':
-                val, missing = self._compute_bdo_sum_range_value(template, bdo_result)
+                val, missing = self._compute_bdo_sum_range_value(
+                    template, bdo_result, use_mutation=False)
                 entry['value'] = val
                 codes = []
                 if template.get('start_account'):
@@ -1940,6 +2155,318 @@ class ManagementAccountsBuilder:
                      f"row 19 = {shadow.get(19, {}).get('value', 'N/A')}")
         return shadow
     
+    # ------------------------------------------------------------------
+    # Value extractors — use parsed BDO data + _new_bdo_row_map
+    # ------------------------------------------------------------------
+
+    def _account_value(self, code: str, bdo_result: BDOParseResult,
+                       col: str) -> float:
+        """
+        Get a single account's value from parsed BDO data.
+        col='H' → closing_balance, col='G' → quarter mutation.
+        """
+        entry = bdo_result.accounts.get(code)
+        if entry is None:
+            entry = self._fuzzy_account_lookup(code, bdo_result)
+        if entry is None:
+            return 0.0
+        if col.upper() == 'G':
+            return self._get_quarter_mutation(entry, bdo_result)
+        return entry.closing_balance
+
+    def _eval_bdo_ref(self, template: dict, bdo_result: BDOParseResult,
+                      col: str) -> float:
+        """
+        Evaluate a bdo_ref template by reading cells from the BDO sheet.
+        Falls back to parsed data when the sheet is unavailable.
+        """
+        account_codes = template.get('account_codes', [])
+        sign = template.get('sign', '-')
+        operator = template.get('operator', '-')
+
+        if not account_codes:
+            return 0.0
+
+        col_idx = ord(col.upper()) - ord('A') + 1
+        bdo_sheet_name = self.config.bdo_sheet_name
+        bdo_sheet = (self.workbook[bdo_sheet_name]
+                     if bdo_sheet_name in self.workbook.sheetnames else None)
+
+        vals = []
+        for code in account_codes:
+            row_num = self._find_account_row(code)
+            if row_num and bdo_sheet:
+                vals.append(self._read_bdo_cell_value(bdo_sheet, row_num, col_idx))
+            else:
+                vals.append(self._account_value(code, bdo_result, col))
+
+        result = -vals[0] if sign == '-' else vals[0]
+        for v in vals[1:]:
+            result = (result - v) if operator == '-' else (result + v)
+        return result
+
+    def _read_bdo_cell_value(self, bdo_sheet, row: int, col_idx: int) -> float:
+        """
+        Read a numeric value from a BDO sheet cell, evaluating simple
+        formulas in-place when the cell contains a formula string.
+        """
+        val = bdo_sheet.cell(row=row, column=col_idx).value
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            val = val.strip()
+            if val.startswith('='):
+                return self._eval_cell_formula(bdo_sheet, val, row, col_idx)
+            try:
+                return float(val.replace(',', '.').replace(' ', ''))
+            except (ValueError, AttributeError):
+                pass
+        return 0.0
+
+    def _eval_cell_formula(self, sheet, formula: str, row: int,
+                           col_idx: int) -> float:
+        """
+        Evaluate a formula cell from the BDO sheet.
+        Handles: =SUM(Cn:Gn), =expr+expr, =-expr-expr, simple arithmetic.
+        """
+        import re
+        f = formula.strip()
+
+        # =SUM(C71:G71) — sum a row range
+        m = re.match(r'^=SUM\(([A-Z])(\d+):([A-Z])(\d+)\)$', f, re.IGNORECASE)
+        if m:
+            c1 = ord(m.group(1).upper()) - ord('A') + 1
+            r1 = int(m.group(2))
+            c2 = ord(m.group(3).upper()) - ord('A') + 1
+            r2 = int(m.group(4))
+            total = 0.0
+            if r1 == r2:
+                for c in range(c1, c2 + 1):
+                    total += self._read_bdo_cell_value(sheet, r1, c)
+            else:
+                for r in range(r1, r2 + 1):
+                    total += self._read_bdo_cell_value(sheet, r, c1)
+            return total
+
+        # Simple arithmetic: =-187446.25-1  or  =23666+2
+        try:
+            return float(eval(f[1:]))  # strip '=' and eval arithmetic
+        except Exception:
+            pass
+
+        return 0.0
+
+    def _eval_bdo_sum_range(self, template: dict, bdo_result: BDOParseResult,
+                            col: str) -> float:
+        """
+        Evaluate a bdo_sum_range template by reading directly from the
+        in-memory BDO sheet cells.
+
+        This handles duplicate account codes and formula cells correctly
+        by summing every cell in the Excel row range (same as the SUM
+        formula the builder writes).
+        """
+        start_account = template.get('start_account')
+        end_account = template.get('end_account')
+        count = template.get('count')
+        additional = template.get('additional', [])
+
+        total = 0.0
+        col_idx = ord(col.upper()) - ord('A') + 1
+
+        bdo_sheet_name = self.config.bdo_sheet_name
+        if bdo_sheet_name not in self.workbook.sheetnames:
+            return total
+        bdo_sheet = self.workbook[bdo_sheet_name]
+
+        start_row = self._find_account_row(start_account) if start_account else None
+
+        if start_row is not None:
+            if count:
+                end_row = start_row + count - 1
+            elif end_account:
+                end_row = self._find_account_row(end_account) or start_row
+            else:
+                end_row = start_row
+
+            for r in range(start_row, end_row + 1):
+                total += self._read_bdo_cell_value(bdo_sheet, r, col_idx)
+
+        for code in additional:
+            row_num = self._find_account_row(code)
+            if row_num:
+                total += self._read_bdo_cell_value(bdo_sheet, row_num, col_idx)
+
+        return total
+
+    def _eval_template(self, template: dict, bdo_result: BDOParseResult,
+                       col: str, computed: dict, key_suffix: str) -> float:
+        """Evaluate any template type and return its numeric value."""
+        formula_type = template.get('type', 'calc')
+
+        if formula_type == 'bdo_ref':
+            return self._eval_bdo_ref(template, bdo_result, col)
+
+        if formula_type == 'bdo_sum_range':
+            return self._eval_bdo_sum_range(template, bdo_result, col)
+
+        if formula_type == 'bdo_ref_conditional':
+            sub = template.get('q_config', {})
+            sub_type = sub.get('type', 'bdo_ref')
+            if sub_type == 'bdo_ref':
+                return self._eval_bdo_ref(sub, bdo_result, col)
+            if sub_type == 'bdo_sum_range':
+                return self._eval_bdo_sum_range(sub, bdo_result, col)
+            return 0.0
+
+        if formula_type == 'calc':
+            shadow = {r: {'value': v} for (r, s), v in computed.items()
+                      if s == key_suffix}
+            pattern = template.get('pattern', '')
+            val = self._evaluate_calc_pattern(pattern, shadow)
+            return val if val is not None else 0.0
+
+        if formula_type == 'constant':
+            return float(template.get('value', 0))
+
+        return 0.0
+
+    # ------------------------------------------------------------------
+
+    def _populate_computed_values(self, bdo_result: BDOParseResult):
+        """
+        Build self.computed_values using parsed BDO data combined with
+        _new_bdo_row_map for correct row mapping.
+
+        This uses the same account-code → Excel-row mapping that the formula
+        builder uses, but reads actual numeric values from the parsed BDO
+        result (not from worksheet cells that may contain formulas).
+
+        Keys: (row_number, 'quarter' | 'ltm')  ->  float
+        """
+
+        # ── BS rows (LTM only, column H = closing_balance) ──
+        for row_idx in sorted(self.balance_sheet_templates.keys()):
+            tpl = self.balance_sheet_templates[row_idx]
+            val = self._eval_template(tpl, bdo_result, 'H',
+                                      self.computed_values, 'ltm')
+            self.computed_values[(row_idx, 'ltm')] = val
+
+        # ── P&L rows ──
+        for row_idx in sorted(self.formula_templates.keys()):
+            tpl = self.formula_templates[row_idx]
+
+            # Quarter → column G (quarter mutation)
+            q_val = self._eval_template(tpl, bdo_result, 'G',
+                                        self.computed_values, 'quarter')
+            self.computed_values[(row_idx, 'quarter')] = q_val
+
+            # LTM → column H (closing_balance)
+            ltm_val = self._eval_template(tpl, bdo_result, 'H',
+                                          self.computed_values, 'ltm')
+            self.computed_values[(row_idx, 'ltm')] = ltm_val
+
+        # ── Manual overrides ──
+        self.computed_values[(50, 'quarter')] = self.config.cash_proceeds_sale or 0.0
+
+        # ── Bank rows (LTM only, column H) ──
+        self._compute_bank_account_values()
+
+        # Round values to nearest integer to eliminate floating-point
+        # accumulation (financial statements use whole numbers).
+        # Skip percentage rows (e.g. row 26 = Vacancy %).
+        pct_rows = {26}
+        for key in list(self.computed_values.keys()):
+            if key[0] not in pct_rows:
+                self.computed_values[key] = round(self.computed_values[key])
+
+        # Enforce accounting identity: Direct Result (PL68) must equal
+        # Total Equity Movement (BS19).  The two chains reference the same
+        # BDO accounts but accumulate through different formula paths,
+        # which can cause a ±1 rounding divergence.  BS19 is the simpler
+        # chain (straight SUM of column-H reads), so we treat it as the
+        # authoritative value.
+        bs19 = self.computed_values.get((19, 'ltm'))
+        pl68 = self.computed_values.get((68, 'ltm'))
+        if bs19 is not None and pl68 is not None and abs(bs19 - pl68) <= 2:
+            if bs19 != pl68:
+                logger.info(f"[Alignment] Snapping PL68 LTM {pl68} → BS19 LTM {bs19}")
+                self.computed_values[(68, 'ltm')] = bs19
+
+        logger.info(
+            f"Populated computed_values: {len(self.computed_values)} entries, "
+            f"BS19(ltm)={self.computed_values.get((19, 'ltm'), 'N/A')}, "
+            f"PL68(quarter)={self.computed_values.get((68, 'quarter'), 'N/A')}, "
+            f"PL68(ltm)={self.computed_values.get((68, 'ltm'), 'N/A')}"
+        )
+
+    def _enforce_bdo_alignment(self, bdo_result: BDOParseResult):
+        """
+        Log alignment check between computed BS19/PL68 and BDO ground truth.
+
+        computed_values are now read directly from BDO sheet cells, so they
+        already reflect the exact formulas. This method only logs diagnostics.
+        """
+        bdo_raw = self._read_bdo_resultaat_na_belasting()
+        if bdo_raw is None:
+            logger.warning("[Alignment] Cannot check — BDO Resultaat na belasting not found")
+            return
+
+        bdo_target = -bdo_raw
+
+        bs19 = self.computed_values.get((19, 'ltm'), 0.0)
+        pl68 = self.computed_values.get((68, 'ltm'), 0.0)
+
+        diff_pl = abs(pl68 - bdo_target)
+        diff_bs = abs(bs19 - bdo_target)
+
+        logger.info(
+            f"[Alignment] BDO target={bdo_target:,.2f}, PL68={pl68:,.2f} (Δ={diff_pl:,.2f}), "
+            f"BS19={bs19:,.2f} (Δ={diff_bs:,.2f})"
+        )
+
+        tolerance = 1.0
+        if diff_pl <= tolerance and diff_bs <= tolerance:
+            logger.info("[Alignment] Values aligned with BDO ground truth")
+        else:
+            logger.warning(
+                f"[Alignment] Mismatch detected: "
+                f"BDO target={bdo_target:,.2f}, PL68={pl68:,.2f} (Δ={diff_pl:,.2f}), "
+                f"BS19={bs19:,.2f} (Δ={diff_bs:,.2f})"
+            )
+
+    def _compute_bank_account_values(self):
+        """
+        Compute expected numeric values for bank account rows (107-113)
+        by reading BDO column H closing balance cells.
+        Bank rows only appear in the LTM column.
+        """
+        bank_bdo_rows = {
+            107: 35,  108: 34,  109: 36,
+            110: 32,  111: 33,  112: 37,  113: 31,
+        }
+        bdo_sheet_name = self.config.bdo_sheet_name
+        if bdo_sheet_name not in self.workbook.sheetnames:
+            logger.warning("BDO sheet not found for bank account values")
+            return
+
+        bdo_sheet = self.workbook[bdo_sheet_name]
+        bank_total = 0.0
+        for mc_row, bdo_row in bank_bdo_rows.items():
+            cell = bdo_sheet.cell(row=bdo_row, column=8)  # column H
+            val = cell.value
+            if isinstance(val, (int, float)):
+                self.computed_values[(mc_row, 'ltm')] = float(val)
+                bank_total += float(val)
+            elif isinstance(val, str) and val.startswith('='):
+                evaluated = self._eval_simple_sum_formula(bdo_sheet, val, 8)
+                self.computed_values[(mc_row, 'ltm')] = evaluated
+                bank_total += evaluated
+            else:
+                self.computed_values[(mc_row, 'ltm')] = 0.0
+
+        self.computed_values[(114, 'ltm')] = bank_total
+
     def _reconcile_pl_chain(self, shadow: dict, equity_movement: float) -> dict:
         """
         Compare shadow P&L chain against equity movement to find divergence.

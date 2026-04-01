@@ -163,7 +163,8 @@ class QuarterlyReportOrchestrator:
         self.covenant_validator = CovenantValidator()
         self.reconciliation_validator = ReconciliationValidator()
         
-    def _run_ai_verification(self, ma_output: Path, bdo_result, results: dict) -> Path:
+    def _run_ai_verification(self, ma_output: Path, bdo_result, results: dict,
+                             computed_values: dict = None) -> Path:
         """
         Run AI verification on the generated Management Accounts workbook.
         Returns the path to use downstream (verified file if patches applied,
@@ -195,6 +196,7 @@ class QuarterlyReportOrchestrator:
                 workbook_path=str(ma_output),
                 bdo_source_path=str(self.config.bdo_file),
                 bdo_result=bdo_result,
+                computed_values=computed_values,
             )
 
             results['steps']['ai_verification'] = {
@@ -310,6 +312,7 @@ class QuarterlyReportOrchestrator:
                 bdo_source_path=str(self.config.bdo_file)  # Pass BDO file for direct copy
             )
             ma_builder.build(bdo_result)
+            ma_computed_values = getattr(ma_builder, 'computed_values', None) or {}
             
             ma_validation = getattr(ma_builder, 'validation_result', None)
             if ma_validation and not ma_validation.get('is_aligned', True):
@@ -322,11 +325,11 @@ class QuarterlyReportOrchestrator:
             }
             # Step 4a: AI Verification of Management Accounts (patches in-place)
             logger.info("Step 4a: Running AI verification on Management Accounts")
-            ma_verified = self._run_ai_verification(ma_output, bdo_result, results)
+            ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
             results['output_files'].append(str(ma_verified))
             
             # Step 4b: Build Compliance Certificate
-            # Uses the AI-verified MA file so any corrections are reflected downstream.
+            # Uses computed_values for exact value copy — no formula evaluation needed.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -338,7 +341,7 @@ class QuarterlyReportOrchestrator:
                 str(compliance_output),
                 compliance_config
             )
-            compliance_builder.build(bdo_result, str(ma_verified))
+            compliance_builder.build(bdo_result, str(ma_verified), computed_values=ma_computed_values)
             results['steps']['compliance_certificate'] = {
                 'status': 'success',
                 'output': str(compliance_output)
@@ -691,6 +694,7 @@ class QuarterlyReportOrchestrator:
                 bdo_source_path=str(self.config.bdo_file)
             )
             ma_builder.build(bdo_result)
+            ma_computed_values = getattr(ma_builder, 'computed_values', None) or {}
             
             ma_validation = getattr(ma_builder, 'validation_result', None)
             if ma_validation and not ma_validation.get('is_aligned', True):
@@ -703,11 +707,11 @@ class QuarterlyReportOrchestrator:
             }
             # Step 4a: AI Verification of Management Accounts (patches in-place)
             logger.info("Step 4a: Running AI verification on Management Accounts")
-            ma_verified = self._run_ai_verification(ma_output, bdo_result, results)
+            ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
             results['output_files'].append(str(ma_verified))
             
             # Step 4b: Build Compliance Certificate
-            # Uses the AI-verified MA file so any corrections are reflected downstream.
+            # Uses computed_values for exact value copy — no formula evaluation needed.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -719,7 +723,7 @@ class QuarterlyReportOrchestrator:
                 str(compliance_output),
                 compliance_config
             )
-            compliance_builder.build(bdo_result, str(ma_verified))
+            compliance_builder.build(bdo_result, str(ma_verified), computed_values=ma_computed_values)
             results['steps']['compliance_certificate'] = {
                 'status': 'success',
                 'output': str(compliance_output)

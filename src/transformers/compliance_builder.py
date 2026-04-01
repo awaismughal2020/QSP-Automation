@@ -82,6 +82,7 @@ class ComplianceBuilder:
         self.output_path = Path(output_path)
         self.config = config
         self.workbook = None
+        self._computed_values: Optional[dict] = None
         
     def _get_previous_period_end(self):
         """
@@ -106,18 +107,24 @@ class ComplianceBuilder:
         
         return datetime(prev_y, month, day)
         
-    def build(self, bdo_result: BDOParseResult, management_accounts_path: Optional[str] = None) -> Path:
+    def build(self, bdo_result: BDOParseResult, management_accounts_path: Optional[str] = None,
+              computed_values: Optional[dict] = None) -> Path:
         """
         Build new Compliance Certificate file.
         
         Args:
             bdo_result: Parsed BDO data for current quarter
             management_accounts_path: Path to Management Accounts file for data copy
+            computed_values: Pre-computed numeric values from MA builder
+                             {(row,'quarter'|'ltm'): float}. When provided,
+                             columns B and C are populated directly from this dict
+                             instead of parsing MA file formulas.
             
         Returns:
             Path to generated file
         """
         logger.info(f"Building Compliance Certificate for {self.config.quarter_str}")
+        self._computed_values = computed_values
         
         # Load previous quarter file
         self.workbook = openpyxl.load_workbook(self.previous_path)
@@ -180,9 +187,9 @@ class ComplianceBuilder:
             
             logger.info(f"Created new sheet: {new_ma_sheet_name} with structure from {old_sheet_name}")
             
-            # If we have a management accounts file, copy data from it
-            if management_accounts_path:
-                self._copy_ma_data(new_ma_sheet_name, management_accounts_path)
+            # Copy data: prefer computed_values cache, fall back to reading the file
+            if self._computed_values or management_accounts_path:
+                self._copy_ma_data(new_ma_sheet_name, management_accounts_path or "")
         else:
             logger.warning("No Management Accounts sheet found to update")
     
@@ -195,11 +202,13 @@ class ComplianceBuilder:
         - Column B: Kwartaal (quarterly) values
         - Column C: LTM values
         
-        The approach:
-        1. Load the CURRENT quarter's Management Accounts file
-        2. Find both the quarterly column and the LTM column
-        3. Copy quarterly values to column B, LTM values to column C
+        When computed_values is available (passed via build()), values are
+        copied directly — no formula parsing needed, guaranteeing an exact match.
         """
+        if self._computed_values:
+            self._copy_ma_data_from_cache(target_sheet_name)
+            return
+
         try:
             source_wb_data = openpyxl.load_workbook(source_path, data_only=True)
             source_wb_formulas = openpyxl.load_workbook(source_path, data_only=False)
@@ -284,8 +293,9 @@ class ComplianceBuilder:
             # Row mapping: target row in CC -> source row in Management Cijfers
             target_to_source_mapping = {}
             
-            # Balance Sheet section (target rows 2-17 -> source rows 3-18)
-            for target_row in range(2, 18):
+            # Balance Sheet section (target rows 2-18 -> source rows 3-19)
+            # Row 18 = Total Equity Movement (MA row 19)
+            for target_row in range(2, 19):
                 target_to_source_mapping[target_row] = target_row + 1
             
             # P&L section (target rows 22-67 -> source rows 23-68)
@@ -409,6 +419,103 @@ class ComplianceBuilder:
             import traceback
             traceback.print_exc()
     
+    def _copy_ma_data_from_cache(self, target_sheet_name: str):
+        """
+        Fast path: copy values from computed_values dict directly into CC columns B/C.
+        No formula parsing — guarantees exact match with the MA builder output.
+
+        Row mapping:
+          CC  2-17  → MA  3-18   (BS individual rows, LTM only — no quarter)
+          CC 18     → MA 19      (Total Equity Movement, LTM only)
+          CC 22-67  → MA 23-68   (P&L rows, quarter col B + LTM col C)
+          CC 72-78  → MA 107-113 (Bank rows, LTM only)
+          CC 79     → MA 114     (Bank Total, LTM only)
+        """
+        target_sheet = self.workbook[target_sheet_name]
+        cv = self._computed_values
+        period_end = self.config.period_end
+
+        # Accounting number format: negatives in parentheses
+        acct_fmt = '_(* #,##0_);_(* (#,##0);_(* "-"??_);_(@_)'
+
+        # ── BS rows: LTM only (CC 2-18 → MA 3-19) ──
+        bs_mapping = {}
+        for t in range(2, 19):               # CC rows 2-18 inclusive
+            bs_mapping[t] = t + 1            # MA rows 3-19 inclusive
+
+        # ── P&L rows: quarter + LTM (CC 22-67 → MA 23-68) ──
+        pl_mapping = {}
+        for t in range(22, 68):
+            pl_mapping[t] = t + 1
+
+        # ── Bank rows: LTM only (CC 72-78 → MA 107-113) ──
+        bank_mapping = {}
+        for t in range(72, 79):
+            bank_mapping[t] = t + 35
+
+        # ── Headers ──
+        target_sheet.cell(row=1, column=3).value = period_end
+        target_sheet.cell(row=1, column=3).number_format = 'YYYY-MM-DD'
+        target_sheet.cell(row=21, column=2).value = self.config.quarter_str
+        target_sheet.cell(row=21, column=3).value = f"LTM {self.config.quarter_str}"
+        target_sheet.cell(row=71, column=3).value = (
+            f"Per {period_end.day}-{period_end.month}-{period_end.year}"
+        )
+
+        q_copied = ltm_copied = 0
+
+        # ── BS: column C only (no quarter column for Balance Sheet) ──
+        for cc_row, src_row in bs_mapping.items():
+            ltm_val = cv.get((src_row, 'ltm'))
+            if ltm_val is not None:
+                cell = target_sheet.cell(row=cc_row, column=3)
+                cell.value = ltm_val
+                cell.number_format = acct_fmt
+                cell.font = Font(name='Calibri', size=11, color='000000')
+                ltm_copied += 1
+
+        # ── P&L: column B (quarter) + column C (LTM) ──
+        for cc_row, src_row in pl_mapping.items():
+            q_val = cv.get((src_row, 'quarter'))
+            ltm_val = cv.get((src_row, 'ltm'))
+
+            if q_val is not None:
+                cell = target_sheet.cell(row=cc_row, column=2)
+                cell.value = q_val
+                cell.number_format = acct_fmt
+                cell.font = Font(name='Calibri', size=11, color='000000')
+                q_copied += 1
+            if ltm_val is not None:
+                cell = target_sheet.cell(row=cc_row, column=3)
+                cell.value = ltm_val
+                cell.number_format = acct_fmt
+                cell.font = Font(name='Calibri', size=11, color='000000')
+                ltm_copied += 1
+
+        # ── Bank: column C only ──
+        for cc_row, src_row in bank_mapping.items():
+            ltm_val = cv.get((src_row, 'ltm'))
+            if ltm_val is not None:
+                cell = target_sheet.cell(row=cc_row, column=3)
+                cell.value = ltm_val
+                cell.number_format = acct_fmt
+                cell.font = Font(name='Calibri', size=11, color='000000')
+                ltm_copied += 1
+
+        # Bank Total: CC row 79 → MA row 114
+        bank_total = cv.get((114, 'ltm'))
+        if bank_total is not None:
+            cell = target_sheet.cell(row=79, column=3)
+            cell.value = bank_total
+            cell.number_format = acct_fmt
+            cell.font = Font(name='Calibri', size=11, color='000000')
+            ltm_copied += 1
+
+        logger.info(
+            f"[CC] Copied from computed_values to {target_sheet_name}: "
+            f"{q_copied} quarter (col B), {ltm_copied} LTM (col C)"
+        )
+
     def _evaluate_formula_with_internal_refs(self, formula: str, bdo_sheet, bdo_sheet_name: str,
                                                ltm_column: int, cijfers_sheet, evaluate_cell_func):
         """
@@ -1404,30 +1511,32 @@ class ComplianceBuilder:
             suppl_sheet.cell(row=7, column=target_column).value = None
             logger.info(f"Shifted row 7 values from {target_col_letter} onwards and cleared {target_col_letter}7")
             
-            # Create helper function to evaluate a cell's value
+            cv = getattr(self, '_computed_values', None) or {}
+
             def get_cell_value(row: int, col: int = source_column):
-                """Get a cell's value, evaluating formulas if needed."""
-                # Try cached value first
+                """Get a cell's value — prefer computed_values cache, then formula eval."""
+                if cv:
+                    col_key = 'ltm' if col == ltm_column else 'quarter'
+                    cached = cv.get((row, col_key))
+                    if cached is not None:
+                        return cached
+
                 cached_val = cijfers_sheet_data.cell(row=row, column=col).value
                 if cached_val is not None and isinstance(cached_val, (int, float)):
                     return cached_val
-                
-                # Try formula evaluation
+
                 formula = cijfers_sheet.cell(row=row, column=col).value
                 if formula and isinstance(formula, str) and formula.startswith('='):
-                    # Use the existing BDO evaluation logic
                     if bdo_sheet is not None:
                         result = self._evaluate_bdo_reference(formula, bdo_sheet, expected_bdo_name)
                         if result is not None:
                             return result
-                        
-                        # Try internal formula evaluation
                         result = self._evaluate_formula_with_internal_refs(
                             formula, bdo_sheet, expected_bdo_name, source_column, cijfers_sheet, get_cell_value
                         )
                         if result is not None:
                             return result
-                
+
                 return None
             
             # Now process each keyword in Suppl. Calc
