@@ -1,0 +1,34 @@
+# Accounting rules for Management Accounts generation and verification.
+#
+# These rules drive reconciliation, rounding, protected rows, and
+# bank-account mapping — keeping magic numbers out of Python code.
+
+identity_alignment:
+  # BS row 19 (Total Equity Movement) must equal PL row 68 (Direct Result)
+  # for LTM.  BS19 is authoritative because it is a direct SUM of column-H
+  # BDO reads; PL68 accumulates through a longer formula chain.
+  authoritative_row: 19
+  dependent_row: 68
+  scope: ltm_only            # ltm_only | quarter_and_ltm
+  max_snap_units: 2          # snap PL68 to BS19 when diff <= this
+  enforce_in_workbook: true  # set PL68 LTM cell to ={COL}19
+
+rounding:
+  round_to_integer: true
+  decimal_rows: [26]         # rows exempt from integer rounding (percentages)
+
+# Bank-account overview section in Management Cijfers.
+# Keys = MA row numbers, values = BDO Excel row numbers (column H).
+bank_bdo_row_map:
+  107: 35
+  108: 34
+  109: 36
+  110: 32
+  111: 33
+  112: 37
+  113: 31
+bank_total_row: 114          # SUM of the bank rows above
+
+# Rows whose values must not be overwritten by AI patches.
+# AI may still change upstream rows — these totals are calculated.
+protected_total_rows: [19, 68]

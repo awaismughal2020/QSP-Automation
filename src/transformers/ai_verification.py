@@ -563,6 +563,13 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
    BDO data via different paths). If they don't match, the workbook has an
    error. Report which row(s) appear wrong and generate a patch.
 
+   CRITICAL IDENTITY RULE: Row 19 (Total Equity Movement, LTM) and
+   Row 68 (Direct Result, LTM) MUST be equal. Row 19 is the authoritative
+   value. Do NOT emit a value patch for row 19 or row 68 directly — these
+   are computed totals. If they disagree, fix upstream rows that contribute
+   to them. Formula patches for these rows are acceptable only when the
+   formula itself is structurally wrong (e.g. wrong cell references).
+
 4. BDO GROUND TRUTH: The "Resultaat na belasting" raw value from BDO
    (sum of columns D-G), when NEGATED, should match both Shadow BS row 19
    and Shadow P&L row 68 within tolerance 1.0.
@@ -664,10 +671,27 @@ ALLOWLISTED_ROW_RANGE = range(1, 121)
 DISALLOWED_SHEET_REFS = ["BDO"]
 
 
+def _load_protected_rows() -> set:
+    """Load protected_total_rows from accounting_rules.yaml."""
+    try:
+        path = Path("config/accounting_rules.yaml")
+        if path.exists():
+            with open(path, 'r', encoding='utf-8') as f:
+                rules = yaml.safe_load(f) or {}
+            return set(rules.get('protected_total_rows', [19, 68]))
+    except Exception:
+        pass
+    return {19, 68}
+
+
+PROTECTED_TOTAL_ROWS = _load_protected_rows()
+
+
 class PatchApplier:
     """
     Applies JSON patches from Claude to the workbook.
     Strict allowlist: only Management Cijfers sheets, rows 1-120.
+    Protected total rows (from config) reject value patches.
     """
 
     def __init__(self, workbook_path: str, summary_sheet_name: str):
@@ -723,6 +747,14 @@ class PatchApplier:
 
         kind = patch.get('kind', '')
         value = patch.get('value', '')
+
+        if row in PROTECTED_TOTAL_ROWS and kind == 'value':
+            patch['rejection_reason'] = (
+                f"Row {row} is a protected total — value patches rejected; "
+                f"fix upstream rows instead"
+            )
+            logger.warning(f"Rejected patch: {patch['rejection_reason']}")
+            return False
 
         if kind == 'formula':
             if not isinstance(value, str) or not value.startswith('='):

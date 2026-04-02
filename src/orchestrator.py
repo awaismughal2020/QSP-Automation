@@ -229,6 +229,113 @@ class QuarterlyReportOrchestrator:
             results['warnings'].append(f"AI verification skipped: {e}")
             return ma_output
 
+    @staticmethod
+    def _verify_and_refresh(ma_path: Path, computed_values: dict,
+                            results: dict) -> dict:
+        """
+        Post-AI verification: open the final xlsx, read BS19 and PL68 from
+        the LTM column, warn on mismatch, and refresh computed_values so
+        Compliance receives the numbers actually in the file.
+        """
+        import openpyxl as _openpyxl
+        from openpyxl.utils import column_index_from_string as _cis
+
+        rules_path = Path("config/accounting_rules.yaml")
+        align = {'authoritative_row': 19, 'dependent_row': 68, 'max_snap_units': 2}
+        if rules_path.exists():
+            try:
+                with open(rules_path, 'r', encoding='utf-8') as f:
+                    rules = yaml.safe_load(f) or {}
+                align.update(rules.get('identity_alignment', {}))
+            except Exception:
+                pass
+
+        auth_row = align['authoritative_row']
+        dep_row = align['dependent_row']
+        max_snap = align['max_snap_units']
+
+        try:
+            wb = _openpyxl.load_workbook(str(ma_path), data_only=True)
+            mc_sheet = None
+            for sn in wb.sheetnames:
+                if 'Management Cijfers' in sn:
+                    mc_sheet = wb[sn]
+                    break
+            if mc_sheet is None:
+                wb.close()
+                return computed_values
+
+            ltm_col = None
+            for col_idx in range(1, mc_sheet.max_column + 1):
+                hdr = mc_sheet.cell(row=22, column=col_idx).value
+                if hdr and isinstance(hdr, str) and hdr.strip().upper().startswith('LTM'):
+                    ltm_col = col_idx
+                    break
+            if ltm_col is None:
+                for col_idx in range(mc_sheet.max_column, 0, -1):
+                    val = mc_sheet.cell(row=auth_row, column=col_idx).value
+                    if val is not None:
+                        ltm_col = col_idx
+                        break
+
+            if ltm_col is None:
+                wb.close()
+                return computed_values
+
+            auth_val = mc_sheet.cell(row=auth_row, column=ltm_col).value
+            dep_val = mc_sheet.cell(row=dep_row, column=ltm_col).value
+            wb.close()
+
+            def _to_num(v):
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
+            auth_num = _to_num(auth_val)
+            dep_num = _to_num(dep_val)
+
+            if auth_num is not None and dep_num is not None:
+                diff = abs(auth_num - dep_num)
+                if diff > max_snap:
+                    msg = (
+                        f"Post-AI check: row {auth_row} LTM={auth_num} vs "
+                        f"row {dep_row} LTM={dep_num} differ by {diff}"
+                    )
+                    logger.warning(msg)
+                    results.setdefault('warnings', []).append(msg)
+
+                computed_values[(auth_row, 'ltm')] = auth_num
+                computed_values[(dep_row, 'ltm')] = auth_num
+
+            elif auth_num is not None:
+                # dep_row was a formula (=COLauth_row) that data_only
+                # couldn't resolve — mirror the authoritative value
+                logger.info(
+                    f"Post-AI refresh: row {dep_row} returned None "
+                    f"(formula cell); setting to row {auth_row}={auth_num}")
+                computed_values[(auth_row, 'ltm')] = auth_num
+                computed_values[(dep_row, 'ltm')] = auth_num
+
+            else:
+                # Both None — openpyxl couldn't read cached values.
+                # Fall back to computed_values and enforce identity.
+                enforce_wb = align.get('enforce_in_workbook', False)
+                cv_auth = computed_values.get((auth_row, 'ltm'))
+                if enforce_wb and cv_auth is not None:
+                    logger.info(
+                        f"Post-AI refresh: file values unavailable; "
+                        f"enforcing identity from cache: "
+                        f"row {dep_row} LTM = row {auth_row} LTM = {cv_auth}")
+                    computed_values[(dep_row, 'ltm')] = cv_auth
+
+        except Exception as e:
+            logger.warning(f"Post-AI verification failed (non-fatal): {e}")
+
+        return computed_values
+
     def run(self, dry_run: bool = False) -> dict:
         """
         Execute the complete quarterly reporting workflow.
@@ -327,9 +434,12 @@ class QuarterlyReportOrchestrator:
             logger.info("Step 4a: Running AI verification on Management Accounts")
             ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
             results['output_files'].append(str(ma_verified))
+
+            # Step 4a.1: Post-AI verify BS19 vs PL68 and refresh computed_values
+            logger.info("Step 4a.1: Post-AI identity check & computed_values refresh")
+            ma_computed_values = self._verify_and_refresh(ma_verified, ma_computed_values, results)
             
             # Step 4b: Build Compliance Certificate
-            # Uses computed_values for exact value copy — no formula evaluation needed.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(
@@ -709,9 +819,12 @@ class QuarterlyReportOrchestrator:
             logger.info("Step 4a: Running AI verification on Management Accounts")
             ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
             results['output_files'].append(str(ma_verified))
+
+            # Step 4a.1: Post-AI verify BS19 vs PL68 and refresh computed_values
+            logger.info("Step 4a.1: Post-AI identity check & computed_values refresh")
+            ma_computed_values = self._verify_and_refresh(ma_verified, ma_computed_values, results)
             
             # Step 4b: Build Compliance Certificate
-            # Uses computed_values for exact value copy — no formula evaluation needed.
             logger.info("Step 4b: Building Compliance Certificate")
             compliance_output = self.config.output_dir / f"Compliance Certificate Berekening QSP - {self.config.quarter_str}_updated.xlsx"
             compliance_config = ComplianceConfig(

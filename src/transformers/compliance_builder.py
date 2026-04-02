@@ -511,6 +511,12 @@ class ComplianceBuilder:
             cell.font = Font(name='Calibri', size=11, color='000000')
             ltm_copied += 1
 
+        # Clear residual template values in the gap between P&L and Bank
+        # (CC rows 68-70 are not mapped and may contain stale data)
+        for gap_row in range(68, 71):
+            for gap_col in (2, 3):
+                target_sheet.cell(row=gap_row, column=gap_col).value = None
+
         logger.info(
             f"[CC] Copied from computed_values to {target_sheet_name}: "
             f"{q_copied} quarter (col B), {ltm_copied} LTM (col C)"

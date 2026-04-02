@@ -111,7 +111,69 @@ class ManagementAccountsBuilder:
         
         # Sheets that must never be modified (existing BDO/kwartaal sheets)
         self._protected_sheets: set = set()
-    
+
+        # Accounting rules (rounding, alignment, bank map, protected rows)
+        self._rules = self._load_accounting_rules()
+
+    # ------------------------------------------------------------------
+    # Config loader
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_accounting_rules() -> dict:
+        """
+        Load config/accounting_rules.yaml with safe defaults so the builder
+        works even if the file is missing.
+        """
+        defaults = {
+            'identity_alignment': {
+                'authoritative_row': 19,
+                'dependent_row': 68,
+                'scope': 'ltm_only',
+                'max_snap_units': 2,
+                'enforce_in_workbook': True,
+            },
+            'rounding': {
+                'round_to_integer': True,
+                'decimal_rows': [26],
+            },
+            'bank_bdo_row_map': {
+                107: 35, 108: 34, 109: 36,
+                110: 32, 111: 33, 112: 37, 113: 31,
+            },
+            'bank_total_row': 114,
+            'protected_total_rows': [19, 68],
+        }
+
+        path = Path("config/accounting_rules.yaml")
+        if not path.exists():
+            logger.warning("accounting_rules.yaml not found — using built-in defaults")
+            return defaults
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f) or {}
+
+            for section, fallback in defaults.items():
+                if section not in loaded:
+                    loaded[section] = fallback
+                elif isinstance(fallback, dict) and isinstance(loaded[section], dict):
+                    for key, val in fallback.items():
+                        loaded[section].setdefault(key, val)
+
+            # Ensure bank_bdo_row_map keys are ints
+            if 'bank_bdo_row_map' in loaded:
+                loaded['bank_bdo_row_map'] = {
+                    int(k): int(v)
+                    for k, v in loaded['bank_bdo_row_map'].items()
+                }
+
+            logger.info(f"Loaded accounting rules from {path}")
+            return loaded
+        except Exception as e:
+            logger.warning(f"Error loading accounting_rules.yaml: {e} — using defaults")
+            return defaults
+
     def _load_formula_templates(self) -> Dict[int, Dict[str, Any]]:
         """Load formula templates that define the account code mapping for each row."""
         templates = {}
@@ -807,11 +869,16 @@ class ManagementAccountsBuilder:
         # Update the LTM column with the current period end date
         ltm_date_cell = summary_sheet.cell(row=2, column=new_ltm_col)
         ltm_date_cell.value = self.config.period_end
-        # Copy styling from previous LTM date cell
+        # Copy styling from previous LTM date cell, force black text
         prev_ltm_date_cell = summary_sheet.cell(row=2, column=new_quarter_col + 1) if new_quarter_col + 1 <= summary_sheet.max_column else None
         if prev_ltm_date_cell and prev_ltm_date_cell.has_style:
             ltm_date_cell.number_format = prev_ltm_date_cell.number_format or 'YYYY-MM-DD'
-            ltm_date_cell.font = copy(prev_ltm_date_cell.font)
+            base = copy(prev_ltm_date_cell.font)
+            ltm_date_cell.font = Font(
+                name=base.name, size=base.size, bold=base.bold,
+                italic=base.italic, underline=base.underline,
+                color='000000',
+            )
             ltm_date_cell.alignment = copy(prev_ltm_date_cell.alignment)
             ltm_date_cell.border = copy(prev_ltm_date_cell.border)
             ltm_date_cell.fill = copy(prev_ltm_date_cell.fill)
@@ -838,18 +905,35 @@ class ManagementAccountsBuilder:
             elif cell.number_format == 'General':
                 cell.number_format = client_number_format
         
-        # LTM column: explicitly copy full styling from the previous quarter
-        # column to ensure fill (blue bar rows), font (green color for LTM
-        # values), border, and alignment are consistent across all rows.
-        for row_idx in range(23, summary_sheet.max_row + 1):
+        # LTM column: copy layout from the previous quarter column, then
+        # override font colour — black for data rows, white for header rows
+        # (rows that carry a blue/dark fill).
+        for row_idx in range(2, summary_sheet.max_row + 1):
             prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
             if prev_cell.has_style:
-                cell.font = copy(prev_cell.font)
+                base_font = copy(prev_cell.font)
                 cell.alignment = copy(prev_cell.alignment)
                 cell.border = copy(prev_cell.border)
                 cell.fill = copy(prev_cell.fill)
                 cell.number_format = prev_cell.number_format if prev_cell.number_format != 'General' else client_number_format
+
+                has_fill = (
+                    prev_cell.fill
+                    and prev_cell.fill.fgColor
+                    and prev_cell.fill.fgColor.rgb
+                    and str(prev_cell.fill.fgColor.rgb) not in ('00000000', '0', None)
+                    and prev_cell.fill.fill_type == 'solid'
+                )
+                target_color = 'FFFFFF' if has_fill else '000000'
+                cell.font = Font(
+                    name=base_font.name,
+                    size=base_font.size,
+                    bold=base_font.bold,
+                    italic=base_font.italic,
+                    underline=base_font.underline,
+                    color=target_color,
+                )
             elif cell.number_format == 'General':
                 cell.number_format = client_number_format
         
@@ -869,7 +953,10 @@ class ManagementAccountsBuilder:
         # Step 8: Update Bank Account Overview section (rows 104-120)
         self._update_bank_account_overview_section(summary_sheet, new_ltm_col)
         
-        # Step 9: Add new quarter column to column group (outline)
+        # Step 9: Enforce accounting identity in workbook (config-driven)
+        self._enforce_identity_formula(summary_sheet, new_ltm_col)
+
+        # Step 10: Add new quarter column to column group (outline)
         new_col_letter = get_column_letter(new_quarter_col)
         summary_sheet.column_dimensions[new_col_letter].outlineLevel = 1
         summary_sheet.column_dimensions[new_col_letter].hidden = False
@@ -938,6 +1025,26 @@ class ManagementAccountsBuilder:
         if updated_count > 0:
             logger.info(f"Updated {updated_count} LTM SUM formulas to include column {new_q_letter}")
     
+    def _enforce_identity_formula(self, sheet, ltm_col: int):
+        """
+        If accounting_rules.yaml has enforce_in_workbook: true, replace the
+        dependent row's LTM formula with a direct reference to the
+        authoritative row (e.g. row 68 LTM = ={COL}19).
+        """
+        align = self._rules.get('identity_alignment', {})
+        if not align.get('enforce_in_workbook', False):
+            return
+
+        auth_row = align.get('authoritative_row', 19)
+        dep_row = align.get('dependent_row', 68)
+        col_letter = get_column_letter(ltm_col)
+
+        formula = f"={col_letter}{auth_row}"
+        sheet.cell(row=dep_row, column=ltm_col).value = formula
+        logger.info(
+            f"[Identity] Set row {dep_row} LTM (col {col_letter}) "
+            f"to '{formula}' (referencing row {auth_row})")
+
     def _update_bank_account_overview_section(self, sheet, ltm_col: int):
         """
         Update the Bank Account Overview section (rows 104-120) in the LTM column.
@@ -2372,26 +2479,45 @@ class ManagementAccountsBuilder:
         # ── Bank rows (LTM only, column H) ──
         self._compute_bank_account_values()
 
-        # Round values to nearest integer to eliminate floating-point
-        # accumulation (financial statements use whole numbers).
-        # Skip percentage rows (e.g. row 26 = Vacancy %).
-        pct_rows = {26}
-        for key in list(self.computed_values.keys()):
-            if key[0] not in pct_rows:
-                self.computed_values[key] = round(self.computed_values[key])
+        # ── Rounding (from config) ──
+        rounding_cfg = self._rules.get('rounding', {})
+        if rounding_cfg.get('round_to_integer', True):
+            decimal_rows = set(rounding_cfg.get('decimal_rows', [26]))
+            for key in list(self.computed_values.keys()):
+                if key[0] not in decimal_rows:
+                    self.computed_values[key] = round(self.computed_values[key])
 
-        # Enforce accounting identity: Direct Result (PL68) must equal
-        # Total Equity Movement (BS19).  The two chains reference the same
-        # BDO accounts but accumulate through different formula paths,
-        # which can cause a ±1 rounding divergence.  BS19 is the simpler
-        # chain (straight SUM of column-H reads), so we treat it as the
-        # authoritative value.
-        bs19 = self.computed_values.get((19, 'ltm'))
-        pl68 = self.computed_values.get((68, 'ltm'))
-        if bs19 is not None and pl68 is not None and abs(bs19 - pl68) <= 2:
-            if bs19 != pl68:
-                logger.info(f"[Alignment] Snapping PL68 LTM {pl68} → BS19 LTM {bs19}")
-                self.computed_values[(68, 'ltm')] = bs19
+        # ── Identity alignment (from config) ──
+        align = self._rules.get('identity_alignment', {})
+        auth_row = align.get('authoritative_row', 19)
+        dep_row = align.get('dependent_row', 68)
+        max_snap = align.get('max_snap_units', 2)
+        scope = align.get('scope', 'ltm_only')
+        enforce_wb = align.get('enforce_in_workbook', False)
+
+        scopes = ['ltm'] if scope == 'ltm_only' else ['quarter', 'ltm']
+        for s in scopes:
+            auth_val = self.computed_values.get((auth_row, s))
+            dep_val = self.computed_values.get((dep_row, s))
+            if auth_val is not None and dep_val is not None:
+                diff = abs(auth_val - dep_val)
+                if enforce_wb and diff > 0:
+                    # Workbook formula guarantees identity — mirror in cache
+                    logger.info(
+                        f"[Alignment] enforce_in_workbook: setting row "
+                        f"{dep_row} {s} {dep_val} → row {auth_row} {s} "
+                        f"{auth_val} (diff={diff})")
+                    self.computed_values[(dep_row, s)] = auth_val
+                elif 0 < diff <= max_snap:
+                    logger.info(
+                        f"[Alignment] Snapping row {dep_row} {s} "
+                        f"{dep_val} → row {auth_row} {s} {auth_val}")
+                    self.computed_values[(dep_row, s)] = auth_val
+                elif diff > max_snap:
+                    logger.warning(
+                        f"[Alignment] Row {auth_row} {s}={auth_val} vs "
+                        f"row {dep_row} {s}={dep_val} differ by {diff} "
+                        f"(> max_snap {max_snap})")
 
         logger.info(
             f"Populated computed_values: {len(self.computed_values)} entries, "
@@ -2437,14 +2563,13 @@ class ManagementAccountsBuilder:
 
     def _compute_bank_account_values(self):
         """
-        Compute expected numeric values for bank account rows (107-113)
+        Compute expected numeric values for bank account rows
         by reading BDO column H closing balance cells.
-        Bank rows only appear in the LTM column.
+        Row mapping and total-row number come from accounting_rules.yaml.
         """
-        bank_bdo_rows = {
-            107: 35,  108: 34,  109: 36,
-            110: 32,  111: 33,  112: 37,  113: 31,
-        }
+        bank_bdo_rows = self._rules.get('bank_bdo_row_map', {})
+        bank_total_row = self._rules.get('bank_total_row', 114)
+
         bdo_sheet_name = self.config.bdo_sheet_name
         if bdo_sheet_name not in self.workbook.sheetnames:
             logger.warning("BDO sheet not found for bank account values")
@@ -2465,7 +2590,7 @@ class ManagementAccountsBuilder:
             else:
                 self.computed_values[(mc_row, 'ltm')] = 0.0
 
-        self.computed_values[(114, 'ltm')] = bank_total
+        self.computed_values[(bank_total_row, 'ltm')] = bank_total
 
     def _reconcile_pl_chain(self, shadow: dict, equity_movement: float) -> dict:
         """
