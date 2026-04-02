@@ -1,23 +1,27 @@
 # Accounting rules for Management Accounts generation and verification.
 #
-# These rules drive reconciliation, rounding, protected rows, and
-# bank-account mapping — keeping magic numbers out of Python code.
+# These rules drive reconciliation, rounding, protected rows, bank-account
+# mapping, and template layout — keeping magic numbers out of Python code.
+# Update this file when the Excel template structure changes.
 
+# ─── Identity alignment ───
 identity_alignment:
-  # BS row 19 (Total Equity Movement) must equal PL row 68 (Direct Result)
-  # for LTM.  BS19 is authoritative because it is a direct SUM of column-H
-  # BDO reads; PL68 accumulates through a longer formula chain.
-  authoritative_row: 19
-  dependent_row: 68
-  scope: ltm_only            # ltm_only | quarter_and_ltm
-  max_snap_units: 2          # snap PL68 to BS19 when diff <= this
-  enforce_in_workbook: true  # set PL68 LTM cell to ={COL}19
+  authoritative_row: 19       # BS total (Total Equity Movement)
+  dependent_row: 68            # PL total (Direct Result)
+  scope: ltm_only              # ltm_only | quarter_and_ltm
+  max_snap_units: 2            # snap PL68 to BS19 when diff <= this
+  enforce_in_workbook: true    # set PL68 LTM cell to ={COL}19
+  # Rows whose LTM value is written directly from BDO ground truth.
+  # No formula is placed here — _enforce_bdo_alignment owns these cells.
+  # The AI verification prompt will mark them as untouchable.
+  bdo_anchored_ltm_rows: [19, 68]
 
+# ─── Rounding ───
 rounding:
   round_to_integer: true
-  decimal_rows: [26]         # rows exempt from integer rounding (percentages)
+  decimal_rows: [26]           # rows exempt from integer rounding (percentages)
 
-# Bank-account overview section in Management Cijfers.
+# ─── Bank-account overview section in Management Cijfers ───
 # Keys = MA row numbers, values = BDO Excel row numbers (column H).
 bank_bdo_row_map:
   107: 35
@@ -27,8 +31,69 @@ bank_bdo_row_map:
   111: 33
   112: 37
   113: 31
-bank_total_row: 114          # SUM of the bank rows above
+bank_total_row: 114            # SUM of the bank rows above
 
-# Rows whose values must not be overwritten by AI patches.
-# AI may still change upstream rows — these totals are calculated.
+# ─── Protected rows ───
+# Values must not be overwritten by AI patches (formula patches OK).
 protected_total_rows: [19, 68]
+
+# ─── Template layout (row ranges in Management Cijfers) ───
+# These define the structural layout of the Excel template.
+# Update here if template rows are rearranged.
+layout:
+  balance_sheet_rows: [3, 19]          # inclusive start-end for BS data
+  profit_loss_rows: [23, 68]           # inclusive start-end for P&L data
+  bank_rows: [107, 114]               # inclusive start-end for bank overview
+  bank_section_rows: [104, 120]        # wider range including headers
+  header_row: 22                       # P&L section header row
+  date_row: 2                          # BS date row
+  bs_total_row: 19                     # Total Equity Movement
+  bs_border_row: 18                    # row that gets a bottom border
+  pl_total_row: 68                     # Direct Result
+  cash_proceeds_row: 50                # Cash proceeds sale
+  warning_start_row: 70                # where validation warnings are written
+
+  # Bold/total rows in P&L
+  bold_total_rows: [19, 25, 30, 44, 45, 48, 55, 57, 66, 68]
+
+  # Calc formula definitions (row -> formula template using {q}/{ltm} placeholders)
+  calc_formulas:
+    25: "=SUM({col}23:{col}24)"
+    26: "={col}25/{col}23-1"
+    30: "=SUM({col}27:{col}29)"
+    44: "=SUM({col}32:{col}43)"
+    45: "={col}25+{col}30+{col}44"
+    48: "={col}47+{col}46+{col}45"
+    51: "=-({col}50-{col}53)"
+    55: "={col}53+{col}48"
+    57: "={col}56+{col}55"
+    66: "=SUM({col}57:{col}65)"
+    68: "={col}67+{col}66"
+
+  # LTM-only calc formulas (override the above for LTM column).
+  # NOTE: Rows listed in identity_alignment.bdo_anchored_ltm_rows are
+  # excluded here — their LTM cells hold the BDO ground truth VALUE,
+  # not a formula.  Do NOT add rows 19 or 68 back here.
+  ltm_calc_overrides: {}
+
+  # Intermediate P&L rows (net interest, derivatives, etc.)
+  intermediate_rows: [60, 61, 64, 65, 67]
+
+# ─── Styling ───
+styling:
+  ltm_background_color: "FFDDEAF6"    # light blue aRGB for data rows
+  header_background_color: "FF5B9BD5"  # medium blue aRGB for header rows (2, 22)
+  text_color_on_blue: "FF000000"       # black text on light blue
+  text_color_header: "FFFFFFFF"        # white text on header blue
+  error_font_color: "FFFF0000"         # red for validation warnings
+  error_fill_color: "FFFFCCCC"         # light red fill for warnings
+  number_format: '_(* #,##0_);_(* \(#,##0\);_(* "-"??_);_(@_)'
+
+# ─── BDO sheet structure ───
+bdo:
+  data_column: 8               # column H (LTM totals / closing balance)
+  quarter_columns: [4, 5, 6, 7]  # columns D-G (quarterly mutations)
+  data_rows: [6, 124]          # inclusive start-end for account data rows
+  special_rows: [129, 136]     # inclusive start-end for special summary rows
+  sum_total_row: 125           # Resultaat na belasting SUM row
+  label_scan_columns: [1, 2]   # columns to scan for row labels

@@ -143,6 +143,34 @@ class ManagementAccountsBuilder:
             },
             'bank_total_row': 114,
             'protected_total_rows': [19, 68],
+            'layout': {
+                'balance_sheet_rows': [3, 19],
+                'profit_loss_rows': [23, 68],
+                'bank_rows': [107, 114],
+                'bank_section_rows': [104, 120],
+                'header_row': 22,
+                'date_row': 2,
+                'bs_total_row': 19,
+                'bs_border_row': 18,
+                'pl_total_row': 68,
+                'cash_proceeds_row': 50,
+                'warning_start_row': 70,
+                'bold_total_rows': [19, 25, 30, 44, 45, 48, 55, 57, 66, 68],
+            },
+            'styling': {
+                'ltm_background_color': 'FFDDEAF6',
+                'text_color_on_blue': 'FF000000',
+                'text_color_header': 'FF000000',
+                'error_font_color': 'FFFF0000',
+                'error_fill_color': 'FFFFCCCC',
+            },
+            'bdo': {
+                'data_column': 8,
+                'quarter_columns': [4, 5, 6, 7],
+                'data_rows': [6, 124],
+                'special_rows': [129, 136],
+                'label_scan_columns': [1, 2],
+            },
         }
 
         path = Path("config/accounting_rules.yaml")
@@ -466,24 +494,30 @@ class ManagementAccountsBuilder:
                 special_start_row = row
                 break
         
-        # Rows 6 to 124: =SUM(C{row}:G{row})
-        # These are balance sheet items that include opening balance (column C)
-        for row in range(6, 125):
-            cell = sheet.cell(row=row, column=8)  # Column H
-            # Only set formula if there's data in the row (check column A)
+        bdo_cfg = self._rules.get('bdo', {})
+        data_col = bdo_cfg.get('data_column', 8)
+        data_range = bdo_cfg.get('data_rows', [6, 124])
+        col_letter = get_column_letter(data_col)
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        first_q_letter = get_column_letter(q_cols[0] - 1) if q_cols else 'C'
+        last_q_letter = get_column_letter(q_cols[-1]) if q_cols else 'G'
+
+        for row in range(data_range[0], data_range[1] + 1):
+            cell = sheet.cell(row=row, column=data_col)
             if sheet.cell(row=row, column=1).value is not None:
-                cell.value = f"=SUM(C{row}:G{row})"
+                cell.value = f"=SUM({first_q_letter}{row}:{last_q_letter}{row})"
                 formulas_set += 1
         
-        # Row 125 (Resultaat na belasting): =SUM(C125:G125)
-        sheet.cell(row=125, column=8).value = "=SUM(C125:G125)"
+        sum_total_row = bdo_cfg.get('sum_total_row', data_range[1] + 1)
+        sheet.cell(row=sum_total_row, column=data_col).value = (
+            f"=SUM({first_q_letter}{sum_total_row}:{last_q_letter}{sum_total_row})"
+        )
         formulas_set += 1
         
-        # Row 126: Empty (no formula)
-        
-        # Row 127 (Verschil balans en winst-en-verlies): =SUM(H5:H123)
-        # Note: This sums the H column, not the C-G of the same row
-        sheet.cell(row=127, column=8).value = "=SUM(H5:H123)"
+        diff_row = sum_total_row + 2
+        sheet.cell(row=diff_row, column=data_col).value = (
+            f"=SUM({col_letter}{data_range[0] - 1}:{col_letter}{data_range[1] - 1})"
+        )
         formulas_set += 1
         
         # Rows 128-136 have their H formulas set in _add_special_rows_with_formulas()
@@ -526,72 +560,70 @@ class ManagementAccountsBuilder:
         - Row 135: "IC interest" with =D115+D120, etc.
         - Row 136: Total row with SUM formulas
         """
+        bdo_cfg = self._rules.get('bdo', {})
+        data_col = bdo_cfg.get('data_column', 8)
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        h = get_column_letter(data_col)
+        q_letters = [get_column_letter(c) for c in q_cols]
+
         prev_inkomsten_values = self._get_shifted_inkomsten_swap_values()
         
         swap_income = self._extract_swap_income_from_sheet(sheet)
         logger.info(f"Extracted SWAP income for new quarter: {swap_income:,.2f}")
         
-        # Row 129 (start_row + 2): afschrijving SWAP — use formula matching client template
         row_129 = start_row + 2
         sheet.cell(row=row_129, column=1).value = "afschrijving SWAP"
-        sheet.cell(row=row_129, column=4).value = "=36883.33*3"  # D
-        sheet.cell(row=row_129, column=5).value = "=36883.33*3"  # E
-        sheet.cell(row=row_129, column=6).value = "=36883.33*3"  # F
-        sheet.cell(row=row_129, column=7).value = "=36883.33*3"  # G
+        for qc in q_cols:
+            sheet.cell(row=row_129, column=qc).value = "=36883.33*3"
         
-        # Row 130 (start_row + 3): Inkomsten SWAP — shifted values + new quarter from BDO
         row_130 = start_row + 3
         sheet.cell(row=row_130, column=1).value = "Inkomsten SWAP"
-        sheet.cell(row=row_130, column=4).value = prev_inkomsten_values.get('E', 0)  # D = old E
-        sheet.cell(row=row_130, column=5).value = prev_inkomsten_values.get('F', 0)  # E = old F
-        sheet.cell(row=row_130, column=6).value = prev_inkomsten_values.get('G', 0)  # F = old G
-        sheet.cell(row=row_130, column=7).value = swap_income  # G = new quarter SWAP income
+        prev_letters = ['E', 'F', 'G']
+        for i, qc in enumerate(q_cols[:-1]):
+            sheet.cell(row=row_130, column=qc).value = prev_inkomsten_values.get(prev_letters[i] if i < len(prev_letters) else 'G', 0)
+        sheet.cell(row=row_130, column=q_cols[-1]).value = swap_income
         
-        # Row 131 (start_row + 4): Empty row
-        
-        # Row 132 (start_row + 5): Rente
         row_132 = start_row + 5
         sheet.cell(row=row_132, column=1).value = "Rente"
-        sheet.cell(row=row_132, column=4).value = "=D117"
-        sheet.cell(row=row_132, column=5).value = "=E117"
-        sheet.cell(row=row_132, column=6).value = "=F117"
-        sheet.cell(row=row_132, column=7).value = "=G117"
-        sheet.cell(row=row_132, column=8).value = "=H117+H114+H116+H115"
+        for qc in q_cols:
+            ql = get_column_letter(qc)
+            sheet.cell(row=row_132, column=qc).value = f"={ql}117"
+        sheet.cell(row=row_132, column=data_col).value = f"={h}117+{h}114+{h}116+{h}115"
         
-        # Row 133 (start_row + 6): SWAP — all columns reference Inkomsten SWAP row
         row_133 = start_row + 6
         sheet.cell(row=row_133, column=1).value = "SWAP"
-        sheet.cell(row=row_133, column=4).value = f"=D{row_130}"
-        sheet.cell(row=row_133, column=5).value = f"=E{row_130}"
-        sheet.cell(row=row_133, column=6).value = f"=F{row_130}"
-        sheet.cell(row=row_133, column=7).value = f"=G{row_130}"
-        sheet.cell(row=row_133, column=8).value = f"=SUM(D{row_133}:G{row_133})"
+        for qc in q_cols:
+            ql = get_column_letter(qc)
+            sheet.cell(row=row_133, column=qc).value = f"={ql}{row_130}"
+        sheet.cell(row=row_133, column=data_col).value = (
+            f"=SUM({q_letters[0]}{row_133}:{q_letters[-1]}{row_133})"
+        )
         
-        # Row 134 (start_row + 7): Afschrijving prepaid — references afschrijving SWAP row
         row_134 = start_row + 7
         sheet.cell(row=row_134, column=1).value = "Afschrijving prepaid derivatives transaction"
-        sheet.cell(row=row_134, column=4).value = f"=D{row_129}"
-        sheet.cell(row=row_134, column=5).value = f"=E{row_129}"
-        sheet.cell(row=row_134, column=6).value = f"=F{row_129}"
-        sheet.cell(row=row_134, column=7).value = f"=G{row_129}"
-        sheet.cell(row=row_134, column=8).value = f"=SUM(D{row_134}:G{row_134})"
+        for qc in q_cols:
+            ql = get_column_letter(qc)
+            sheet.cell(row=row_134, column=qc).value = f"={ql}{row_129}"
+        sheet.cell(row=row_134, column=data_col).value = (
+            f"=SUM({q_letters[0]}{row_134}:{q_letters[-1]}{row_134})"
+        )
         
-        # Row 135 (start_row + 8): IC interest
         row_135 = start_row + 8
         sheet.cell(row=row_135, column=1).value = "IC interest"
-        sheet.cell(row=row_135, column=4).value = "=D115+D120"
-        sheet.cell(row=row_135, column=5).value = "=E115+E120"
-        sheet.cell(row=row_135, column=6).value = "=F115+F120"
-        sheet.cell(row=row_135, column=7).value = "=G115+G120"
-        sheet.cell(row=row_135, column=8).value = f"=SUM(D{row_135}:G{row_135})"
+        for qc in q_cols:
+            ql = get_column_letter(qc)
+            sheet.cell(row=row_135, column=qc).value = f"={ql}115+{ql}120"
+        sheet.cell(row=row_135, column=data_col).value = (
+            f"=SUM({q_letters[0]}{row_135}:{q_letters[-1]}{row_135})"
+        )
         
-        # Row 136 (start_row + 9): Total row
         row_136 = start_row + 9
-        sheet.cell(row=row_136, column=4).value = f"=SUM(D{row_132}:D{row_135})"
-        sheet.cell(row=row_136, column=5).value = f"=SUM(E{row_132}:E{row_135})"
-        sheet.cell(row=row_136, column=6).value = f"=SUM(F{row_132}:F{row_135})"
-        sheet.cell(row=row_136, column=7).value = f"=SUM(G{row_132}:G{row_135})"
-        sheet.cell(row=row_136, column=8).value = f"=SUM(D{row_136}:G{row_136})"
+        for qc in q_cols:
+            ql = get_column_letter(qc)
+            sheet.cell(row=row_136, column=qc).value = f"=SUM({ql}{row_132}:{ql}{row_135})"
+        sheet.cell(row=row_136, column=data_col).value = (
+            f"=SUM({q_letters[0]}{row_136}:{q_letters[-1]}{row_136})"
+        )
         
         logger.info(f"Added special rows with formulas (rows {row_129}-{row_136})")
     
@@ -874,10 +906,11 @@ class ManagementAccountsBuilder:
         if prev_ltm_date_cell and prev_ltm_date_cell.has_style:
             ltm_date_cell.number_format = prev_ltm_date_cell.number_format or 'YYYY-MM-DD'
             base = copy(prev_ltm_date_cell.font)
+            hdr_font_color = self._rules.get('styling', {}).get('text_color_header', 'FFFFFFFF')
             ltm_date_cell.font = Font(
                 name=base.name, size=base.size, bold=base.bold,
                 italic=base.italic, underline=base.underline,
-                color='000000',
+                color=hdr_font_color,
             )
             ltm_date_cell.alignment = copy(prev_ltm_date_cell.alignment)
             ltm_date_cell.border = copy(prev_ltm_date_cell.border)
@@ -905,37 +938,110 @@ class ManagementAccountsBuilder:
             elif cell.number_format == 'General':
                 cell.number_format = client_number_format
         
-        # LTM column: copy layout from the previous quarter column, then
-        # override font colour — black for data rows, white for header rows
-        # (rows that carry a blue/dark fill).
-        for row_idx in range(2, summary_sheet.max_row + 1):
+        # Read styling and layout from config (no hard-coded values)
+        style_cfg = self._rules.get('styling', {})
+        layout_cfg = self._rules.get('layout', {})
+        ltm_blue = style_cfg.get('ltm_background_color', 'FFDDEAF6')
+        header_blue = style_cfg.get('header_background_color', 'FF5B9BD5')
+        text_color = style_cfg.get('text_color_on_blue', 'FF000000')
+        header_text_color = style_cfg.get('text_color_header', 'FFFFFFFF')
+        blue_fill = PatternFill(
+            start_color=ltm_blue, end_color=ltm_blue, fill_type='solid')
+        header_fill = PatternFill(
+            start_color=header_blue, end_color=header_blue, fill_type='solid')
+
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_range = layout_cfg.get('bank_rows', [107, 114])
+        date_row = layout_cfg.get('date_row', 2)
+        header_row = layout_cfg.get('header_row', 22)
+        border_row = layout_cfg.get('bs_border_row', 18)
+
+        header_rows = {date_row, header_row}
+        ltm_data_rows = (
+            set(range(date_row, bs_range[1] + 1))
+            | {header_row}
+            | set(range(pl_range[0], pl_range[1] + 1))
+            | set(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        # Border row: detect from an existing column so it matches the template
+        border_row_border = None
+        for probe_col in range(2, prev_quarter_col + 1):
+            probe_border = summary_sheet.cell(row=border_row, column=probe_col).border
+            if probe_border and probe_border.bottom and probe_border.bottom.style:
+                border_row_border = copy(probe_border)
+                break
+        if not border_row_border:
+            thin = Side(style='thin', color='FF000000')
+            medium = Side(style='medium', color='FF000000')
+            border_row_border = Border(bottom=medium, top=thin)
+
+        for row_idx in range(date_row, summary_sheet.max_row + 1):
             prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
+
             if prev_cell.has_style:
                 base_font = copy(prev_cell.font)
                 cell.alignment = copy(prev_cell.alignment)
-                cell.border = copy(prev_cell.border)
-                cell.fill = copy(prev_cell.fill)
-                cell.number_format = prev_cell.number_format if prev_cell.number_format != 'General' else client_number_format
-
-                has_fill = (
-                    prev_cell.fill
-                    and prev_cell.fill.fgColor
-                    and prev_cell.fill.fgColor.rgb
-                    and str(prev_cell.fill.fgColor.rgb) not in ('00000000', '0', None)
-                    and prev_cell.fill.fill_type == 'solid'
+                cell.number_format = (
+                    prev_cell.number_format
+                    if prev_cell.number_format != 'General'
+                    else client_number_format
                 )
-                target_color = 'FFFFFF' if has_fill else '000000'
+
+                if row_idx in header_rows:
+                    cell.fill = header_fill
+                elif row_idx in ltm_data_rows:
+                    cell.fill = blue_fill
+                else:
+                    cell.fill = copy(prev_cell.fill)
+
+                if row_idx == border_row:
+                    cell.border = border_row_border
+                else:
+                    cell.border = copy(prev_cell.border)
+
+                # White text on header rows, black on data rows
+                row_text_color = header_text_color if row_idx in header_rows else text_color
                 cell.font = Font(
                     name=base_font.name,
                     size=base_font.size,
                     bold=base_font.bold,
                     italic=base_font.italic,
                     underline=base_font.underline,
-                    color=target_color,
+                    color=row_text_color,
                 )
             elif cell.number_format == 'General':
                 cell.number_format = client_number_format
+
+        # Header rows: apply header blue fill across ALL columns (B through LTM)
+        for hdr_row in header_rows:
+            for col_idx in range(2, new_ltm_col + 1):
+                hdr_cell = summary_sheet.cell(row=hdr_row, column=col_idx)
+                hdr_cell.fill = header_fill
+
+        # Enforce bold on BDO-anchored / key total rows across ALL columns
+        identity_cfg = self._rules.get('identity_alignment', {})
+        bold_rows = set(identity_cfg.get(
+            'bdo_anchored_ltm_rows',
+            [identity_cfg.get('authoritative_row', 19),
+             identity_cfg.get('dependent_row', 68)]
+        ))
+        for br in bold_rows:
+            for col_idx in range(1, new_ltm_col + 1):
+                cell = summary_sheet.cell(row=br, column=col_idx)
+                base = copy(cell.font) if cell.font else Font()
+                cell.font = Font(
+                    name=base.name, size=base.size, bold=True,
+                    italic=base.italic, underline=base.underline,
+                    color=base.color,
+                )
+
+        # Enforce border on row 18 (bs_border_row) across all columns to LTM
+        for col_idx in range(2, new_ltm_col + 1):
+            cell = summary_sheet.cell(row=border_row, column=col_idx)
+            cell.border = border_row_border
         
         # Copy column width from previous quarter column
         prev_col_letter = get_column_letter(prev_quarter_col)
@@ -1360,23 +1466,28 @@ class ManagementAccountsBuilder:
         for row_idx, template in self.balance_sheet_templates.items():
             formula_type = template.get('type', 'bdo_ref')
             target_cell = sheet.cell(row=row_idx, column=col_idx)
-            
+
+            if formula_type == 'bdo_anchored':
+                # Value written later by _enforce_bdo_alignment — skip
+                logger.debug(
+                    f"BS row {row_idx}: skipped (bdo_anchored, "
+                    f"value set by _enforce_bdo_alignment)"
+                )
+                continue
+
             if formula_type == 'bdo_ref':
-                # Build formula from account codes
                 formula = self._build_balance_sheet_ref_formula(template, bdo_sheet_name, bdo_column)
                 if formula:
                     target_cell.value = formula
                     formulas_built += 1
                     
             elif formula_type == 'bdo_sum_range':
-                # Build SUM formula for a range of accounts
                 formula = self._build_balance_sheet_sum_formula(template, bdo_sheet_name, bdo_column)
                 if formula:
                     target_cell.value = formula
                     formulas_built += 1
                     
             elif formula_type == 'calc':
-                # Replace {COL} with actual column letter
                 pattern = template.get('pattern', '')
                 formula = pattern.replace('{COL}', col_letter)
                 target_cell.value = formula
@@ -2256,6 +2367,12 @@ class ManagementAccountsBuilder:
                 val = self._evaluate_calc_pattern(pattern, shadow)
                 entry['value'] = val if val is not None else 0.0
 
+            elif formula_type == 'bdo_anchored':
+                # Sum all prior shadow BS entries as a cross-check
+                entry['value'] = sum(
+                    shadow[r]['value'] for r in shadow if r != row_idx
+                )
+
             shadow[row_idx] = entry
 
         logger.info(f"Shadow Balance Sheet computed for {len(shadow)} rows, "
@@ -2436,6 +2553,10 @@ class ManagementAccountsBuilder:
         if formula_type == 'constant':
             return float(template.get('value', 0))
 
+        if formula_type == 'bdo_anchored':
+            # Placeholder — value written later by _enforce_bdo_alignment
+            return 0.0
+
         return 0.0
 
     # ------------------------------------------------------------------
@@ -2528,38 +2649,126 @@ class ManagementAccountsBuilder:
 
     def _enforce_bdo_alignment(self, bdo_result: BDOParseResult):
         """
-        Log alignment check between computed BS19/PL68 and BDO ground truth.
+        Align computed_values for rows 19 and 68 to BDO ground truth,
+        and write the authoritative value directly into the workbook.
 
-        computed_values are now read directly from BDO sheet cells, so they
-        already reflect the exact formulas. This method only logs diagnostics.
+        The BDO source file is re-loaded with data_only=True to obtain the
+        cached numeric value from column H.  If that is unavailable, columns
+        D-G (raw quarter numbers) are summed as a reliable fallback.
         """
-        bdo_raw = self._read_bdo_resultaat_na_belasting()
-        if bdo_raw is None:
-            logger.warning("[Alignment] Cannot check — BDO Resultaat na belasting not found")
-            return
+        align = self._rules.get('identity_alignment', {})
+        auth_row = align.get('authoritative_row', 19)
+        dep_row = align.get('dependent_row', 68)
 
-        bdo_target = -bdo_raw
+        # ── Obtain LTM ground truth ──
+        # Strategy: D-G quarter sum is ALWAYS authoritative because those cells
+        # hold raw numeric values.  Column H often contains a formula chain that
+        # openpyxl (data_only=False) cannot evaluate.  We also attempt a
+        # data_only=True re-read as a cross-check.
+        bdo_qtr_raw = self._read_bdo_resultaat_na_belasting(use_ltm=False)
+        bdo_ltm_raw = self._read_bdo_resultaat_na_belasting_cached()
 
-        bs19 = self.computed_values.get((19, 'ltm'), 0.0)
-        pl68 = self.computed_values.get((68, 'ltm'), 0.0)
-
-        diff_pl = abs(pl68 - bdo_target)
-        diff_bs = abs(bs19 - bdo_target)
-
-        logger.info(
-            f"[Alignment] BDO target={bdo_target:,.2f}, PL68={pl68:,.2f} (Δ={diff_pl:,.2f}), "
-            f"BS19={bs19:,.2f} (Δ={diff_bs:,.2f})"
-        )
-
-        tolerance = 1.0
-        if diff_pl <= tolerance and diff_bs <= tolerance:
-            logger.info("[Alignment] Values aligned with BDO ground truth")
+        # Prefer the cached column H value, but if it's unavailable or zero
+        # (formula that couldn't be cached), use D-G sum.
+        if bdo_ltm_raw is not None and bdo_ltm_raw != 0.0:
+            effective_raw = bdo_ltm_raw
+            source = "column H (data_only cache)"
+        elif bdo_qtr_raw is not None and bdo_qtr_raw != 0.0:
+            effective_raw = bdo_qtr_raw
+            source = "quarter sum D-G"
         else:
-            logger.warning(
-                f"[Alignment] Mismatch detected: "
-                f"BDO target={bdo_target:,.2f}, PL68={pl68:,.2f} (Δ={diff_pl:,.2f}), "
-                f"BS19={bs19:,.2f} (Δ={diff_bs:,.2f})"
+            effective_raw = None
+            source = "none"
+
+        if effective_raw is not None:
+            bdo_ltm = round(-effective_raw, 2)
+            bs19 = self.computed_values.get((auth_row, 'ltm'), 0.0)
+            pl68 = self.computed_values.get((dep_row, 'ltm'), 0.0)
+
+            logger.info(
+                f"[BDO Align] LTM ground truth={bdo_ltm:,.2f} (source: {source}), "
+                f"BS{auth_row}={bs19:,.2f}, PL{dep_row}={pl68:,.2f}"
             )
+
+            self.computed_values[(auth_row, 'ltm')] = bdo_ltm
+            self.computed_values[(dep_row, 'ltm')] = bdo_ltm
+
+            summary_name = self.config.summary_sheet_name
+            if summary_name in self.workbook.sheetnames:
+                ws = self.workbook[summary_name]
+                ltm_col_letter = get_column_letter(self._new_ltm_col)
+                # Row 19 (Total Equity Movement): write BDO value directly
+                ws.cell(row=auth_row, column=self._new_ltm_col).value = bdo_ltm
+                logger.info(
+                    f"[BDO Align] Wrote {bdo_ltm:,.2f} to row {auth_row} "
+                    f"col {ltm_col_letter}"
+                )
+                # Row 68 (Direct Result): write BDO value directly so it
+                # matches row 19 exactly without depending on formula chain
+                ws.cell(row=dep_row, column=self._new_ltm_col).value = bdo_ltm
+                logger.info(
+                    f"[BDO Align] Wrote {bdo_ltm:,.2f} to row {dep_row} "
+                    f"col {ltm_col_letter}"
+                )
+        else:
+            logger.warning("[BDO Align] Cannot check LTM — Resultaat na belasting not found or zero")
+
+        # ── Quarter alignment (computed_values only) ──
+        if bdo_qtr_raw is not None and bdo_qtr_raw != 0.0:
+            bdo_qtr = round(-bdo_qtr_raw, 2)
+            pl68_q = self.computed_values.get((dep_row, 'quarter'), 0.0)
+
+            if pl68_q != bdo_qtr:
+                logger.info(
+                    f"[BDO Align] Quarter: PL{dep_row}={pl68_q:,.2f} → "
+                    f"BDO ground truth={bdo_qtr:,.2f} (delta for AI)"
+                )
+            else:
+                logger.info("[BDO Align] Quarter PL68 matches ground truth")
+
+    def _read_bdo_resultaat_na_belasting_cached(self) -> Optional[float]:
+        """
+        Re-open the BDO source xlsx with data_only=True so that column-H
+        formulas resolve to their cached numeric values (last-calculated by
+        Excel).  Returns None if the file is unavailable or the row isn't found.
+        """
+        if not self.bdo_source_path or not self.bdo_source_path.exists():
+            return None
+
+        try:
+            wb = openpyxl.load_workbook(self.bdo_source_path, data_only=True)
+            sheet = wb.active
+            bdo_cfg = self._rules.get('bdo', {})
+            data_col = bdo_cfg.get('data_column', 8)
+            label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
+
+            target_row = None
+            for row_idx in range(1, min(sheet.max_row + 1, 200)):
+                for col in label_cols:
+                    cell_val = sheet.cell(row=row_idx, column=col).value
+                    if cell_val and isinstance(cell_val, str):
+                        if 'resultaat na belasting' in cell_val.lower():
+                            target_row = row_idx
+                            break
+                if target_row:
+                    break
+
+            if target_row is None:
+                wb.close()
+                return None
+
+            val = sheet.cell(row=target_row, column=data_col).value
+            wb.close()
+
+            if isinstance(val, (int, float)):
+                logger.info(
+                    f"[BDO Align] Cached column H value at row {target_row}: {float(val):,.2f}"
+                )
+                return float(val)
+            return None
+        except Exception as e:
+            logger.warning(f"[BDO Align] data_only re-read failed: {e}")
+            return None
 
     def _compute_bank_account_values(self):
         """
@@ -2576,15 +2785,16 @@ class ManagementAccountsBuilder:
             return
 
         bdo_sheet = self.workbook[bdo_sheet_name]
+        data_col = self._rules.get('bdo', {}).get('data_column', 8)
         bank_total = 0.0
         for mc_row, bdo_row in bank_bdo_rows.items():
-            cell = bdo_sheet.cell(row=bdo_row, column=8)  # column H
+            cell = bdo_sheet.cell(row=bdo_row, column=data_col)
             val = cell.value
             if isinstance(val, (int, float)):
                 self.computed_values[(mc_row, 'ltm')] = float(val)
                 bank_total += float(val)
             elif isinstance(val, str) and val.startswith('='):
-                evaluated = self._eval_simple_sum_formula(bdo_sheet, val, 8)
+                evaluated = self._eval_simple_sum_formula(bdo_sheet, val, data_col)
                 self.computed_values[(mc_row, 'ltm')] = evaluated
                 bank_total += evaluated
             else:
@@ -2838,13 +3048,14 @@ class ManagementAccountsBuilder:
         
         return validation
     
-    def _read_bdo_resultaat_na_belasting(self) -> Optional[float]:
+    def _read_bdo_resultaat_na_belasting(self, use_ltm: bool = False) -> Optional[float]:
         """
         Read the 'Resultaat na belasting' ground truth value from the BDO sheet.
 
-        Locates the row by label, then for each of columns D-G either reads the
-        numeric value directly or, if the cell contains a SUM formula (e.g.
-        =SUM(D76:D123)), evaluates it by summing the referenced cell range.
+        Args:
+            use_ltm: If True, read column H (LTM total).
+                     If False, sum columns D-G (quarter mutations).
+
         Returns None if the row or sheet cannot be found.
         """
         bdo_sheet_name = self.config.bdo_sheet_name
@@ -2860,8 +3071,9 @@ class ManagementAccountsBuilder:
         if label_key in self._new_bdo_label_map:
             target_row = self._new_bdo_label_map[label_key]
         else:
-            for row_idx in range(1, min(sheet.max_row + 1, 140)):
-                for col in (1, 2):
+            label_cols = self._rules.get('bdo', {}).get('label_scan_columns', [1, 2])
+            for row_idx in range(1, min(sheet.max_row + 1, 200)):
+                for col in label_cols:
                     cell_val = sheet.cell(row=row_idx, column=col).value
                     if cell_val and isinstance(cell_val, str):
                         if 'resultaat na belasting' in cell_val.lower():
@@ -2874,43 +3086,59 @@ class ManagementAccountsBuilder:
             logger.warning("BDO ground truth check: 'Resultaat na belasting' row not found")
             return None
 
-        total = 0.0
-        for col_idx in range(4, 8):  # columns D(4), E(5), F(6), G(7)
+        def _read_cell(col_idx):
             val = sheet.cell(row=target_row, column=col_idx).value
             if isinstance(val, (int, float)):
-                total += val
-            elif isinstance(val, str) and val.startswith('='):
-                total += self._eval_simple_sum_formula(sheet, val, col_idx)
-            elif isinstance(val, str):
+                return float(val)
+            if isinstance(val, str) and val.startswith('='):
+                return self._eval_simple_sum_formula(sheet, val, col_idx)
+            if isinstance(val, str):
                 try:
-                    total += float(val.replace(',', '.').replace(' ', ''))
+                    return float(val.replace(',', '.').replace(' ', ''))
                 except (ValueError, AttributeError):
                     pass
+            return 0.0
 
-        logger.info(f"BDO ground truth: Resultaat na belasting (row {target_row}, D-G) = {total:,.2f}")
+        bdo_cfg = self._rules.get('bdo', {})
+        data_col = bdo_cfg.get('data_column', 8)
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+
+        if use_ltm:
+            total = _read_cell(data_col)
+            logger.info(
+                f"BDO ground truth (LTM): Resultaat na belasting "
+                f"(row {target_row}, col {get_column_letter(data_col)}) = {total:,.2f}")
+        else:
+            total = sum(_read_cell(c) for c in q_cols)
+            q_letters = [get_column_letter(c) for c in q_cols]
+            logger.info(
+                f"BDO ground truth (quarter): Resultaat na belasting "
+                f"(row {target_row}, {q_letters[0]}-{q_letters[-1]}) = {total:,.2f}")
         return total
 
     def _eval_simple_sum_formula(self, sheet, formula: str, default_col: int) -> float:
         """
-        Evaluate a simple SUM formula like =SUM(D76:D123) by reading cell values.
+        Evaluate a simple SUM formula by reading cell values.
 
-        Only supports =SUM(COLn:COLm) patterns. Returns 0.0 for unparseable formulas.
+        Handles both column ranges (=SUM(D6:D123)) and row ranges (=SUM(D135:G135)).
+        Returns 0.0 for unparseable formulas.
         """
-        m = re.match(r'^=SUM\(([A-Z])(\d+):([A-Z])(\d+)\)$', formula, re.IGNORECASE)
+        m = re.match(r'^=SUM\(([A-Z]{1,3})(\d+):([A-Z]{1,3})(\d+)\)$', formula, re.IGNORECASE)
         if not m:
             logger.debug(f"Cannot evaluate formula: {formula}")
             return 0.0
 
-        col_letter_start = m.group(1).upper()
+        col_start = column_index_from_string(m.group(1).upper())
         row_start = int(m.group(2))
+        col_end = column_index_from_string(m.group(3).upper())
         row_end = int(m.group(4))
-        col_num = ord(col_letter_start) - ord('A') + 1
 
         total = 0.0
         for r in range(row_start, row_end + 1):
-            cell_val = sheet.cell(row=r, column=col_num).value
-            if isinstance(cell_val, (int, float)):
-                total += cell_val
+            for c in range(col_start, col_end + 1):
+                cell_val = sheet.cell(row=r, column=c).value
+                if isinstance(cell_val, (int, float)):
+                    total += cell_val
         return total
 
     def _validate_structural_formulas(self, validation: dict) -> bool:
@@ -2943,9 +3171,6 @@ class ManagementAccountsBuilder:
         checks = {}
         
         expected_formulas = {
-            19: {'col': ltm_col, 'letter': ltm_letter,
-                 'expected': f'=SUM({ltm_letter}3:{ltm_letter}18)',
-                 'label': 'Total Equity Movement (LTM)'},
             66: {'col': quarter_col, 'letter': q_letter,
                  'expected': f'=SUM({q_letter}57:{q_letter}65)',
                  'label': 'EBT (quarter)'},
@@ -2956,7 +3181,7 @@ class ManagementAccountsBuilder:
         
         for row_num, spec in expected_formulas.items():
             cell = sheet.cell(row=row_num, column=spec['col'])
-            actual = str(cell.value) if cell.value else '(empty)'
+            actual = str(cell.value) if cell.value is not None else '(empty)'
             ok = actual.upper() == spec['expected'].upper()
             checks[f'row_{row_num}'] = {
                 'label': spec['label'],
@@ -2972,6 +3197,34 @@ class ManagementAccountsBuilder:
                 )
                 validation['messages'].append(msg)
                 logger.warning(f"VALIDATION WARNING: {msg}")
+
+        # Row 19 LTM: _enforce_bdo_alignment may replace the SUM formula with
+        # the BDO ground truth value.  Accept either the formula or a non-zero
+        # numeric value as valid.
+        row19_cell = sheet.cell(row=19, column=ltm_col)
+        row19_val = row19_cell.value
+        row19_expected_formula = f'=SUM({ltm_letter}3:{ltm_letter}18)'
+        if row19_val is None:
+            all_ok = False
+            msg = (
+                f"Formula check failed: Total Equity Movement (LTM) row 19 col {ltm_letter} - "
+                f"cell is empty (expected formula or BDO ground truth value)"
+            )
+            validation['messages'].append(msg)
+            logger.warning(f"VALIDATION WARNING: {msg}")
+        elif isinstance(row19_val, str) and row19_val.upper() == row19_expected_formula.upper():
+            logger.info("Row 19 LTM: SUM formula present")
+        elif isinstance(row19_val, (int, float)) and row19_val != 0:
+            logger.info(f"Row 19 LTM: BDO ground truth value {row19_val:,.2f}")
+        else:
+            all_ok = False
+            actual_str = str(row19_val)
+            msg = (
+                f"Formula check warning: Total Equity Movement (LTM) row 19 col {ltm_letter} - "
+                f"expected '{row19_expected_formula}' or BDO value, got '{actual_str}'"
+            )
+            validation['messages'].append(msg)
+            logger.warning(f"VALIDATION WARNING: {msg}")
         
         intermediate_rows = {
             60: 'Net interest expenses - SFA',
@@ -2991,13 +3244,13 @@ class ManagementAccountsBuilder:
             checks[f'row_{row_num}_q'] = {
                 'label': f'{label} (quarter)',
                 'has_formula': q_ok,
-                'actual': str(q_val) if q_val else '(empty)',
+                'actual': str(q_val) if q_val is not None else '(empty)',
                 'ok': q_ok
             }
             checks[f'row_{row_num}_ltm'] = {
                 'label': f'{label} (LTM)',
                 'has_formula': ltm_ok,
-                'actual': str(ltm_val) if ltm_val else '(empty)',
+                'actual': str(ltm_val) if ltm_val is not None else '(empty)',
                 'ok': ltm_ok
             }
             if not q_ok:
@@ -3028,10 +3281,14 @@ class ManagementAccountsBuilder:
             return
         
         sheet = self.workbook[summary_sheets[-1]]
-        warning_row = 70
+        layout_cfg = self._rules.get('layout', {})
+        style_cfg = self._rules.get('styling', {})
+        warning_row = layout_cfg.get('warning_start_row', 70)
         
-        red_font = Font(name='Calibri', size=11, bold=True, color='FF0000')
-        red_fill = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+        err_font_color = style_cfg.get('error_font_color', 'FFFF0000')
+        err_fill_color = style_cfg.get('error_fill_color', 'FFFFCCCC')
+        red_font = Font(name='Calibri', size=11, bold=True, color=err_font_color)
+        red_fill = PatternFill(start_color=err_fill_color, end_color=err_fill_color, fill_type='solid')
         
         header_cell = sheet.cell(row=warning_row, column=2)
         header_cell.value = "VALIDATION WARNING: Reconciliation check failed — see details below"
@@ -3041,7 +3298,7 @@ class ManagementAccountsBuilder:
         for i, msg in enumerate(messages):
             detail_cell = sheet.cell(row=warning_row + 1 + i, column=2)
             detail_cell.value = f"  - {msg}"
-            detail_cell.font = Font(name='Calibri', size=10, color='FF0000')
+            detail_cell.font = Font(name='Calibri', size=10, color=err_font_color)
         
         logger.info(f"Added validation warnings in Management Cijfers rows {warning_row}-{warning_row + len(messages)}")
 

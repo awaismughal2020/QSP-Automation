@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 from pathlib import Path
 import re
+import yaml
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, PatternFill
@@ -419,6 +420,17 @@ class ComplianceBuilder:
             import traceback
             traceback.print_exc()
     
+    @staticmethod
+    def _load_accounting_rules() -> dict:
+        rules_path = Path("config/accounting_rules.yaml")
+        if rules_path.exists():
+            try:
+                with open(rules_path, 'r', encoding='utf-8') as f:
+                    return yaml.safe_load(f) or {}
+            except Exception:
+                pass
+        return {}
+
     def _copy_ma_data_from_cache(self, target_sheet_name: str):
         """
         Fast path: copy values from computed_values dict directly into CC columns B/C.
@@ -471,7 +483,7 @@ class ComplianceBuilder:
                 cell = target_sheet.cell(row=cc_row, column=3)
                 cell.value = ltm_val
                 cell.number_format = acct_fmt
-                cell.font = Font(name='Calibri', size=11, color='000000')
+                cell.font = Font(name='Calibri', size=11, color='FF000000')
                 ltm_copied += 1
 
         # ── P&L: column B (quarter) + column C (LTM) ──
@@ -483,13 +495,13 @@ class ComplianceBuilder:
                 cell = target_sheet.cell(row=cc_row, column=2)
                 cell.value = q_val
                 cell.number_format = acct_fmt
-                cell.font = Font(name='Calibri', size=11, color='000000')
+                cell.font = Font(name='Calibri', size=11, color='FF000000')
                 q_copied += 1
             if ltm_val is not None:
                 cell = target_sheet.cell(row=cc_row, column=3)
                 cell.value = ltm_val
                 cell.number_format = acct_fmt
-                cell.font = Font(name='Calibri', size=11, color='000000')
+                cell.font = Font(name='Calibri', size=11, color='FF000000')
                 ltm_copied += 1
 
         # ── Bank: column C only ──
@@ -499,7 +511,7 @@ class ComplianceBuilder:
                 cell = target_sheet.cell(row=cc_row, column=3)
                 cell.value = ltm_val
                 cell.number_format = acct_fmt
-                cell.font = Font(name='Calibri', size=11, color='000000')
+                cell.font = Font(name='Calibri', size=11, color='FF000000')
                 ltm_copied += 1
 
         # Bank Total: CC row 79 → MA row 114
@@ -508,7 +520,7 @@ class ComplianceBuilder:
             cell = target_sheet.cell(row=79, column=3)
             cell.value = bank_total
             cell.number_format = acct_fmt
-            cell.font = Font(name='Calibri', size=11, color='000000')
+            cell.font = Font(name='Calibri', size=11, color='FF000000')
             ltm_copied += 1
 
         # Clear residual template values in the gap between P&L and Bank
@@ -516,6 +528,26 @@ class ComplianceBuilder:
         for gap_row in range(68, 71):
             for gap_col in (2, 3):
                 target_sheet.cell(row=gap_row, column=gap_col).value = None
+
+        # Bold the key total rows (label in col A + values in B/C).
+        # CC rows are offset by -1 from MA rows.
+        rules = self._load_accounting_rules()
+        identity = rules.get('identity_alignment', {})
+        bold_ma_rows = identity.get(
+            'bdo_anchored_ltm_rows',
+            [identity.get('authoritative_row', 19),
+             identity.get('dependent_row', 68)]
+        )
+        for ma_row in bold_ma_rows:
+            cc_row = ma_row - 1
+            for col in range(1, 4):  # columns A, B, C
+                cell = target_sheet.cell(row=cc_row, column=col)
+                base = copy(cell.font) if cell.font else Font()
+                cell.font = Font(
+                    name=base.name or 'Calibri', size=base.size or 11,
+                    bold=True, italic=base.italic, underline=base.underline,
+                    color=base.color or 'FF000000',
+                )
 
         logger.info(
             f"[CC] Copied from computed_values to {target_sheet_name}: "
@@ -1872,6 +1904,17 @@ class ComplianceBuilder:
                 cell.alignment = copy(prev_ntm_cell.alignment)
                 cell.border = copy(prev_ntm_cell.border)
                 cell.fill = copy(prev_ntm_cell.fill)
+
+        # === 5. NTM Forecast column: set data-row text to black (header stays as-is) ===
+        for row in range(3, 42):
+            cell = suppl_sheet.cell(row=row, column=ntm_col)
+            if cell.font:
+                base = copy(cell.font)
+                cell.font = Font(
+                    name=base.name, size=base.size, bold=base.bold,
+                    italic=base.italic, underline=base.underline,
+                    color='FF000000',
+                )
 
         logger.info("Completed Suppl. Calc formula updates (dynamic NTM)")
     

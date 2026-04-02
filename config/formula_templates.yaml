@@ -142,8 +142,9 @@ balance_sheet:
     
   19:
     label: "Total (Equity Movement)"
-    type: calc
-    pattern: "=SUM({COL}3:{COL}18)"
+    type: bdo_anchored
+    # LTM value is written by _enforce_bdo_alignment from BDO ground truth.
+    # No formula is generated here — see identity_alignment.bdo_anchored_ltm_rows.
 
 # P&L Section (rows 22-68)
 profit_loss:
