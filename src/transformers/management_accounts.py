@@ -361,30 +361,217 @@ class ManagementAccountsBuilder:
     def _build_row_map(self, sheet, row_map: dict, label_map: dict = None):
         """
         Build mapping of account codes to row numbers in a BDO sheet.
-        This is critical for validating that formula row references are correct.
-        
+        Keeps FIRST occurrence of each code to avoid duplicates overwriting.
         Also builds a label map for non-numeric identifiers (like "SWAP").
         """
         row_map.clear()
         if label_map is not None:
             label_map.clear()
-        
+
         for row_idx in range(1, sheet.max_row + 1):
             code = sheet.cell(row=row_idx, column=1).value
             label = sheet.cell(row=row_idx, column=2).value
-            
+
             if code and isinstance(code, (str, int, float)):
                 code_str = str(code).strip()
                 if code_str and code_str[0].isdigit():
-                    row_map[code_str] = row_idx
+                    if code_str not in row_map:
+                        row_map[code_str] = row_idx
                 elif code_str and label_map is not None:
-                    # Non-numeric code - store in label map
                     label_map[code_str.lower()] = row_idx
-            
-            # Also map by label column (column B) for special rows like "SWAP"
+
             if label and isinstance(label, str) and label_map is not None:
                 label_map[label.strip().lower()] = row_idx
-    
+
+    def _discover_bdo_structure(self, bdo_sheet) -> Dict[str, Any]:
+        """
+        Scan the entire BDO sheet and build a complete structural map.
+        Returns dict with section boundaries, all account rows (including
+        duplicates), and unlabeled value rows. Nothing is hardcoded.
+        """
+        data_col = self._rules.get('bdo', {}).get('data_column', 8)
+        structure = {
+            'account_to_rows': {},
+            'account_to_first': {},
+            'unlabeled_value_rows': [],
+            'pl_start': None,
+            'resultaat_row': None,
+            'duplicate_codes': {},
+        }
+
+        seen_codes: Dict[str, int] = {}
+
+        for row_idx in range(1, bdo_sheet.max_row + 1):
+            code = bdo_sheet.cell(row=row_idx, column=1).value
+            h_val = bdo_sheet.cell(row=row_idx, column=data_col).value
+
+            cell_a_str = str(code).strip() if code else ''
+            if isinstance(code, str):
+                lower = code.lower()
+                if 'winst' in lower and 'verlies' in lower:
+                    structure['pl_start'] = row_idx + 1
+                if 'resultaat na belasting' in lower:
+                    structure['resultaat_row'] = row_idx
+
+            is_account = bool(cell_a_str and cell_a_str[0].isdigit())
+            if is_account:
+                if cell_a_str not in structure['account_to_first']:
+                    structure['account_to_first'][cell_a_str] = row_idx
+                structure['account_to_rows'].setdefault(cell_a_str, []).append(row_idx)
+
+                if cell_a_str in seen_codes:
+                    if cell_a_str not in structure['duplicate_codes']:
+                        structure['duplicate_codes'][cell_a_str] = [seen_codes[cell_a_str]]
+                    structure['duplicate_codes'][cell_a_str].append(row_idx)
+                else:
+                    seen_codes[cell_a_str] = row_idx
+            elif h_val is not None and h_val != 0 and not is_account:
+                has_value = isinstance(h_val, (int, float)) or (
+                    isinstance(h_val, str) and h_val.startswith('='))
+                if has_value:
+                    structure['unlabeled_value_rows'].append(row_idx)
+
+        logger.info(
+            f"[BDO Structure] {len(structure['account_to_first'])} unique codes, "
+            f"{len(structure['duplicate_codes'])} duplicates, "
+            f"{len(structure['unlabeled_value_rows'])} unlabeled value rows, "
+            f"PL start={structure['pl_start']}, resultaat={structure['resultaat_row']}"
+        )
+        return structure
+
+    def _find_sum_range_end(self, bdo_sheet, start_row: int,
+                            expected_count: int, prefix: Optional[str]) -> int:
+        """
+        Scan forward from start_row to find the actual end of a SUM range.
+        Extends beyond expected_count if subsequent rows match the prefix
+        and carry non-zero H values.
+        """
+        data_col = self._rules.get('bdo', {}).get('data_column', 8)
+        end = start_row + expected_count - 1
+
+        if not prefix:
+            return end
+
+        while end + 1 <= bdo_sheet.max_row:
+            next_code = bdo_sheet.cell(row=end + 1, column=1).value
+            next_h = bdo_sheet.cell(row=end + 1, column=data_col).value
+            code_str = str(next_code).strip() if next_code else ''
+            if code_str.startswith(prefix) and next_h is not None:
+                end += 1
+                logger.info(
+                    f"[SUM Range] Extended range past expected: "
+                    f"row {end} code {code_str}"
+                )
+            else:
+                break
+        return end
+
+    def _build_ltm_interest(self, sheet, ltm_col: int, bdo_sheet,
+                            bdo_name: str, structure: Dict[str, Any]):
+        """
+        Build row 60 LTM with ALL interest accounts discovered dynamically
+        from the BDO sheet using account codes from config.
+        """
+        interest_cfg = self._rules.get('interest_section', {})
+        codes = interest_cfg.get('account_codes', [])
+        sfa_row = interest_cfg.get('management_row')
+        absorbed = interest_cfg.get('absorbed_rows', [])
+        dmrrp_code = interest_cfg.get('dmrrp_code', '')
+        dmrrp_ma_row = interest_cfg.get('dmrrp_row')
+        data_col_letter = get_column_letter(
+            self._rules.get('bdo', {}).get('data_column', 8))
+
+        if not sfa_row or not codes:
+            return
+
+        interest_bdo_rows = []
+        for code in codes:
+            for r in structure.get('account_to_rows', {}).get(code, []):
+                if r not in interest_bdo_rows:
+                    interest_bdo_rows.append(r)
+
+        if not interest_bdo_rows:
+            logger.warning("[LTM Interest] No BDO rows found for interest accounts")
+            return
+
+        parts = [f"'{bdo_name}'!{data_col_letter}{r}" for r in interest_bdo_rows]
+        formula = "=-" + "-".join(parts)
+        sheet.cell(row=sfa_row, column=ltm_col).value = formula
+        logger.info(
+            f"[LTM Interest] Row {sfa_row}: consolidated {len(interest_bdo_rows)} "
+            f"BDO rows {interest_bdo_rows}"
+        )
+
+        for ar in absorbed:
+            sheet.cell(row=ar, column=ltm_col).value = 0
+        logger.info(f"[LTM Interest] Zeroed absorbed rows {absorbed}")
+
+        if dmrrp_code and dmrrp_ma_row:
+            dmrrp_rows = structure.get('account_to_rows', {}).get(dmrrp_code, [])
+            if dmrrp_rows:
+                sheet.cell(row=dmrrp_ma_row, column=ltm_col).value = (
+                    f"=-'{bdo_name}'!{data_col_letter}{dmrrp_rows[0]}"
+                )
+                logger.info(
+                    f"[LTM Interest] Row {dmrrp_ma_row}: "
+                    f"=-'{bdo_name}'!{data_col_letter}{dmrrp_rows[0]}"
+                )
+
+    def _post_build_coverage_audit(self, sheet, bdo_sheet, ltm_col: int,
+                                   q_col: int, bdo_name: str,
+                                   structure: Dict[str, Any]):
+        """
+        After all formulas are in place, verify that every non-zero BDO P&L
+        row is referenced somewhere. If not, add it to the catch-all row.
+        """
+        import re as _re
+        rules = self._rules
+        catch_all = rules.get('layout', {}).get('other_costs_row')
+        pl_start = structure.get('pl_start')
+        resultaat_row = structure.get('resultaat_row')
+
+        if not catch_all or not pl_start or not resultaat_row:
+            return
+
+        data_col = rules.get('bdo', {}).get('data_column', 8)
+        data_col_letter = get_column_letter(data_col)
+        q_cols = rules.get('bdo', {}).get('quarter_columns', [4, 5, 6, 7])
+        q_bdo_col_letter = get_column_letter(q_cols[-1]) if q_cols else 'G'
+
+        referenced = set()
+        pl_rows = rules.get('layout', {}).get('profit_loss_rows', [23, 68])
+        for ma_row in range(pl_rows[0], pl_rows[1] + 1):
+            for col in [ltm_col, q_col]:
+                f = sheet.cell(row=ma_row, column=col).value
+                if f and isinstance(f, str) and f.startswith('='):
+                    for m in _re.findall(r'[HG](\d+)', f):
+                        referenced.add(int(m))
+
+        missing_count = 0
+        for bdo_row in range(pl_start, resultaat_row):
+            h = bdo_sheet.cell(row=bdo_row, column=data_col).value
+            if isinstance(h, (int, float)) and h != 0 and bdo_row not in referenced:
+                for col, ref_letter in [(ltm_col, data_col_letter),
+                                        (q_col, q_bdo_col_letter)]:
+                    cell = sheet.cell(row=catch_all, column=col)
+                    current = str(cell.value) if cell.value else ''
+                    ref = f"'{bdo_name}'!{ref_letter}{bdo_row}"
+                    if ref not in current and current.startswith('='):
+                        cell.value = current + f"-{ref}"
+                missing_count += 1
+                logger.warning(
+                    f"[Coverage Audit] Added unreferenced BDO row {bdo_row} "
+                    f"to catch-all row {catch_all}"
+                )
+
+        if missing_count:
+            logger.info(
+                f"[Coverage Audit] Added {missing_count} missing BDO refs "
+                f"to row {catch_all}"
+            )
+        else:
+            logger.info("[Coverage Audit] All BDO P&L rows are referenced")
+
     def _copy_bdo_data_to_new_sheet(self, bdo_result: BDOParseResult):
         """
         Create new BDO sheet as a verbatim copy of the uploaded Cijfers file.
@@ -1021,10 +1208,9 @@ class ManagementAccountsBuilder:
                 hdr_cell = summary_sheet.cell(row=hdr_row, column=col_idx)
                 hdr_cell.fill = header_fill
 
-        # Enforce bold on BDO-anchored / key total rows across ALL columns
         identity_cfg = self._rules.get('identity_alignment', {})
         bold_rows = set(identity_cfg.get(
-            'bdo_anchored_ltm_rows',
+            'formula_total_rows',
             [identity_cfg.get('authoritative_row', 19),
              identity_cfg.get('dependent_row', 68)]
         ))
@@ -1467,14 +1653,6 @@ class ManagementAccountsBuilder:
             formula_type = template.get('type', 'bdo_ref')
             target_cell = sheet.cell(row=row_idx, column=col_idx)
 
-            if formula_type == 'bdo_anchored':
-                # Value written later by _enforce_bdo_alignment — skip
-                logger.debug(
-                    f"BS row {row_idx}: skipped (bdo_anchored, "
-                    f"value set by _enforce_bdo_alignment)"
-                )
-                continue
-
             if formula_type == 'bdo_ref':
                 formula = self._build_balance_sheet_ref_formula(template, bdo_sheet_name, bdo_column)
                 if formula:
@@ -1523,44 +1701,49 @@ class ManagementAccountsBuilder:
     
     def _build_balance_sheet_sum_formula(self, template: Dict[str, Any], bdo_sheet_name: str,
                                           bdo_column: str) -> Optional[str]:
-        """Build a Balance Sheet SUM formula for a range of accounts."""
+        """Build a Balance Sheet SUM formula for a range of accounts.
+        Uses _find_sum_range_end() to dynamically extend ranges."""
         start_account = template.get('start_account')
         end_account = template.get('end_account')
-        count = template.get('count')  # Optional: number of rows in range
+        count = template.get('count')
+        prefix = template.get('prefix')
         additional = template.get('additional', [])
-        
+
         start_row = self._find_account_row(start_account) if start_account else None
-        
-        # Calculate end_row
+
         if count and start_row:
-            # If count is specified, calculate end_row from start_row + count - 1
-            end_row = start_row + count - 1
+            bdo_sheet = None
+            if self.config.bdo_sheet_name in self.workbook.sheetnames:
+                bdo_sheet = self.workbook[self.config.bdo_sheet_name]
+            if bdo_sheet and prefix:
+                end_row = self._find_sum_range_end(
+                    bdo_sheet, start_row, count, prefix)
+            else:
+                end_row = start_row + count - 1
         elif end_account:
-            # Find end account row
             end_row = self._find_account_row(end_account)
         else:
             end_row = None
-        
+
         parts = []
-        
+
         if start_row and end_row and end_row > start_row:
-            # Range with multiple cells
-            parts.append(f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row}:{bdo_column}{end_row})")
+            parts.append(
+                f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row}"
+                f":{bdo_column}{end_row})")
         elif start_row and count == 1:
-            # Single cell SUM (for consistency with expected format)
             parts.append(f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row})")
         elif start_row:
             parts.append(f"'{bdo_sheet_name}'!{bdo_column}{start_row}")
-        
-        # Add additional accounts
+
         for code in additional:
             row_num = self._find_account_row(code)
             if row_num:
                 parts.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
-        
+
         if not parts:
             return None
-        
+
         return "=" + "+".join(parts)
     
     def _update_balance_sheet_bdo_refs(self, sheet, col_idx: int, bdo_column: str = 'G'):
@@ -2367,12 +2550,6 @@ class ManagementAccountsBuilder:
                 val = self._evaluate_calc_pattern(pattern, shadow)
                 entry['value'] = val if val is not None else 0.0
 
-            elif formula_type == 'bdo_anchored':
-                # Sum all prior shadow BS entries as a cross-check
-                entry['value'] = sum(
-                    shadow[r]['value'] for r in shadow if r != row_idx
-                )
-
             shadow[row_idx] = entry
 
         logger.info(f"Shadow Balance Sheet computed for {len(shadow)} rows, "
@@ -2553,10 +2730,6 @@ class ManagementAccountsBuilder:
         if formula_type == 'constant':
             return float(template.get('value', 0))
 
-        if formula_type == 'bdo_anchored':
-            # Placeholder — value written later by _enforce_bdo_alignment
-            return 0.0
-
         return 0.0
 
     # ------------------------------------------------------------------
@@ -2649,27 +2822,17 @@ class ManagementAccountsBuilder:
 
     def _enforce_bdo_alignment(self, bdo_result: BDOParseResult):
         """
-        Align computed_values for rows 19 and 68 to BDO ground truth,
-        and write the authoritative value directly into the workbook.
-
-        The BDO source file is re-loaded with data_only=True to obtain the
-        cached numeric value from column H.  If that is unavailable, columns
-        D-G (raw quarter numbers) are summed as a reliable fallback.
+        Write formulas (not hardcoded values) for rows 19 and 68 in the LTM
+        column, consolidate interest accounts dynamically, and run a post-build
+        coverage audit. All BDO row positions are discovered at runtime.
         """
         align = self._rules.get('identity_alignment', {})
         auth_row = align.get('authoritative_row', 19)
         dep_row = align.get('dependent_row', 68)
 
-        # ── Obtain LTM ground truth ──
-        # Strategy: D-G quarter sum is ALWAYS authoritative because those cells
-        # hold raw numeric values.  Column H often contains a formula chain that
-        # openpyxl (data_only=False) cannot evaluate.  We also attempt a
-        # data_only=True re-read as a cross-check.
         bdo_qtr_raw = self._read_bdo_resultaat_na_belasting(use_ltm=False)
         bdo_ltm_raw = self._read_bdo_resultaat_na_belasting_cached()
 
-        # Prefer the cached column H value, but if it's unavailable or zero
-        # (formula that couldn't be cached), use D-G sum.
         if bdo_ltm_raw is not None and bdo_ltm_raw != 0.0:
             effective_raw = bdo_ltm_raw
             source = "column H (data_only cache)"
@@ -2682,42 +2845,52 @@ class ManagementAccountsBuilder:
 
         if effective_raw is not None:
             bdo_ltm = round(-effective_raw, 2)
-            bs19 = self.computed_values.get((auth_row, 'ltm'), 0.0)
-            pl68 = self.computed_values.get((dep_row, 'ltm'), 0.0)
-
             logger.info(
-                f"[BDO Align] LTM ground truth={bdo_ltm:,.2f} (source: {source}), "
-                f"BS{auth_row}={bs19:,.2f}, PL{dep_row}={pl68:,.2f}"
+                f"[BDO Align] LTM ground truth={bdo_ltm:,.2f} (source: {source})"
             )
-
             self.computed_values[(auth_row, 'ltm')] = bdo_ltm
             self.computed_values[(dep_row, 'ltm')] = bdo_ltm
-
-            summary_name = self.config.summary_sheet_name
-            if summary_name in self.workbook.sheetnames:
-                ws = self.workbook[summary_name]
-                ltm_col_letter = get_column_letter(self._new_ltm_col)
-                # Row 19 (Total Equity Movement): write BDO value directly
-                ws.cell(row=auth_row, column=self._new_ltm_col).value = bdo_ltm
-                logger.info(
-                    f"[BDO Align] Wrote {bdo_ltm:,.2f} to row {auth_row} "
-                    f"col {ltm_col_letter}"
-                )
-                # Row 68 (Direct Result): write BDO value directly so it
-                # matches row 19 exactly without depending on formula chain
-                ws.cell(row=dep_row, column=self._new_ltm_col).value = bdo_ltm
-                logger.info(
-                    f"[BDO Align] Wrote {bdo_ltm:,.2f} to row {dep_row} "
-                    f"col {ltm_col_letter}"
-                )
         else:
-            logger.warning("[BDO Align] Cannot check LTM — Resultaat na belasting not found or zero")
+            logger.warning("[BDO Align] Cannot determine LTM ground truth")
 
-        # ── Quarter alignment (computed_values only) ──
+        summary_name = self.config.summary_sheet_name
+        if summary_name not in self.workbook.sheetnames:
+            return
+        ws = self.workbook[summary_name]
+        ltm_col = self._new_ltm_col
+        ltm_letter = get_column_letter(ltm_col)
+        bdo_name = self.config.bdo_sheet_name
+
+        # Write calc formulas from config for total rows
+        calc_formulas = self._rules.get('layout', {}).get('calc_formulas', {})
+        ltm_overrides = self._rules.get('layout', {}).get('ltm_calc_overrides', {})
+        all_calcs = {**calc_formulas, **ltm_overrides}
+
+        for row_key in [dep_row, auth_row]:
+            tmpl = all_calcs.get(row_key) or all_calcs.get(str(row_key))
+            if tmpl:
+                formula = tmpl.replace('{col}', ltm_letter)
+                ws.cell(row=row_key, column=ltm_col).value = formula
+                logger.info(f"[BDO Align] Row {row_key}: {formula}")
+            else:
+                logger.warning(f"[BDO Align] No calc_formula for row {row_key}")
+
+        # Discover BDO structure dynamically for interest + coverage
+        bdo_sheet = (self.workbook[bdo_name]
+                     if bdo_name in self.workbook.sheetnames else None)
+        if bdo_sheet:
+            structure = self._discover_bdo_structure(bdo_sheet)
+            self._build_ltm_interest(
+                ws, ltm_col, bdo_sheet, bdo_name, structure)
+
+            q_col = ltm_col - 1
+            self._post_build_coverage_audit(
+                ws, bdo_sheet, ltm_col, q_col, bdo_name, structure)
+
+        # Quarter alignment (computed_values only, for context)
         if bdo_qtr_raw is not None and bdo_qtr_raw != 0.0:
             bdo_qtr = round(-bdo_qtr_raw, 2)
             pl68_q = self.computed_values.get((dep_row, 'quarter'), 0.0)
-
             if pl68_q != bdo_qtr:
                 logger.info(
                     f"[BDO Align] Quarter: PL{dep_row}={pl68_q:,.2f} → "
@@ -3198,33 +3371,19 @@ class ManagementAccountsBuilder:
                 validation['messages'].append(msg)
                 logger.warning(f"VALIDATION WARNING: {msg}")
 
-        # Row 19 LTM: _enforce_bdo_alignment may replace the SUM formula with
-        # the BDO ground truth value.  Accept either the formula or a non-zero
-        # numeric value as valid.
+        # Row 19 LTM: must contain a formula (e.g. ={ltm}68), not a hardcoded value
         row19_cell = sheet.cell(row=19, column=ltm_col)
         row19_val = row19_cell.value
-        row19_expected_formula = f'=SUM({ltm_letter}3:{ltm_letter}18)'
-        if row19_val is None:
+        if not isinstance(row19_val, str) or not row19_val.startswith('='):
             all_ok = False
             msg = (
                 f"Formula check failed: Total Equity Movement (LTM) row 19 col {ltm_letter} - "
-                f"cell is empty (expected formula or BDO ground truth value)"
+                f"expected a formula, got '{row19_val}'"
             )
             validation['messages'].append(msg)
             logger.warning(f"VALIDATION WARNING: {msg}")
-        elif isinstance(row19_val, str) and row19_val.upper() == row19_expected_formula.upper():
-            logger.info("Row 19 LTM: SUM formula present")
-        elif isinstance(row19_val, (int, float)) and row19_val != 0:
-            logger.info(f"Row 19 LTM: BDO ground truth value {row19_val:,.2f}")
         else:
-            all_ok = False
-            actual_str = str(row19_val)
-            msg = (
-                f"Formula check warning: Total Equity Movement (LTM) row 19 col {ltm_letter} - "
-                f"expected '{row19_expected_formula}' or BDO value, got '{actual_str}'"
-            )
-            validation['messages'].append(msg)
-            logger.warning(f"VALIDATION WARNING: {msg}")
+            logger.info(f"Row 19 LTM: formula present — {row19_val}")
         
         intermediate_rows = {
             60: 'Net interest expenses - SFA',

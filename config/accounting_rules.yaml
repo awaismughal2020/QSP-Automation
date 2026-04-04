@@ -11,10 +11,27 @@ identity_alignment:
   scope: ltm_only              # ltm_only | quarter_and_ltm
   max_snap_units: 2            # snap PL68 to BS19 when diff <= this
   enforce_in_workbook: true    # set PL68 LTM cell to ={COL}19
-  # Rows whose LTM value is written directly from BDO ground truth.
-  # No formula is placed here — _enforce_bdo_alignment owns these cells.
-  # The AI verification prompt will mark them as untouchable.
-  bdo_anchored_ltm_rows: [19, 68]
+  # These rows must contain FORMULAS whose result matches BDO ground truth.
+  formula_total_rows: [19, 68]
+
+# ─── Interest section configuration ───
+# All BDO rows are discovered dynamically from these account codes.
+interest_section:
+  management_row: 60          # MA row for consolidated interest
+  absorbed_rows: [61, 64]     # MA rows zeroed for LTM (content in management_row)
+  dmrrp_row: 65               # MA row for DMRRP income
+  account_codes:              # Interest accounts to consolidate (looked up dynamically)
+    - "4601000"
+    - "4611000"
+    - "4613000"
+    - "4620200"
+    - "4623001"
+    - "4643000"
+    - "4642000"
+  dmrrp_code: "4663000"
+  cit_codes:
+    - "9500000"
+    - "9510000"
 
 # ─── Rounding ───
 rounding:
@@ -22,7 +39,7 @@ rounding:
   decimal_rows: [26]           # rows exempt from integer rounding (percentages)
 
 # ─── Bank-account overview section in Management Cijfers ───
-# Keys = MA row numbers, values = BDO Excel row numbers (column H).
+# Keys = MA row numbers, values = BDO account codes (resolved at runtime).
 bank_bdo_row_map:
   107: 35
   108: 34
@@ -38,8 +55,6 @@ bank_total_row: 114            # SUM of the bank rows above
 protected_total_rows: [19, 68]
 
 # ─── Template layout (row ranges in Management Cijfers) ───
-# These define the structural layout of the Excel template.
-# Update here if template rows are rearranged.
 layout:
   balance_sheet_rows: [3, 19]          # inclusive start-end for BS data
   profit_loss_rows: [23, 68]           # inclusive start-end for P&L data
@@ -52,12 +67,14 @@ layout:
   pl_total_row: 68                     # Direct Result
   cash_proceeds_row: 50                # Cash proceeds sale
   warning_start_row: 70                # where validation warnings are written
+  other_costs_row: 40                  # Catch-all row for unreferenced P&L items
 
   # Bold/total rows in P&L
   bold_total_rows: [19, 25, 30, 44, 45, 48, 55, 57, 66, 68]
 
-  # Calc formula definitions (row -> formula template using {q}/{ltm} placeholders)
+  # Calc formula definitions (row -> formula template using {col} placeholder)
   calc_formulas:
+    19: "={col}68"
     25: "=SUM({col}23:{col}24)"
     26: "={col}25/{col}23-1"
     30: "=SUM({col}27:{col}29)"
@@ -68,12 +85,9 @@ layout:
     55: "={col}53+{col}48"
     57: "={col}56+{col}55"
     66: "=SUM({col}57:{col}65)"
-    68: "={col}67+{col}66"
+    68: "={col}66+{col}67"
 
-  # LTM-only calc formulas (override the above for LTM column).
-  # NOTE: Rows listed in identity_alignment.bdo_anchored_ltm_rows are
-  # excluded here — their LTM cells hold the BDO ground truth VALUE,
-  # not a formula.  Do NOT add rows 19 or 68 back here.
+  # LTM-only calc formula overrides (empty = same as quarter)
   ltm_calc_overrides: {}
 
   # Intermediate P&L rows (net interest, derivatives, etc.)
@@ -90,10 +104,10 @@ styling:
   number_format: '_(* #,##0_);_(* \(#,##0\);_(* "-"??_);_(@_)'
 
 # ─── BDO sheet structure ───
+# NOTE: data_rows and special_rows are HINTS — all scanning is done dynamically.
 bdo:
   data_column: 8               # column H (LTM totals / closing balance)
   quarter_columns: [4, 5, 6, 7]  # columns D-G (quarterly mutations)
-  data_rows: [6, 124]          # inclusive start-end for account data rows
-  special_rows: [129, 136]     # inclusive start-end for special summary rows
-  sum_total_row: 125           # Resultaat na belasting SUM row
+  data_rows: [6, 124]          # hint: start-end for account data rows
+  special_rows: [129, 136]     # hint: start-end for special summary rows
   label_scan_columns: [1, 2]   # columns to scan for row labels

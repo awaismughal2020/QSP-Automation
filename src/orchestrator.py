@@ -9,6 +9,7 @@ from typing import Optional
 from pathlib import Path
 from datetime import datetime
 import os
+import shutil
 import yaml
 import glob
 from loguru import logger
@@ -171,6 +172,11 @@ class QuarterlyReportOrchestrator:
         original otherwise).
         """
         try:
+            pre_ai_path = ma_output.with_name(
+                ma_output.stem + '_pre_ai' + ma_output.suffix)
+            shutil.copy2(str(ma_output), str(pre_ai_path))
+            logger.info(f"Saved pre-AI copy: {pre_ai_path}")
+
             prev_q = self.config.quarter - 1
             prev_y = self.config.year
             if prev_q == 0:

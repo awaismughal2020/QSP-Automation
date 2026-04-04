@@ -534,7 +534,7 @@ class ComplianceBuilder:
         rules = self._load_accounting_rules()
         identity = rules.get('identity_alignment', {})
         bold_ma_rows = identity.get(
-            'bdo_anchored_ltm_rows',
+            'formula_total_rows',
             [identity.get('authoritative_row', 19),
              identity.get('dependent_row', 68)]
         )

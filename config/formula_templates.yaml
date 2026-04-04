@@ -40,6 +40,7 @@ balance_sheet:
     start_account: "1600000"
     end_account: "1610803"
     count: 5
+    prefix: "16"
     
   5:
     label: "Financial fixed assets"
@@ -61,6 +62,7 @@ balance_sheet:
     start_account: "2502020"
     end_account: "2502024"
     count: 6
+    prefix: "2502"
     additional: ["2742000", "2741000", "2741001"]
     
   8:
@@ -69,6 +71,7 @@ balance_sheet:
     start_account: "2040200"
     end_account: "2040900"
     count: 3
+    prefix: "204"
     additional: ["2300001", "2040601"]
     
   9:
@@ -77,6 +80,7 @@ balance_sheet:
     start_account: "2400200"
     end_account: "2400206"
     count: 7
+    prefix: "2400"
     
   10:
     label: "Equity"
@@ -84,6 +88,7 @@ balance_sheet:
     start_account: "1000002"
     end_account: "1160000"
     count: 3
+    prefix: "1"
     
   11:
     label: "AC Shareholder"
@@ -118,6 +123,7 @@ balance_sheet:
     start_account: "2730001"
     end_account: "2650001"
     count: 6
+    prefix: "2"
     
   16:
     label: "VAT payable"
@@ -142,9 +148,8 @@ balance_sheet:
     
   19:
     label: "Total (Equity Movement)"
-    type: bdo_anchored
-    # LTM value is written by _enforce_bdo_alignment from BDO ground truth.
-    # No formula is generated here — see identity_alignment.bdo_anchored_ltm_rows.
+    type: calc
+    pattern: "={COL}68"
 
 # P&L Section (rows 22-68)
 profit_loss:
@@ -354,12 +359,19 @@ profit_loss:
   # Interest and tax section
   60:
     label: "(Net interest expenses - SFA)"
-    type: bdo_ref
-    account_codes: ["4611000", "4613000", "4620200", "4623001", "4642000"]
-    sign: "-"
-    column: G
-    operator: "-"
-    
+    type: bdo_ref_conditional
+    q_config:
+      type: bdo_ref
+      account_codes: ["4611000", "4613000", "4620200", "4623001", "4642000"]
+      sign: "-"
+      operator: "-"
+    ltm_config:
+      type: bdo_ref_consolidated
+      account_codes: ["4601000", "4611000", "4613000", "4620200", "4623001", "4643000", "4642000"]
+      sign: "-"
+      operator: "-"
+      note: "LTM consolidates ALL interest accounts (BDO H113-H119) to avoid quarterly rounding"
+
   61:
     label: "(Prepaid derivatives transaction- SFA)"
     type: bdo_ref_conditional
@@ -368,9 +380,10 @@ profit_loss:
       account_codes: ["1790000"]
       sign: ""
     ltm_config:
-      type: ltm_sum_quarters
-      num_quarters: 4
-    
+      type: static
+      value: 0
+      note: "Absorbed into row 60 for LTM"
+
   64:
     label: "(Net interest expenses - Hedge)"
     type: bdo_ref_conditional
@@ -380,9 +393,10 @@ profit_loss:
       sign: "-"
       operator: "-"
     ltm_config:
-      type: ltm_sum_quarters
-      num_quarters: 4
-    
+      type: static
+      value: 0
+      note: "Absorbed into row 60 for LTM"
+
   65:
     label: "(Net interest income - DMRRP INV I)"
     type: bdo_ref

@@ -104,6 +104,8 @@ class GenerateResponse(BaseModel):
     job_id: str
     message: str
     output_files: Optional[List[str]] = None
+    management_accounts_path: Optional[str] = None
+    compliance_certificate_path: Optional[str] = None
     warnings: Optional[List[str]] = None
     errors: Optional[List[str]] = None
     execution_time_seconds: Optional[float] = None
@@ -243,6 +245,19 @@ def _extract_ai_verification(result: dict) -> Optional[AIVerificationStatus]:
     return None
 
 
+def _extract_named_paths(result: dict) -> dict:
+    """Derive management_accounts_path and compliance_certificate_path from output_files."""
+    ma_path = None
+    cc_path = None
+    for fp in result.get('output_files', []):
+        lower = fp.lower()
+        if 'management accounts' in lower and lower.endswith('.xlsx'):
+            ma_path = fp
+        elif 'compliance' in lower and lower.endswith('.xlsx'):
+            cc_path = fp
+    return {'management_accounts_path': ma_path, 'compliance_certificate_path': cc_path}
+
+
 # API Endpoints
 
 @app.get("/", response_model=HealthResponse)
@@ -341,6 +356,7 @@ async def generate_report(request: GenerateRequest):
         
         # Build response
         ai_verification = _extract_ai_verification(result)
+        named = _extract_named_paths(result)
 
         if result.get('status') == 'success':
             return GenerateResponse(
@@ -348,6 +364,8 @@ async def generate_report(request: GenerateRequest):
                 job_id=job_id,
                 message=f"Quarterly report Q{request.quarter} {request.year} generated successfully",
                 output_files=result.get('output_files', []),
+                management_accounts_path=named['management_accounts_path'],
+                compliance_certificate_path=named['compliance_certificate_path'],
                 warnings=result.get('warnings', []),
                 errors=[],
                 execution_time_seconds=execution_time,
@@ -488,6 +506,7 @@ async def generate_accounts(request: GenerateAccountsRequest):
         execution_time = (datetime.now() - start_time).total_seconds()
         
         ai_verification = _extract_ai_verification(result)
+        named = _extract_named_paths(result)
 
         if result.get('status') == 'success':
             return GenerateResponse(
@@ -495,6 +514,8 @@ async def generate_accounts(request: GenerateAccountsRequest):
                 job_id=job_id,
                 message=f"Phase 1 complete: Management Accounts and Compliance Certificate generated for Q{request.quarter} {request.year}",
                 output_files=result.get('output_files', []),
+                management_accounts_path=named['management_accounts_path'],
+                compliance_certificate_path=named['compliance_certificate_path'],
                 warnings=result.get('warnings', []),
                 errors=[],
                 execution_time_seconds=execution_time,
