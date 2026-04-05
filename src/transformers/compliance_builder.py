@@ -1905,16 +1905,31 @@ class ComplianceBuilder:
                 cell.border = copy(prev_ntm_cell.border)
                 cell.fill = copy(prev_ntm_cell.fill)
 
-        # === 5. NTM Forecast column: set data-row text to black (header stays as-is) ===
-        for row in range(3, 42):
-            cell = suppl_sheet.cell(row=row, column=ntm_col)
-            if cell.font:
-                base = copy(cell.font)
+        # === 5. Suppl. Calc header styling: rows 2-3 white text on #43546a ===
+        header_fill = PatternFill(start_color='FF43546A', end_color='FF43546A', fill_type='solid')
+        for row in (2, 3):
+            for col in range(1, suppl_sheet.max_column + 1):
+                cell = suppl_sheet.cell(row=row, column=col)
+                base = copy(cell.font) if cell.font else Font()
                 cell.font = Font(
                     name=base.name, size=base.size, bold=base.bold,
                     italic=base.italic, underline=base.underline,
-                    color='FF000000',
+                    color='FFFFFFFF',
                 )
+                cell.fill = header_fill
+
+        # === 6. NTM column rows 4-35: light grey background + black text ===
+        ntm_data_fill = PatternFill(start_color='FFF2F2F2', end_color='FFF2F2F2', fill_type='solid')
+        for row in range(4, 36):
+            cell = suppl_sheet.cell(row=row, column=ntm_col)
+            base = copy(cell.font) if cell.font else Font()
+            make_bold = row >= 5
+            cell.font = Font(
+                name=base.name, size=base.size, bold=make_bold,
+                italic=base.italic, underline=base.underline,
+                color='FF000000',
+            )
+            cell.fill = ntm_data_fill
 
         logger.info("Completed Suppl. Calc formula updates (dynamic NTM)")
     

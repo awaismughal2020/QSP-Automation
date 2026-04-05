@@ -100,6 +100,7 @@ styling:
   text_color_on_blue: "FF000000"       # black text on light blue
   text_color_header: "FFFFFFFF"        # white text on header blue
   error_font_color: "FFFF0000"         # red for validation warnings
+  bank_text_color: "FF00B050"          # green text for bank account data rows
   error_fill_color: "FFFFCCCC"         # light red fill for warnings
   number_format: '_(* #,##0_);_(* \(#,##0\);_(* "-"??_);_(@_)'
 

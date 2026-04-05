@@ -241,7 +241,7 @@ class WorkbookContextExtractor:
 
             code_str = str(code).strip() if code else None
             if isinstance(code, str):
-                if 'winst' in code.lower() and 'verlies' in code.lower():
+                if 'winst' in code.lower() and 'verlies' in code.lower() and pl_start is None:
                     pl_start = row_idx + 1
                 if 'resultaat na belasting' in code.lower():
                     pl_end = row_idx
@@ -1759,7 +1759,7 @@ class AIVerificationOrchestrator:
             for row_idx in range(1, bdo_sheet.max_row + 1):
                 val = bdo_sheet.cell(row=row_idx, column=1).value
                 if isinstance(val, str):
-                    if 'winst' in val.lower() and 'verlies' in val.lower():
+                    if 'winst' in val.lower() and 'verlies' in val.lower() and pl_start_row is None:
                         pl_start_row = row_idx + 1
                     if 'resultaat na belasting' in val.lower():
                         resultaat_row = row_idx

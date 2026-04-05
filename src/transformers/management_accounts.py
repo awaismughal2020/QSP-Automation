@@ -408,7 +408,7 @@ class ManagementAccountsBuilder:
             cell_a_str = str(code).strip() if code else ''
             if isinstance(code, str):
                 lower = code.lower()
-                if 'winst' in lower and 'verlies' in lower:
+                if 'winst' in lower and 'verlies' in lower and structure['pl_start'] is None:
                     structure['pl_start'] = row_idx + 1
                 if 'resultaat na belasting' in lower:
                     structure['resultaat_row'] = row_idx
@@ -451,6 +451,7 @@ class ManagementAccountsBuilder:
 
         if not prefix:
             return end
+        prefix = str(prefix)
 
         while end + 1 <= bdo_sheet.max_row:
             next_code = bdo_sheet.cell(row=end + 1, column=1).value
@@ -1292,6 +1293,19 @@ class ManagementAccountsBuilder:
             cell = summary_sheet.cell(row=border_row, column=col_idx)
             cell.border = border_row_border
         
+        # LTM column: blue background rows 106-114, green text rows 107-113
+        green_text = style_cfg.get('bank_text_color', 'FF00B050')
+        for row_idx in range(bank_range[0] - 1, bank_range[1] + 1):
+            ltm_cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
+            ltm_cell.fill = blue_fill
+            if bank_range[0] <= row_idx <= bank_range[1] - 1:
+                base = copy(ltm_cell.font) if ltm_cell.font else Font()
+                ltm_cell.font = Font(
+                    name=base.name, size=base.size, bold=base.bold,
+                    italic=base.italic, underline=base.underline,
+                    color=green_text,
+                )
+
         # Copy column width from previous quarter column
         prev_col_letter = get_column_letter(prev_quarter_col)
         new_q_letter = get_column_letter(new_quarter_col)
@@ -1802,11 +1816,19 @@ class ManagementAccountsBuilder:
             bdo_sheet = None
             if self.config.bdo_sheet_name in self.workbook.sheetnames:
                 bdo_sheet = self.workbook[self.config.bdo_sheet_name]
+            if prefix is not None:
+                prefix = str(prefix)
             if bdo_sheet and prefix:
                 end_row = self._find_sum_range_end(
                     bdo_sheet, start_row, count, prefix)
             else:
                 end_row = start_row + count - 1
+                if bdo_sheet and not prefix and start_account:
+                    logger.warning(
+                        f"[BS SUM] No prefix for start_account {start_account} "
+                        f"(count={count}). SUM range will NOT auto-extend. "
+                        f"Add prefix to formula_templates.yaml if extension is needed."
+                    )
         elif end_account:
             end_row = self._find_account_row(end_account)
         else:
