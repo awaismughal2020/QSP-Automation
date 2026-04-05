@@ -442,9 +442,9 @@ class ManagementAccountsBuilder:
     def _find_sum_range_end(self, bdo_sheet, start_row: int,
                             expected_count: int, prefix: Optional[str]) -> int:
         """
-        Scan forward from start_row to find the actual end of a SUM range.
-        Extends beyond expected_count if subsequent rows match the prefix
-        and carry non-zero H values.
+        Extend SUM range ONLY for contiguous rows with matching prefix.
+        Stops at the first gap (empty row, no account code) or non-matching
+        code. NEVER extends across section boundaries.
         """
         data_col = self._rules.get('bdo', {}).get('data_column', 8)
         end = start_row + expected_count - 1
@@ -456,10 +456,12 @@ class ManagementAccountsBuilder:
             next_code = bdo_sheet.cell(row=end + 1, column=1).value
             next_h = bdo_sheet.cell(row=end + 1, column=data_col).value
             code_str = str(next_code).strip() if next_code else ''
+            if not code_str or not code_str[0].isdigit():
+                break
             if code_str.startswith(prefix) and next_h is not None:
                 end += 1
                 logger.info(
-                    f"[SUM Range] Extended range past expected: "
+                    f"[SUM Range] Extended same-section range: "
                     f"row {end} code {code_str}"
                 )
             else:
@@ -517,6 +519,57 @@ class ManagementAccountsBuilder:
                     f"=-'{bdo_name}'!{data_col_letter}{dmrrp_rows[0]}"
                 )
 
+    def _handle_duplicate_accounts(self, sheet, bdo_sheet, ltm_col: int,
+                                   q_col: int, bdo_name: str,
+                                   structure: Dict[str, Any]):
+        """
+        For each duplicate account code, check if all occurrences are referenced.
+        Add missing occurrences as EXPLICIT +'BDO'!H<row> terms — NEVER extend
+        SUM ranges. This prevents bugs 8-10.
+        """
+        import re as _re
+        bdo_cfg = self._rules.get('bdo', {})
+        data_col = bdo_cfg.get('data_column', 8)
+        data_letter = get_column_letter(data_col)
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        q_letter = get_column_letter(q_cols[-1]) if q_cols else 'G'
+
+        duplicates = structure.get('duplicate_codes', {})
+        if not duplicates:
+            return
+
+        pl_rows = self._rules.get('layout', {}).get('profit_loss_rows', [23, 68])
+        bs_rows = self._rules.get('layout', {}).get('balance_sheet_rows', [3, 19])
+
+        for code, info in duplicates.items():
+            all_bdo_rows = info.get('rows', info) if isinstance(info, dict) else info
+
+            for ma_row in range(bs_rows[0], pl_rows[1] + 1):
+                for col, ref_letter in [(ltm_col, data_letter), (q_col, q_letter)]:
+                    formula = sheet.cell(row=ma_row, column=col).value
+                    if not formula or not isinstance(formula, str) or not formula.startswith('='):
+                        continue
+
+                    refs_in_formula = set()
+                    for bdo_row in all_bdo_rows:
+                        if f'{ref_letter}{bdo_row}' in formula:
+                            refs_in_formula.add(bdo_row)
+
+                    if not refs_in_formula:
+                        continue
+
+                    missing = [r for r in all_bdo_rows if r not in refs_in_formula]
+                    if missing:
+                        for mr in missing:
+                            ref = f"'{bdo_name}'!{ref_letter}{mr}"
+                            if ref not in formula:
+                                formula += f"+{ref}"
+                        sheet.cell(row=ma_row, column=col).value = formula
+                        logger.info(
+                            f"[Duplicates] Added code {code} rows {missing} "
+                            f"to MA row {ma_row} col {get_column_letter(col)}"
+                        )
+
     def _post_build_coverage_audit(self, sheet, bdo_sheet, ltm_col: int,
                                    q_col: int, bdo_name: str,
                                    structure: Dict[str, Any]):
@@ -547,10 +600,20 @@ class ManagementAccountsBuilder:
                     for m in _re.findall(r'[HG](\d+)', f):
                         referenced.add(int(m))
 
+        q_cols = rules.get('bdo', {}).get('quarter_columns', [4, 5, 6, 7])
+        q_bdo_col = q_cols[-1] if q_cols else 7
+
         missing_count = 0
         for bdo_row in range(pl_start, resultaat_row):
             h = bdo_sheet.cell(row=bdo_row, column=data_col).value
-            if isinstance(h, (int, float)) and h != 0 and bdo_row not in referenced:
+            g = bdo_sheet.cell(row=bdo_row, column=q_bdo_col).value
+
+            h_has_value = (isinstance(h, (int, float)) and h != 0) or \
+                          (isinstance(h, str) and h.startswith('='))
+            g_has_value = (isinstance(g, (int, float)) and g != 0) or \
+                          (isinstance(g, str) and g.startswith('='))
+
+            if (h_has_value or g_has_value) and bdo_row not in referenced:
                 for col, ref_letter in [(ltm_col, data_col_letter),
                                         (q_col, q_bdo_col_letter)]:
                     cell = sheet.cell(row=catch_all, column=col)
@@ -1699,10 +1762,34 @@ class ManagementAccountsBuilder:
         else:
             return f"={sign}{operator.join(refs)}"
     
+    def _get_all_rows_for_account(self, code: str) -> List[int]:
+        """
+        Get ALL BDO rows for an account code, including duplicate occurrences.
+        Returns list of row numbers sorted ascending.
+        """
+        rows = []
+        primary = self._find_account_row(code)
+        if primary:
+            rows.append(primary)
+
+        bdo_sheet_name = self.config.bdo_sheet_name
+        if bdo_sheet_name in self.workbook.sheetnames:
+            bdo_sheet = self.workbook[bdo_sheet_name]
+            for row_idx in range(1, bdo_sheet.max_row + 1):
+                cell_code = bdo_sheet.cell(row=row_idx, column=1).value
+                if cell_code and str(cell_code).strip() == code:
+                    if row_idx not in rows:
+                        rows.append(row_idx)
+
+        rows.sort()
+        return rows
+
     def _build_balance_sheet_sum_formula(self, template: Dict[str, Any], bdo_sheet_name: str,
                                           bdo_column: str) -> Optional[str]:
         """Build a Balance Sheet SUM formula for a range of accounts.
-        Uses _find_sum_range_end() to dynamically extend ranges."""
+        Uses _find_sum_range_end() for same-section prefix extension only.
+        Skips additional refs already inside the SUM range.
+        Handles duplicate account codes by adding all occurrences."""
         start_account = template.get('start_account')
         end_account = template.get('end_account')
         count = template.get('count')
@@ -1726,20 +1813,25 @@ class ManagementAccountsBuilder:
             end_row = None
 
         parts = []
+        sum_range = set()
 
         if start_row and end_row and end_row > start_row:
             parts.append(
                 f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row}"
                 f":{bdo_column}{end_row})")
+            sum_range = set(range(start_row, end_row + 1))
         elif start_row and count == 1:
             parts.append(f"SUM('{bdo_sheet_name}'!{bdo_column}{start_row})")
+            sum_range = {start_row}
         elif start_row:
             parts.append(f"'{bdo_sheet_name}'!{bdo_column}{start_row}")
+            sum_range = {start_row}
 
         for code in additional:
-            row_num = self._find_account_row(code)
-            if row_num:
-                parts.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
+            all_rows = self._get_all_rows_for_account(code)
+            for row_num in all_rows:
+                if row_num not in sum_range:
+                    parts.append(f"'{bdo_sheet_name}'!{bdo_column}{row_num}")
 
         if not parts:
             return None
@@ -2875,15 +2967,19 @@ class ManagementAccountsBuilder:
             else:
                 logger.warning(f"[BDO Align] No calc_formula for row {row_key}")
 
-        # Discover BDO structure dynamically for interest + coverage
+        # Discover BDO structure dynamically for interest, duplicates, coverage
         bdo_sheet = (self.workbook[bdo_name]
                      if bdo_name in self.workbook.sheetnames else None)
         if bdo_sheet:
             structure = self._discover_bdo_structure(bdo_sheet)
+            q_col = ltm_col - 1
+
             self._build_ltm_interest(
                 ws, ltm_col, bdo_sheet, bdo_name, structure)
 
-            q_col = ltm_col - 1
+            self._handle_duplicate_accounts(
+                ws, bdo_sheet, ltm_col, q_col, bdo_name, structure)
+
             self._post_build_coverage_audit(
                 ws, bdo_sheet, ltm_col, q_col, bdo_name, structure)
 

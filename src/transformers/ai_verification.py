@@ -1009,12 +1009,15 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
     c) Emit a patch to add the missing reference.
     Pay special attention to UNLABELED ROWS and DUPLICATE ACCOUNT CODES.
 
-13. SUM RANGE BOUNDARY CHECK:
-    For every formula using SUM('{bdo_name}'!{bdo_col_letter}N:{bdo_col_letter}M):
-    a) Check if BDO rows M+1, M+2 etc. have matching account code prefixes
-       AND non-zero values.
-    b) If found, the SUM range must be extended to include them.
-    c) Emit a formula patch with the corrected range.
+13. SUM RANGE AND DUPLICATE ACCOUNT CHECK:
+    NEVER extend a SUM range to handle duplicates or rows from a different section.
+    SUM ranges represent contiguous BDO structural sections.
+    - If a duplicate account code exists outside a SUM range, add it as an
+      explicit +'{bdo_name}'!{bdo_col_letter}<row> term APPENDED to the formula.
+    - Only extend a SUM range if a new row is contiguous AND shares the same
+      account code prefix (same structural section).
+    - Check the DUPLICATE ACCOUNT CODES list: for each duplicate, verify ALL
+      row occurrences are referenced in Management Cijfers formulas.
 {cv_section}"""
 
     def _response_format_section(self) -> str:
@@ -1773,24 +1776,31 @@ class AIVerificationOrchestrator:
 
                 catch_all_row = rules.get('layout', {}).get('other_costs_row')
                 if catch_all_row:
-                    q_bdo_letter = get_column_letter(
-                        bdo_cfg.get('quarter_columns', [4, 5, 6, 7])[-1])
+                    q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+                    q_bdo_col = q_cols[-1] if q_cols else 7
+                    q_bdo_letter = get_column_letter(q_bdo_col)
                     for bdo_row in range(pl_start_row, resultaat_row):
                         h_val = bdo_sheet.cell(row=bdo_row, column=data_col).value
-                        if isinstance(h_val, (int, float)) and h_val != 0:
-                            if bdo_row not in referenced_rows:
-                                for col, ref_l in [(ltm_col, data_col_letter),
-                                                   (ltm_col - 1, q_bdo_letter)]:
-                                    cell = sheet.cell(row=catch_all_row, column=col)
-                                    cur = str(cell.value) if cell.value else ''
-                                    ref = f"'{bdo_name}'!{ref_l}{bdo_row}"
-                                    if ref not in cur and cur.startswith('='):
-                                        cell.value = cur + f"-{ref}"
-                                        needs_save = True
-                                logger.warning(
-                                    f"[Post-patch] Added unreferenced BDO row "
-                                    f"{bdo_row} to catch-all row {catch_all_row}"
-                                )
+                        g_val = bdo_sheet.cell(row=bdo_row, column=q_bdo_col).value
+
+                        h_has = (isinstance(h_val, (int, float)) and h_val != 0) or \
+                                (isinstance(h_val, str) and h_val.startswith('='))
+                        g_has = (isinstance(g_val, (int, float)) and g_val != 0) or \
+                                (isinstance(g_val, str) and g_val.startswith('='))
+
+                        if (h_has or g_has) and bdo_row not in referenced_rows:
+                            for col, ref_l in [(ltm_col, data_col_letter),
+                                               (ltm_col - 1, q_bdo_letter)]:
+                                cell = sheet.cell(row=catch_all_row, column=col)
+                                cur = str(cell.value) if cell.value else ''
+                                ref = f"'{bdo_name}'!{ref_l}{bdo_row}"
+                                if ref not in cur and cur.startswith('='):
+                                    cell.value = cur + f"-{ref}"
+                                    needs_save = True
+                            logger.warning(
+                                f"[Post-patch] Added unreferenced BDO row "
+                                f"{bdo_row} to catch-all row {catch_all_row}"
+                            )
 
         if needs_save:
             wb.save(workbook_path)

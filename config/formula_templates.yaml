@@ -40,7 +40,6 @@ balance_sheet:
     start_account: "1600000"
     end_account: "1610803"
     count: 5
-    prefix: "16"
     
   5:
     label: "Financial fixed assets"
@@ -71,7 +70,6 @@ balance_sheet:
     start_account: "2040200"
     end_account: "2040900"
     count: 3
-    prefix: "204"
     additional: ["2300001", "2040601"]
     
   9:
@@ -88,7 +86,6 @@ balance_sheet:
     start_account: "1000002"
     end_account: "1160000"
     count: 3
-    prefix: "1"
     
   11:
     label: "AC Shareholder"
@@ -123,7 +120,6 @@ balance_sheet:
     start_account: "2730001"
     end_account: "2650001"
     count: 6
-    prefix: "2"
     
   16:
     label: "VAT payable"
