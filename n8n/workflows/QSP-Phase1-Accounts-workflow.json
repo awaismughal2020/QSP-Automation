@@ -19,10 +19,18 @@
               "fieldType": "dropdown",
               "fieldOptions": {
                 "values": [
-                  { "option": "Q1" },
-                  { "option": "Q2" },
-                  { "option": "Q3" },
-                  { "option": "Q4" }
+                  {
+                    "option": "Q1"
+                  },
+                  {
+                    "option": "Q2"
+                  },
+                  {
+                    "option": "Q3"
+                  },
+                  {
+                    "option": "Q4"
+                  }
                 ]
               },
               "requiredField": true
@@ -66,7 +74,10 @@
       "name": "Phase 1 Form",
       "type": "n8n-nodes-base.formTrigger",
       "typeVersion": 2.1,
-      "position": [1248, 816],
+      "position": [
+        1248,
+        816
+      ],
       "webhookId": "generate-accounts"
     },
     {
@@ -90,7 +101,10 @@
       "name": "Upload BDO",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [1792, 448]
+      "position": [
+        1792,
+        448
+      ]
     },
     {
       "parameters": {
@@ -113,7 +127,10 @@
       "name": "Upload MA",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [1792, 624]
+      "position": [
+        1792,
+        624
+      ]
     },
     {
       "parameters": {
@@ -136,7 +153,10 @@
       "name": "Upload Rent Roll",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [1792, 784]
+      "position": [
+        1792,
+        784
+      ]
     },
     {
       "parameters": {
@@ -159,7 +179,10 @@
       "name": "Upload Sales",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [1792, 944]
+      "position": [
+        1792,
+        944
+      ]
     },
     {
       "parameters": {
@@ -182,7 +205,10 @@
       "name": "Upload Compliance",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [1792, 1104]
+      "position": [
+        1792,
+        1104
+      ]
     },
     {
       "parameters": {
@@ -190,7 +216,10 @@
       },
       "type": "n8n-nodes-base.merge",
       "typeVersion": 3.2,
-      "position": [2128, 752],
+      "position": [
+        2128,
+        752
+      ],
       "id": "phase1-merge",
       "name": "Merge"
     },
@@ -204,7 +233,10 @@
       "name": "Wait All Uploads",
       "type": "n8n-nodes-base.merge",
       "typeVersion": 3,
-      "position": [2416, 832],
+      "position": [
+        2416,
+        832
+      ],
       "alwaysOutputData": true
     },
     {
@@ -213,14 +245,17 @@
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2656, 832],
+      "position": [
+        2656,
+        832
+      ],
       "id": "phase1-build-request",
       "name": "Build Request"
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "http://qsp-automation-api:8000/api/v1/generate-accounts",
+        "url": "http://qsp-automation-api:8000/api/v1/generate-accounts-async",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify($json) }}",
@@ -230,14 +265,31 @@
               "responseFormat": "json"
             }
           },
-          "timeout": 600000
+          "timeout": 60000
         }
       },
       "id": "phase1-generate",
-      "name": "Generate Accounts",
+      "name": "Start Phase 1 Job",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [2912, 832]
+      "position": [
+        2912,
+        832
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nif (j.job_id) {\n  return [{ json: { job_id: j.job_id } }];\n}\nlet msg = j.message || (j.error && j.error.message);\nif (!msg && j.detail != null) {\n  msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);\n}\nif (!msg) {\n  try { msg = JSON.stringify(j); } catch (e) { msg = 'Unknown error starting Phase 1 job'; }\n}\nreturn [{ json: { errors: [String(msg)], message: 'Failed to start Phase 1 job' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3032,
+        832
+      ],
+      "id": "phase1-parse-start",
+      "name": "Parse Start Response"
     },
     {
       "parameters": {
@@ -250,12 +302,12 @@
           },
           "conditions": [
             {
-              "id": "success-check",
-              "leftValue": "={{ $json.status }}",
-              "rightValue": "success",
+              "id": "job-id-check",
+              "leftValue": "={{ String($json.job_id || '') }}",
+              "rightValue": "",
               "operator": {
                 "type": "string",
-                "operation": "equals"
+                "operation": "notEquals"
               }
             }
           ],
@@ -264,15 +316,18 @@
         "options": {}
       },
       "id": "phase1-success-check",
-      "name": "Success?",
+      "name": "Job Started?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [3152, 832]
+      "position": [
+        3264,
+        832
+      ]
     },
     {
       "parameters": {
         "respondWith": "text",
-        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 1 Complete</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#4ade80;margin-bottom:20px}\n        .phase-badge{display:inline-block;background:#3b82f6;color:#fff;padding:4px 12px;border-radius:4px;font-size:14px;margin-bottom:15px}\n        .btn{display:inline-block;margin:8px 8px 8px 0;padding:12px 20px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px;font-weight:500}\n        .btn:hover{background:#2563eb}\n        .btn-next{background:#22c55e}\n        .btn-next:hover{background:#16a34a}\n        .stats{background:#0f172a;padding:15px;border-radius:8px;margin:15px 0}\n        .next-steps{background:#1e3a5f;padding:20px;border-radius:8px;margin:20px 0;border-left:4px solid #3b82f6}\n        .review-note{background:#1e3a5f;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b;color:#fcd34d}\n        .warn{background:#422006;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b;color:#fbbf24}\n        .warn ul{margin:8px 0 0 20px;padding:0}\n        .warn li{margin:4px 0}\n        .ai-pass{background:#052e16;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #4ade80;color:#86efac}\n        .ai-issues{background:#1e1b4b;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #818cf8;color:#c7d2fe}\n        .ai-skip{background:#1c1917;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #78716c;color:#d6d3d1}\n        a{color:#60a5fa}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <span class=\"phase-badge\">Phase 1 of 3</span>\n    <h1>✅ Draft Files Generated!</h1>\n    <div class=\"stats\">\n        <p><strong>Job ID:</strong> {{ $json.job_id }}</p>\n        <p><strong>Execution Time:</strong> {{ $json.execution_time_seconds ? $json.execution_time_seconds.toFixed(1) + ' seconds' : 'N/A' }}</p>\n    </div>\n    {{ $json.ai_verification ? ($json.ai_verification.status === 'PASS' ? '<div class=\"ai-pass\"><strong>🤖 AI Verification: PASS</strong><p>All formulas, values, sign conventions, and formatting verified by Claude.</p></div>' : $json.ai_verification.status === 'ISSUES_FOUND' ? '<div class=\"ai-issues\"><strong>🤖 AI Verification: ' + $json.ai_verification.patches_applied + ' issue(s) auto-corrected</strong><p>' + ($json.ai_verification.notes || 'Patches applied to Management Accounts file') + '</p><p>Re-validation: ' + ($json.ai_verification.revalidation_passed ? '✅ Passed' : '⚠️ Review needed') + '</p></div>' : '<div class=\"ai-skip\"><strong>🤖 AI Verification: ' + $json.ai_verification.status + '</strong><p>' + ($json.ai_verification.notes || '') + '</p></div>') : '' }}\n    <h3>📥 Download Generated Files for Review:</h3>\n    <p>\n    {{ ($json.output_files || []).map(f => '<a class=\"btn\" href=\"http://localhost:8000/api/v1/outputs/' + f.split('/').pop() + '\" target=\"_blank\">📄 ' + f.split('/').pop() + '</a>').join(' ') }}\n    </p>\n    {{ $json.warnings && $json.warnings.length > 0 ? '<div class=\"warn\"><strong>⚠️ Data Validation Warning:</strong><ul>' + $json.warnings.map(w => '<li>' + w + '</li>').join('') + '</ul></div>' : '' }}\n    <div class=\"review-note\">\n        <p><strong>⚠️ Important:</strong> These are draft files. Download and review both the <strong>Management Accounts</strong> and the <strong>Compliance Certificate</strong> before proceeding. Any edits you make will be used in all subsequent phases.</p>\n    </div>\n    <div class=\"next-steps\">\n        <h3>📋 Next Steps:</h3>\n        <ol>\n            <li>Download and review the <strong>Management Accounts</strong></li>\n            <li>Download and review the <strong>Compliance Certificate</strong></li>\n            <li>Make any necessary edits to both files</li>\n            <li>Proceed to <strong>Phase 2</strong> and re-upload the reviewed files</li>\n        </ol>\n        <a class=\"btn btn-next\" href=\"/form/generate-word-report\">➡️ Continue to Phase 2</a>\n    </div>\n    <p style=\"margin-top:25px\"><a href=\"/form/generate-accounts\">← Start Over</a></p>\n</div>\n</body>\n</html>",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 1</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#94a3b8;margin-bottom:20px}\n        h1.done-ok{color:#4ade80}\n        h1.done-fail{color:#f87171}\n        .phase-badge{display:inline-block;background:#3b82f6;color:#fff;padding:4px 12px;border-radius:4px;font-size:14px;margin-bottom:15px}\n        .btn{display:inline-block;margin:8px 8px 8px 0;padding:12px 20px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px;font-weight:500}\n        .btn:hover{background:#2563eb}\n        .btn-next{background:#22c55e}\n        .btn-next:hover{background:#16a34a}\n        .stats{background:#0f172a;padding:15px;border-radius:8px;margin:15px 0}\n        .next-steps{background:#1e3a5f;padding:20px;border-radius:8px;margin:20px 0;border-left:4px solid #3b82f6}\n        .review-note{background:#1e3a5f;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b;color:#fcd34d}\n        .warn{background:#422006;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #f59e0b;color:#fbbf24}\n        .warn ul{margin:8px 0 0 20px;padding:0}\n        .warn li{margin:4px 0}\n        .ai-pass{background:#052e16;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #4ade80;color:#86efac}\n        .ai-issues{background:#1e1b4b;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #818cf8;color:#c7d2fe}\n        .ai-skip{background:#1c1917;padding:15px;border-radius:8px;margin:15px 0;border-left:4px solid #78716c;color:#d6d3d1}\n        .err{background:#450a0a;padding:20px;border-radius:8px;border-left:4px solid #ef4444}\n        a{color:#60a5fa}\n    </style>\n</head>\n<body>\n<div class=\"box\" id=\"box\">\n    <span class=\"phase-badge\">Phase 1 of 3</span>\n    <div id=\"status\">\n        <h1>\u23f3 Processing\u2026</h1>\n        <p>Your Management Accounts and Compliance Certificate are being generated. This page updates automatically; AI verification can take several minutes.</p>\n        <p id=\"detail\">Connecting\u2026</p>\n    </div>\n    <div id=\"result\"></div>\n</div>\n<script>\n(function(){\n  var API_BASE = \"http://localhost:8000\";\n  var JOB_ID = \"{{ $json.job_id }}\";\n  var POLL_MS = 5000;\n  var MAX_ATTEMPTS = 300;\n  var n = 0;\n  var detail = document.getElementById(\"detail\");\n  var result = document.getElementById(\"result\");\n  var statusBox = document.getElementById(\"status\");\n  var h1 = statusBox.querySelector(\"h1\");\n\n  function esc(s) {\n    if (s == null) return \"\";\n    return String(s).replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\").replace(/\"/g,\"&quot;\");\n  }\n\n  function renderAI(v) {\n    if (!v) return \"\";\n    if (v.status === \"PASS\") return '<div class=\"ai-pass\"><strong>\ud83e\udd16 AI Verification: PASS</strong><p>All formulas, values, sign conventions, and formatting verified by Claude.</p></div>';\n    if (v.status === \"ISSUES_FOUND\") {\n      var notes = esc(v.notes || \"Patches applied to Management Accounts file\");\n      var rev = v.revalidation_passed ? \"\u2705 Passed\" : \"\u26a0\ufe0f Review needed\";\n      return '<div class=\"ai-issues\"><strong>\ud83e\udd16 AI Verification: ' + (v.patches_applied || 0) + ' issue(s) auto-corrected</strong><p>' + notes + '</p><p>Re-validation: ' + rev + '</p></div>';\n    }\n    return '<div class=\"ai-skip\"><strong>\ud83e\udd16 AI Verification: ' + esc(v.status) + '</strong><p>' + esc(v.notes || \"\") + '</p></div>';\n  }\n\n  function showSuccess(data) {\n    h1.textContent = \"\u2705 Draft Files Generated!\";\n    h1.className = \"done-ok\";\n    var exec = (data.execution_time_seconds != null) ? (Number(data.execution_time_seconds).toFixed(1) + \" seconds\") : \"N/A\";\n    var html = '<div class=\"stats\"><p><strong>Job ID:</strong> ' + esc(data.job_id) + '</p><p><strong>Execution Time:</strong> ' + exec + '</p></div>';\n    html += renderAI(data.ai_verification);\n    html += '<h3>\ud83d\udce5 Download Generated Files for Review:</h3><p>';\n    (data.output_files || []).forEach(function(f) {\n      var name = f.split(\"/\").pop();\n      html += '<a class=\"btn\" href=\"' + API_BASE + '/api/v1/outputs/' + encodeURIComponent(name) + '\" target=\"_blank\">\ud83d\udcc4 ' + esc(name) + '</a> ';\n    });\n    html += '</p>';\n    if (data.warnings && data.warnings.length) {\n      html += '<div class=\"warn\"><strong>\u26a0\ufe0f Data Validation Warning:</strong><ul>';\n      data.warnings.forEach(function(w) { html += '<li>' + esc(w) + '</li>'; });\n      html += '</ul></div>';\n    }\n    html += '<div class=\"review-note\"><p><strong>\u26a0\ufe0f Important:</strong> These are draft files. Download and review both the <strong>Management Accounts</strong> and the <strong>Compliance Certificate</strong> before proceeding. Any edits you make will be used in all subsequent phases.</p></div>';\n    html += '<div class=\"next-steps\"><h3>\ud83d\udccb Next Steps:</h3><ol><li>Download and review the <strong>Management Accounts</strong></li><li>Download and review the <strong>Compliance Certificate</strong></li><li>Make any necessary edits to both files</li><li>Proceed to <strong>Phase 2</strong> and re-upload the reviewed files</li></ol><a class=\"btn btn-next\" href=\"/form/generate-word-report\">\u27a1\ufe0f Continue to Phase 2</a></div><p style=\"margin-top:25px\"><a href=\"/form/generate-accounts\">\u2190 Start Over</a></p>';\n    result.innerHTML = html;\n    statusBox.querySelector(\"p\").style.display = \"none\";\n    detail.style.display = \"none\";\n  }\n\n  function showFail(data) {\n    h1.textContent = \"\u274c Phase 1 Generation Failed\";\n    h1.className = \"done-fail\";\n    var errs = (data && data.errors) || [];\n    var msg = \"\";\n    errs.forEach(function(e) { msg += \"<p>\u2022 \" + esc(e) + \"</p>\"; });\n    if (data && data.message) msg += \"<p>\u2022 \" + esc(data.message) + \"</p>\";\n    result.innerHTML = '<div class=\"err\"><p><strong>Error Details:</strong></p>' + msg + '</div><a class=\"btn\" href=\"/form/generate-accounts\">\ud83d\udd04 Try Again</a>';\n    statusBox.querySelector(\"p\").style.display = \"none\";\n    detail.style.display = \"none\";\n  }\n\n  function tick() {\n    n++;\n    if (n > MAX_ATTEMPTS) {\n      detail.textContent = \"Timed out waiting for the server. Check n8n execution logs or try again.\";\n      return;\n    }\n    detail.textContent = \"Checking status\u2026 (poll \" + n + \")\";\n    fetch(API_BASE + \"/api/v1/jobs/\" + encodeURIComponent(JOB_ID))\n      .then(function(r) { return r.json(); })\n      .then(function(j) {\n        if (j.status === \"pending\" || j.status === \"running\") {\n          setTimeout(tick, POLL_MS);\n          return;\n        }\n        if (j.status === \"completed\" && j.result) {\n          if (j.result.status === \"success\") showSuccess(j.result);\n          else showFail(j.result);\n          return;\n        }\n        if (j.status === \"failed\") {\n          showFail(j.result || { errors: [\"Job failed\"], message: \"\" });\n          return;\n        }\n        detail.textContent = \"Unexpected status: \" + (j.status || \"?\");\n        setTimeout(tick, POLL_MS);\n      })\n      .catch(function(e) {\n        detail.textContent = \"Network error: \" + (e.message || e);\n        setTimeout(tick, POLL_MS);\n      });\n  }\n  tick();\n})();\n</script>\n</body>\n</html>",
         "options": {
           "responseHeaders": {
             "entries": [
@@ -285,15 +340,18 @@
         }
       },
       "id": "phase1-success-page",
-      "name": "Success Page",
+      "name": "Polling Page",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [3472, 736]
+      "position": [
+        3472,
+        736
+      ]
     },
     {
       "parameters": {
         "respondWith": "text",
-        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 1 Failed</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#f87171}\n        .err{background:#450a0a;padding:20px;border-radius:8px;border-left:4px solid #ef4444}\n        .btn{display:inline-block;margin-top:20px;padding:12px 24px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <h1>❌ Phase 1 Generation Failed</h1>\n    <div class=\"err\">\n        <p><strong>Error Details:</strong></p>\n        {{ ($json.errors || []).map(e => '<p>• ' + e + '</p>').join('') }}\n        {{ $json.detail ? '<p>• ' + $json.detail + '</p>' : '' }}\n        {{ $json.message ? '<p>• ' + $json.message + '</p>' : '' }}\n    </div>\n    <a class=\"btn\" href=\"/form/generate-accounts\">🔄 Try Again</a>\n</div>\n</body>\n</html>",
+        "responseBody": "=<!DOCTYPE html>\n<html>\n<head>\n    <title>Phase 1 Failed</title>\n    <style>\n        body{font-family:system-ui,sans-serif;max-width:800px;margin:50px auto;padding:20px;background:#0f172a;color:#e2e8f0}\n        .box{background:#1e293b;padding:30px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}\n        h1{color:#f87171}\n        .err{background:#450a0a;padding:20px;border-radius:8px;border-left:4px solid #ef4444}\n        .btn{display:inline-block;margin-top:20px;padding:12px 24px;background:#3b82f6;color:#fff;text-decoration:none;border-radius:8px}\n    </style>\n</head>\n<body>\n<div class=\"box\">\n    <h1>\u274c Phase 1 Generation Failed</h1>\n    <div class=\"err\">\n        <p><strong>Error Details:</strong></p>\n        {{ ($json.errors || []).map(e => '<p>\u2022 ' + e + '</p>').join('') }}\n        {{ $json.detail ? '<p>\u2022 ' + $json.detail + '</p>' : '' }}\n        {{ $json.message ? '<p>\u2022 ' + $json.message + '</p>' : '' }}\n    </div>\n    <a class=\"btn\" href=\"/form/generate-accounts\">\ud83d\udd04 Try Again</a>\n</div>\n</body>\n</html>",
         "options": {
           "responseCode": 500,
           "responseHeaders": {
@@ -310,7 +368,10 @@
       "name": "Error Page",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [3472, 928]
+      "position": [
+        3472,
+        928
+      ]
     }
   ],
   "pinData": {},
@@ -318,45 +379,160 @@
     "Phase 1 Form": {
       "main": [
         [
-          { "node": "Upload BDO", "type": "main", "index": 0 },
-          { "node": "Upload MA", "type": "main", "index": 0 },
-          { "node": "Upload Rent Roll", "type": "main", "index": 0 },
-          { "node": "Upload Sales", "type": "main", "index": 0 },
-          { "node": "Upload Compliance", "type": "main", "index": 0 }
+          {
+            "node": "Upload BDO",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload MA",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Rent Roll",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Sales",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upload Compliance",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
     "Upload BDO": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Upload MA": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 1 }]]
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
     },
     "Upload Rent Roll": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 2 }]]
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
     },
     "Upload Sales": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 3 }]]
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
     },
     "Upload Compliance": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 4 }]]
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
     },
     "Merge": {
-      "main": [[{ "node": "Wait All Uploads", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Wait All Uploads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Wait All Uploads": {
-      "main": [[{ "node": "Build Request", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Build Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Build Request": {
-      "main": [[{ "node": "Generate Accounts", "type": "main", "index": 0 }]]
-    },
-    "Generate Accounts": {
-      "main": [[{ "node": "Success?", "type": "main", "index": 0 }]]
-    },
-    "Success?": {
       "main": [
-        [{ "node": "Success Page", "type": "main", "index": 0 }],
-        [{ "node": "Error Page", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Start Phase 1 Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Phase 1 Job": {
+      "main": [
+        [
+          {
+            "node": "Parse Start Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Start Response": {
+      "main": [
+        [
+          {
+            "node": "Job Started?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Job Started?": {
+      "main": [
+        [
+          {
+            "node": "Polling Page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
@@ -369,5 +545,9 @@
     "instanceId": "qsp-automation-phase1"
   },
   "id": "QSPPhase1Accounts",
-  "tags": ["qsp", "phase1", "accounts"]
+  "tags": [
+    "qsp",
+    "phase1",
+    "accounts"
+  ]
 }

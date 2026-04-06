@@ -431,6 +431,103 @@ async def get_job_status(job_id: str):
 # PHASE 1: Generate Management Accounts + Compliance Certificate
 # ============================================================================
 
+def _http_exception_error_messages(exc: HTTPException) -> List[str]:
+    """Normalize FastAPI HTTPException.detail to a list of strings."""
+    d = exc.detail
+    if isinstance(d, str):
+        return [d]
+    if isinstance(d, list):
+        return [str(x) for x in d]
+    return [str(d)]
+
+
+def _execute_phase1_accounts(request: GenerateAccountsRequest, job_id: str) -> GenerateResponse:
+    """
+    Run Phase 1 synchronously. Raises HTTPException on missing inputs or orchestrator failure.
+    """
+    start_time = datetime.now()
+    logger.info(f"[Job {job_id}] [Phase 1] Starting accounts generation for Q{request.quarter} {request.year}")
+
+    output_dir = Path(request.output_dir) if request.output_dir else OUTPUTS_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    input_files = {
+        "bdo_file": request.bdo_file,
+        "prev_ma_file": request.prev_ma_file,
+        "rent_roll_file": request.rent_roll_file,
+        "sales_tracker_file": request.sales_tracker_file,
+        "prev_compliance_file": request.prev_compliance_file,
+    }
+
+    resolved_files = {}
+    missing_files = []
+
+    for name, path_str in input_files.items():
+        resolved_path = resolve_input_path(path_str)
+        if not resolved_path.exists():
+            missing_files.append(f"{name}: {path_str} (resolved: {resolved_path})")
+        else:
+            resolved_files[name] = resolved_path
+            logger.info(f"[Job {job_id}] Resolved {name}: {path_str} -> {resolved_path}")
+
+    if missing_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing input files: {', '.join(missing_files)}"
+        )
+
+    config = QuarterlyReportConfig(
+        year=request.year,
+        quarter=request.quarter,
+        bdo_file=resolved_files["bdo_file"],
+        previous_management_accounts=resolved_files["prev_ma_file"],
+        rent_roll_file=resolved_files["rent_roll_file"],
+        sales_tracker_file=resolved_files["sales_tracker_file"],
+        previous_compliance_calc=resolved_files["prev_compliance_file"],
+        word_template=Path("/dev/null"),  # Not used in Phase 1
+        output_dir=output_dir
+    )
+
+    try:
+        orchestrator = QuarterlyReportOrchestrator(config)
+        result = orchestrator.run_accounts_only(dry_run=request.dry_run)
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Error in Phase 1: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Phase 1 generation failed: {str(e)}"
+        )
+
+    execution_time = (datetime.now() - start_time).total_seconds()
+    ai_verification = _extract_ai_verification(result)
+    named = _extract_named_paths(result)
+
+    if result.get('status') == 'success':
+        return GenerateResponse(
+            status="success",
+            job_id=job_id,
+            message=f"Phase 1 complete: Management Accounts and Compliance Certificate generated for Q{request.quarter} {request.year}",
+            output_files=result.get('output_files', []),
+            management_accounts_path=named['management_accounts_path'],
+            compliance_certificate_path=named['compliance_certificate_path'],
+            warnings=result.get('warnings', []),
+            errors=[],
+            execution_time_seconds=execution_time,
+            ai_verification=ai_verification,
+        )
+
+    return GenerateResponse(
+        status="failed",
+        job_id=job_id,
+        message="Phase 1 generation failed",
+        output_files=result.get('output_files', []),
+        warnings=result.get('warnings', []),
+        errors=result.get('errors', []),
+        execution_time_seconds=execution_time,
+        ai_verification=ai_verification,
+    )
+
+
 @app.post("/api/v1/generate-accounts", response_model=GenerateResponse)
 async def generate_accounts(request: GenerateAccountsRequest):
     """
@@ -450,89 +547,9 @@ async def generate_accounts(request: GenerateAccountsRequest):
     The client can download and review/edit the Compliance Certificate
     before proceeding to Phase 2.
     """
-    start_time = datetime.now()
     job_id = str(uuid.uuid4())[:8]
-    
-    logger.info(f"[Job {job_id}] [Phase 1] Starting accounts generation for Q{request.quarter} {request.year}")
-    
     try:
-        # Resolve file paths
-        output_dir = Path(request.output_dir) if request.output_dir else OUTPUTS_DIR
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Validate input files exist
-        input_files = {
-            "bdo_file": request.bdo_file,
-            "prev_ma_file": request.prev_ma_file,
-            "rent_roll_file": request.rent_roll_file,
-            "sales_tracker_file": request.sales_tracker_file,
-            "prev_compliance_file": request.prev_compliance_file,
-        }
-        
-        resolved_files = {}
-        missing_files = []
-        
-        for name, path_str in input_files.items():
-            resolved_path = resolve_input_path(path_str)
-            if not resolved_path.exists():
-                missing_files.append(f"{name}: {path_str} (resolved: {resolved_path})")
-            else:
-                resolved_files[name] = resolved_path
-                logger.info(f"[Job {job_id}] Resolved {name}: {path_str} -> {resolved_path}")
-        
-        if missing_files:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing input files: {', '.join(missing_files)}"
-            )
-        
-        # Create orchestrator config
-        config = QuarterlyReportConfig(
-            year=request.year,
-            quarter=request.quarter,
-            bdo_file=resolved_files["bdo_file"],
-            previous_management_accounts=resolved_files["prev_ma_file"],
-            rent_roll_file=resolved_files["rent_roll_file"],
-            sales_tracker_file=resolved_files["sales_tracker_file"],
-            previous_compliance_calc=resolved_files["prev_compliance_file"],
-            word_template=Path("/dev/null"),  # Not used in Phase 1
-            output_dir=output_dir
-        )
-        
-        # Run Phase 1 only
-        orchestrator = QuarterlyReportOrchestrator(config)
-        result = orchestrator.run_accounts_only(dry_run=request.dry_run)
-        
-        execution_time = (datetime.now() - start_time).total_seconds()
-        
-        ai_verification = _extract_ai_verification(result)
-        named = _extract_named_paths(result)
-
-        if result.get('status') == 'success':
-            return GenerateResponse(
-                status="success",
-                job_id=job_id,
-                message=f"Phase 1 complete: Management Accounts and Compliance Certificate generated for Q{request.quarter} {request.year}",
-                output_files=result.get('output_files', []),
-                management_accounts_path=named['management_accounts_path'],
-                compliance_certificate_path=named['compliance_certificate_path'],
-                warnings=result.get('warnings', []),
-                errors=[],
-                execution_time_seconds=execution_time,
-                ai_verification=ai_verification,
-            )
-        else:
-            return GenerateResponse(
-                status="failed",
-                job_id=job_id,
-                message="Phase 1 generation failed",
-                output_files=result.get('output_files', []),
-                warnings=result.get('warnings', []),
-                errors=result.get('errors', []),
-                execution_time_seconds=execution_time,
-                ai_verification=ai_verification,
-            )
-            
+        return _execute_phase1_accounts(request, job_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -541,6 +558,57 @@ async def generate_accounts(request: GenerateAccountsRequest):
             status_code=500,
             detail=f"Phase 1 generation failed: {str(e)}"
         )
+
+
+@app.post("/api/v1/generate-accounts-async", response_model=JobStatusResponse)
+async def generate_accounts_async(request: GenerateAccountsRequest, background_tasks: BackgroundTasks):
+    """
+    Start Phase 1 in the background. Returns immediately with job_id; poll GET /api/v1/jobs/{job_id}.
+    Use this from n8n or other clients that cannot keep a long-lived HTTP connection open.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    job_status[job_id] = {"status": "pending", "progress": "Phase 1 queued"}
+    background_tasks.add_task(run_phase1_accounts_task, job_id, request)
+    return JobStatusResponse(
+        job_id=job_id,
+        status="pending",
+        progress="Phase 1 job queued for processing",
+    )
+
+
+async def run_phase1_accounts_task(job_id: str, request: GenerateAccountsRequest):
+    """Background task: run Phase 1 and store GenerateResponse-shaped result for job polling."""
+    try:
+        job_status[job_id]["status"] = "running"
+        job_status[job_id]["progress"] = "Phase 1: generating Management Accounts..."
+        resp = _execute_phase1_accounts(request, job_id)
+        job_status[job_id]["status"] = "completed" if resp.status == "success" else "failed"
+        job_status[job_id]["progress"] = "Completed"
+        job_status[job_id]["result"] = resp.model_dump(mode="json")
+    except HTTPException as e:
+        logger.warning(f"[Job {job_id}] Phase 1 async failed (HTTP): {e.detail}")
+        errs = _http_exception_error_messages(e)
+        job_status[job_id]["status"] = "failed"
+        job_status[job_id]["progress"] = (errs[0] if errs else "Failed")[:500]
+        fail_resp = GenerateResponse(
+            status="failed",
+            job_id=job_id,
+            message="Phase 1 failed",
+            errors=errs,
+            output_files=[],
+        )
+        job_status[job_id]["result"] = fail_resp.model_dump(mode="json")
+    except Exception as e:
+        logger.exception(f"[Job {job_id}] Phase 1 background task failed: {e}")
+        job_status[job_id]["status"] = "failed"
+        job_status[job_id]["progress"] = f"Failed: {str(e)}"
+        job_status[job_id]["result"] = GenerateResponse(
+            status="failed",
+            job_id=job_id,
+            message="Phase 1 failed",
+            errors=[str(e)],
+            output_files=[],
+        ).model_dump(mode="json")
 
 
 # ============================================================================
