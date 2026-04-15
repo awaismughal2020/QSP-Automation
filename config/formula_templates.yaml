@@ -362,11 +362,8 @@ profit_loss:
       sign: "-"
       operator: "-"
     ltm_config:
-      type: bdo_ref_consolidated
-      account_codes: ["4601000", "4611000", "4613000", "4620200", "4623001", "4643000", "4642000"]
-      sign: "-"
-      operator: "-"
-      note: "LTM consolidates ALL interest accounts (BDO H113-H119) to avoid quarterly rounding"
+      type: mirror_quarter_g_to_h
+      note: "LTM = quarter row 60 formula with BDO !G swapped to !H (set by _apply_interest_section_overrides)"
 
   61:
     label: "(Prepaid derivatives transaction- SFA)"

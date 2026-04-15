@@ -231,7 +231,7 @@ class ManagementAccountsBuilder:
     ) -> None:
         """
         Deterministic post-AI safety net for interest rows:
-        - Row 60 LTM: rebuild consolidated BDO H formula from config account codes
+        - Row 60 LTM: copy quarter row 60 formula, swap BDO !G→!H
         - Rows 61/64 LTM: =SUM(Y:quarter_col)
         - Row 60 quarter: extend from previous column
         """
@@ -258,20 +258,6 @@ class ManagementAccountsBuilder:
                 return
             new_quarter_col = ltm_col - 1
 
-            # Rebuild LTM row 60 from config (undo any AI patches)
-            # Use the last BDO sheet (newest quarter)
-            bdo_sheet_name = None
-            for sn in wb.sheetnames:
-                if sn.startswith('BDO'):
-                    bdo_sheet_name = sn
-            if bdo_sheet_name:
-                bdo_sheet = wb[bdo_sheet_name]
-                structure = shell._discover_bdo_structure(bdo_sheet)
-                shell._build_ltm_interest(
-                    sheet, ltm_col, bdo_sheet, bdo_sheet_name, structure
-                )
-
-            # Rows 61/64 LTM SUM + row 60 quarter extension
             shell._apply_interest_section_overrides(
                 sheet, new_quarter_col, ltm_col
             )
@@ -562,43 +548,15 @@ class ManagementAccountsBuilder:
     def _build_ltm_interest(self, sheet, ltm_col: int, bdo_sheet,
                             bdo_name: str, structure: Dict[str, Any]):
         """
-        Build row 60 LTM with ALL interest accounts discovered dynamically
-        from the BDO sheet using account codes from config.
+        Build DMRRP row (65) LTM formula from BDO structure.
+        Row 60 LTM is handled separately by _apply_interest_section_overrides
+        (copy quarter row 60 formula, swap BDO G→H).
         """
         interest_cfg = self._rules.get('interest_section', {})
-        codes = interest_cfg.get('account_codes', [])
-        sfa_row = interest_cfg.get('management_row')
-        absorbed = interest_cfg.get('absorbed_rows', [])
         dmrrp_code = interest_cfg.get('dmrrp_code', '')
         dmrrp_ma_row = interest_cfg.get('dmrrp_row')
         data_col_letter = get_column_letter(
             self._rules.get('bdo', {}).get('data_column', 8))
-
-        if not sfa_row or not codes:
-            return
-
-        interest_bdo_rows = []
-        for code in codes:
-            for r in structure.get('account_to_rows', {}).get(code, []):
-                if r not in interest_bdo_rows:
-                    interest_bdo_rows.append(r)
-
-        if not interest_bdo_rows:
-            logger.warning("[LTM Interest] No BDO rows found for interest accounts")
-            return
-
-        parts = [f"'{bdo_name}'!{data_col_letter}{r}" for r in interest_bdo_rows]
-        formula = "=-" + "-".join(parts)
-        sheet.cell(row=sfa_row, column=ltm_col).value = formula
-        logger.info(
-            f"[LTM Interest] Row {sfa_row}: consolidated {len(interest_bdo_rows)} "
-            f"BDO rows {interest_bdo_rows}"
-        )
-
-        # Rows 61/64 need SUM formulas in LTM, not zero — skip them here;
-        # they are handled by the template processor (horizontal_sum_quarters)
-        # and the _apply_interest_section_overrides safety net.
-        logger.info(f"[LTM Interest] Skipping absorbed rows {absorbed} (SUM formulas set elsewhere)")
 
         if dmrrp_code and dmrrp_ma_row:
             dmrrp_rows = structure.get('account_to_rows', {}).get(dmrrp_code, [])
@@ -1619,10 +1577,16 @@ class ManagementAccountsBuilder:
         self, sheet, new_quarter_col: int, ltm_col: int
     ) -> None:
         """
-        Safety-net for interest rows after template build / AI verification:
-        - Row 60 quarter col: copy prev quarter's formula, shifting column refs.
-        - Rows 61 & 64 LTM col: =SUM(Y{row}:{new_quarter_letter}{row}).
+        Deterministic interest-row overrides:
+        - Row 60 quarter col: extend previous quarter's formula (shift MA column refs).
+        - Row 60 LTM col: copy quarter row 60 formula, swap BDO !G → !H.
+        - Rows 61 & 64 LTM col: =SUM(Y{row}:{quarter_letter}{row}).
         """
+        bdo_cfg = self._rules.get('bdo', {})
+        q_bdo_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        q_bdo_letter = get_column_letter(q_bdo_cols[-1]) if q_bdo_cols else 'G'
+        ltm_bdo_letter = get_column_letter(bdo_cfg.get('data_column', 8))
+
         layout = self._rules.get('layout', {})
         sum_start_col = layout.get('interest_quarter_horizontal_sum_start_column', 25)
 
@@ -1630,6 +1594,7 @@ class ManagementAccountsBuilder:
         prev_letter = get_column_letter(prev_quarter_col)
         new_letter = get_column_letter(new_quarter_col)
 
+        # Row 60 quarter: extend from previous quarter column
         prev_60 = sheet.cell(row=60, column=prev_quarter_col).value
         if isinstance(prev_60, str) and prev_60.startswith('='):
             shifted = _shift_formula_column_letter(prev_60, prev_letter, new_letter)
@@ -1639,6 +1604,17 @@ class ManagementAccountsBuilder:
                     f"Interest row 60: quarter formula derived from col {prev_letter} → {new_letter}"
                 )
 
+        # Row 60 LTM: take quarter row 60 and swap BDO column G→H
+        quarter_60 = sheet.cell(row=60, column=new_quarter_col).value
+        if isinstance(quarter_60, str) and quarter_60.startswith('='):
+            ltm_60 = quarter_60.replace(f'!{q_bdo_letter}', f'!{ltm_bdo_letter}')
+            sheet.cell(row=60, column=ltm_col).value = ltm_60
+            logger.info(
+                f"Interest row 60: LTM formula derived from quarter col "
+                f"{new_letter} (BDO !{q_bdo_letter}→!{ltm_bdo_letter})"
+            )
+
+        # Rows 61 & 64 LTM: horizontal SUM from config start through quarter col
         if new_quarter_col < sum_start_col:
             logger.warning(
                 f"Interest rows 61/64: quarter col {new_quarter_col} < "

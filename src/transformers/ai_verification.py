@@ -728,7 +728,7 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
 
    EXCEPTION — interest rows 60, 61, 64 in LTM column ({ltm}):
    These cells are set deterministically — DO NOT PATCH THEM.
-   - {ltm}60: consolidated BDO H formula with exactly the configured account codes
+   - {ltm}60: mirror of {q}60 with BDO !G swapped to !H (same row numbers)
    - {ltm}61: =SUM({sum_start_letter}61:{q}61)
    - {ltm}64: =SUM({sum_start_letter}64:{q}64)
    Quarter column ({q}): rows 61/64 use normal BDO references via q_config.
@@ -967,30 +967,20 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
    wrong BDO row numbers, missing accounts) — do NOT replace it with a
    hard-coded value. This applies to ALL rows including {auth_row} and {dep_row}.
 
-5. LTM INTEREST CONSOLIDATION + QUARTER COLUMN ROWS 60 / 61 / 64 (DYNAMIC):
-
-   LTM column ({ltm}) — consolidation only here:
-   All P&L interest/financial items must be referenced directly from BDO column
-   {bdo_col_letter} — never as SUM of quarterly Management Cijfers values (rounding drift).
-
-   LTM row {interest_ma_row} ({ltm}{interest_ma_row}) uses ONLY these account codes:
-   {interest_codes_str}
-   Do NOT add any other account codes to this formula.
-   The formula must reference exactly these accounts in BDO column {bdo_col_letter}.
+5. INTEREST ROWS 60, 61, 64 (MANAGED DETERMINISTICALLY — DO NOT PATCH):
 
    Latest QUARTER column ({q}) — rows 60, 61, 64:
-   - Row {interest_ma_row}: usually BDO q_config (per-quarter mutations), OR same-sheet
-     formula extended from column {prev_q_letter} (fill-right pattern). Both are valid.
+   - Row {interest_ma_row}: BDO q_config formula, OR extended from column {prev_q_letter}.
      Do NOT delete a working formula on {q}{interest_ma_row}.
    - Rows 61 and 64 in column {q}: normal BDO reference formulas from q_config.
 
    LTM column ({ltm}) — rows 60, 61, 64 (DO NOT MODIFY):
-   - {ltm}{interest_ma_row}: consolidated BDO {bdo_col_letter} formula with ONLY the
-     account codes listed above. Do NOT add extra BDO rows.
+   - {ltm}{interest_ma_row}: mirror of {q}{interest_ma_row} with BDO !G swapped to !H.
+     It has the SAME BDO row numbers as the quarter column, just column H instead of G.
+     Do NOT add extra BDO rows. Do NOT use a different set of account codes.
    - {ltm}61 MUST contain =SUM({sum_start_letter}61:{q}61)
    - {ltm}64 MUST contain =SUM({sum_start_letter}64:{q}64)
-   These sum all quarter columns from {sum_start_letter} through {q}.
-   Do NOT modify these cells. Do NOT change the SUM start column.
+   These cells are set by deterministic code. Do NOT patch them.
 
    The DMRRP income account ({dmrrp_code}) goes to its own row ({dmrrp_ma_row})
    with a direct BDO {bdo_col_letter} reference (per template).
@@ -1041,7 +1031,7 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
     Pay special attention to UNLABELED ROWS and DUPLICATE ACCOUNT CODES.
 
     EXCEPTION: Cells {ltm}60, {ltm}61, and {ltm}64 are managed deterministically.
-    - {ltm}60 uses ONLY the configured interest account codes — do NOT add extra rows.
+    - {ltm}60 mirrors {q}60 with BDO !G→!H (same row numbers, different column).
     - {ltm}61 and {ltm}64 contain SUM formulas with NO BDO references.
     Do NOT flag these as missing coverage and do NOT patch them.
 
@@ -1057,8 +1047,7 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
 
 14. INTEREST SECTION — PATCH POLICY (NON-NEGOTIABLE):
     DO NOT PATCH any of these LTM cells — they are set deterministically:
-    - {ltm}{interest_ma_row}: consolidated BDO H formula with exactly the configured
-      account codes. NEVER add extra BDO rows.
+    - {ltm}{interest_ma_row}: mirror of {q}{interest_ma_row} with BDO !G→!H
     - {ltm}61: =SUM({sum_start_letter}61:{q}61)
     - {ltm}64: =SUM({sum_start_letter}64:{q}64)
     If any of these cells look different from what you expect, PASS — they are

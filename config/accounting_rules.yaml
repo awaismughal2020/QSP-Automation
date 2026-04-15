@@ -87,8 +87,9 @@ layout:
     66: "=SUM({col}57:{col}65)"
     68: "={col}66+{col}67"
 
-  # LTM-only calc formula overrides (empty = same as quarter)
-  ltm_calc_overrides: {}
+  # LTM-only calc formula overrides (overrides calc_formulas for LTM column only)
+  ltm_calc_overrides:
+    19: "=SUM({col}3:{col}18)"
 
   # Intermediate P&L rows (net interest, derivatives, etc.)
   intermediate_rows: [60, 61, 64, 65, 67]
