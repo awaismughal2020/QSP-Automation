@@ -1614,15 +1614,11 @@ class ManagementAccountsBuilder:
                 f"{new_letter} (BDO !{q_bdo_letter}→!{ltm_bdo_letter})"
             )
 
-        # Rows 61 & 64 LTM: horizontal SUM from config start through quarter col
-        if new_quarter_col < sum_start_col:
-            logger.warning(
-                f"Interest rows 61/64: quarter col {new_quarter_col} < "
-                f"start col {sum_start_col}, skipping LTM SUM"
-            )
-            return
-
-        start_letter = get_column_letter(sum_start_col)
+        # Rows 61 & 64 LTM: SUM of last 4 quarter columns
+        sum_start = new_quarter_col - 3
+        if sum_start < 2:
+            sum_start = 2
+        start_letter = get_column_letter(sum_start)
         quarter_letter = get_column_letter(new_quarter_col)
         for row_num in (61, 64):
             formula = f'=SUM({start_letter}{row_num}:{quarter_letter}{row_num})'
@@ -1758,23 +1754,17 @@ class ManagementAccountsBuilder:
         prev_col_idx: Optional[int]
     ) -> Optional[str]:
         """
-        Build =SUM(Y{row}:{prev_quarter_col}{row}) for the LTM column.
+        Build =SUM of last 4 quarter columns for the LTM column.
 
-        Used for rows 61/64 in the LTM column: sums from the configured start
-        column (default Y/25) through the latest quarter column (prev_col_idx).
+        Used for rows 61/64 in the LTM column.
+        prev_col_idx is the newest quarter column (the column just before LTM).
         """
-        layout = self._rules.get('layout', {})
-        sum_start_col = layout.get('interest_quarter_horizontal_sum_start_column', 25)
-
         prev_quarter_col = prev_col_idx if prev_col_idx else (new_quarter_col - 1)
-        if prev_quarter_col < sum_start_col:
-            logger.warning(
-                f"Row {row_idx}: prev_quarter_col {prev_quarter_col} < "
-                f"start col {sum_start_col}, cannot build horizontal SUM"
-            )
-            return None
+        sum_start = prev_quarter_col - 3
+        if sum_start < 2:
+            sum_start = 2
 
-        start_letter = get_column_letter(sum_start_col)
+        start_letter = get_column_letter(sum_start)
         prev_letter = get_column_letter(prev_quarter_col)
         formula = f"=SUM({start_letter}{row_idx}:{prev_letter}{row_idx})"
         logger.info(f"Row {row_idx}: horizontal SUM formula: {formula}")

@@ -677,13 +677,13 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
         ltm = context.get('ltm_col_letter', 'AB')
         rules = context.get('accounting_rules', {})
         layout = rules.get('layout', {})
-        sum_start_idx = layout.get('interest_quarter_horizontal_sum_start_column', 25)
-        sum_start_letter = get_column_letter(sum_start_idx)
         try:
             q_idx = column_index_from_string(str(q).upper())
             prev_q_letter = get_column_letter(q_idx - 1) if q_idx > 1 else q
+            sum_start_letter = get_column_letter(max(q_idx - 3, 2))
         except Exception:
             prev_q_letter = '(column immediately left of quarter column)'
+            sum_start_letter = '?'
 
         return f"""FORMULA CONSTRUCTION RULES (how to verify each formula type):
 
@@ -886,13 +886,13 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
         dmrrp_code = interest_cfg.get('dmrrp_code', '4663000')
         dmrrp_ma_row = interest_cfg.get('dmrrp_row', 65)
 
-        sum_start_idx = layout.get('interest_quarter_horizontal_sum_start_column', 25)
-        sum_start_letter = get_column_letter(sum_start_idx)
         try:
             _q_idx = column_index_from_string(str(q).upper())
             prev_q_letter = get_column_letter(_q_idx - 1) if _q_idx > 1 else q
+            sum_start_letter = get_column_letter(max(_q_idx - 3, 2))
         except Exception:
             prev_q_letter = '(column left of quarter)'
+            sum_start_letter = '?'
 
         # Computed values from MA builder (pre-computed expected values)
         computed = context.get('computed_values_snapshot', {})
