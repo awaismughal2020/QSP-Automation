@@ -18,9 +18,9 @@ identity_alignment:
 # All BDO rows are discovered dynamically from these account codes.
 interest_section:
   management_row: 60          # MA row for consolidated interest
-  absorbed_rows: [61, 64]     # MA rows zeroed for LTM (content in management_row)
+  absorbed_rows: [61, 64]     # Interest sub-rows; LTM uses horizontal SUMs (not consolidated into 60)
   dmrrp_row: 65               # MA row for DMRRP income
-  account_codes:              # Interest accounts to consolidate (looked up dynamically)
+  account_codes:              # LTM row 60: consolidated BDO column H (discovered rows)
     - "4601000"
     - "4611000"
     - "4613000"
@@ -92,6 +92,11 @@ layout:
 
   # Intermediate P&L rows (net interest, derivatives, etc.)
   intermediate_rows: [60, 61, 64, 65, 67]
+
+  # First Management Cijfers column included in =SUM(...) for interest rows 61 & 64
+  # (new quarter column gets SUM from this column through the prior quarter column).
+  # Excel column index: Y = 25 (Q4 2025 → AC gives =SUM(Y61:AB61); Q1 2026 → AD gives =SUM(Y61:AC61)).
+  interest_quarter_horizontal_sum_start_column: 25
 
 # ─── Styling ───
 styling:

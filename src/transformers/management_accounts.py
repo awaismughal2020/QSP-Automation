@@ -38,6 +38,29 @@ from loguru import logger
 from ..parsers.bdo_parser import BDOParseResult, AccountEntry
 
 
+def _shift_formula_column_letter(formula: str, from_letter: str, to_letter: str) -> str:
+    """
+    In an Excel formula, replace A1-style references that use from_letter as the
+    column with to_letter (exact column match only, so A does not match AA).
+    """
+    if not formula or not isinstance(formula, str) or not formula.startswith('='):
+        return formula
+    from_u = from_letter.upper()
+
+    def repl(match) -> str:
+        d1, col, d2, row_digits = match.group(1), match.group(2), match.group(3), match.group(4)
+        if col.upper() == from_u:
+            return f'{d1}{to_letter}{d2}{row_digits}'
+        return match.group(0)
+
+    return re.sub(
+        r'(\$?)([A-Z]{1,3})(\$?)(\d+)',
+        repl,
+        formula,
+        flags=re.IGNORECASE,
+    )
+
+
 @dataclass
 class ManagementAccountsConfig:
     """Configuration for Management Accounts generation."""
@@ -202,6 +225,64 @@ class ManagementAccountsBuilder:
             logger.warning(f"Error loading accounting_rules.yaml: {e} — using defaults")
             return defaults
 
+    @classmethod
+    def reapply_interest_overrides_on_saved_workbook(
+        cls, file_path: str, summary_sheet_name: str
+    ) -> None:
+        """
+        Deterministic post-AI safety net for interest rows:
+        - Row 60 LTM: rebuild consolidated BDO H formula from config account codes
+        - Rows 61/64 LTM: =SUM(Y:quarter_col)
+        - Row 60 quarter: extend from previous column
+        """
+        p = Path(file_path)
+        if not p.exists():
+            logger.warning(f"reapply_interest_overrides: file not found {file_path}")
+            return
+
+        rules = cls._load_accounting_rules()
+        shell = cls.__new__(cls)
+        shell._rules = rules
+
+        wb = openpyxl.load_workbook(p)
+        try:
+            if summary_sheet_name not in wb.sheetnames:
+                logger.warning(
+                    f"reapply_interest_overrides: sheet {summary_sheet_name!r} not in workbook"
+                )
+                return
+            sheet = wb[summary_sheet_name]
+            ltm_col = shell._find_ltm_column(sheet)
+            if not ltm_col or ltm_col < 3:
+                logger.warning("reapply_interest_overrides: LTM column not found")
+                return
+            new_quarter_col = ltm_col - 1
+
+            # Rebuild LTM row 60 from config (undo any AI patches)
+            # Use the last BDO sheet (newest quarter)
+            bdo_sheet_name = None
+            for sn in wb.sheetnames:
+                if sn.startswith('BDO'):
+                    bdo_sheet_name = sn
+            if bdo_sheet_name:
+                bdo_sheet = wb[bdo_sheet_name]
+                structure = shell._discover_bdo_structure(bdo_sheet)
+                shell._build_ltm_interest(
+                    sheet, ltm_col, bdo_sheet, bdo_sheet_name, structure
+                )
+
+            # Rows 61/64 LTM SUM + row 60 quarter extension
+            shell._apply_interest_section_overrides(
+                sheet, new_quarter_col, ltm_col
+            )
+            wb.save(p)
+            logger.info(
+                f"Re-applied interest overrides: {p.name} "
+                f"LTM col {get_column_letter(ltm_col)} (rows 60/61/64)"
+            )
+        finally:
+            wb.close()
+
     def _load_formula_templates(self) -> Dict[int, Dict[str, Any]]:
         """Load formula templates that define the account code mapping for each row."""
         templates = {}
@@ -348,6 +429,15 @@ class ManagementAccountsBuilder:
         
         # Step 8: Enforce BDO alignment (deterministic reconciliation)
         self._enforce_bdo_alignment(bdo_result)
+        
+        # Re-apply interest LTM formulas (rows 61/64 SUM) and row 60 quarter
+        # extension after alignment — coverage logic may overwrite these cells.
+        if self._new_quarter_col and self._new_ltm_col:
+            sn = self.config.summary_sheet_name
+            if sn in self.workbook.sheetnames:
+                self._apply_interest_section_overrides(
+                    self.workbook[sn], self._new_quarter_col, self._new_ltm_col
+                )
         
         # Step 9: Validate calculations
         self.validation_result = self._validate_calculations(bdo_result)
@@ -505,9 +595,10 @@ class ManagementAccountsBuilder:
             f"BDO rows {interest_bdo_rows}"
         )
 
-        for ar in absorbed:
-            sheet.cell(row=ar, column=ltm_col).value = 0
-        logger.info(f"[LTM Interest] Zeroed absorbed rows {absorbed}")
+        # Rows 61/64 need SUM formulas in LTM, not zero — skip them here;
+        # they are handled by the template processor (horizontal_sum_quarters)
+        # and the _apply_interest_section_overrides safety net.
+        logger.info(f"[LTM Interest] Skipping absorbed rows {absorbed} (SUM formulas set elsewhere)")
 
         if dmrrp_code and dmrrp_ma_row:
             dmrrp_rows = structure.get('account_to_rows', {}).get(dmrrp_code, [])
@@ -1334,6 +1425,11 @@ class ManagementAccountsBuilder:
         # Update title
         summary_sheet.cell(row=1, column=1).value = f"Management Accounts QSP ESS B.V. - {self.config.quarter}"
         
+        # Step 11: Interest section safety net — row 60 quarter formula + rows 61/64 LTM SUM
+        self._apply_interest_section_overrides(
+            summary_sheet, new_quarter_col, new_ltm_col
+        )
+        
         logger.info(f"Updated summary sheet columns: {new_quarter_letter} and {new_ltm_letter}")
     
     def _copy_number_formatting(self, sheet, source_col: int, target_col: int, 
@@ -1500,6 +1596,66 @@ class ManagementAccountsBuilder:
         if updated_count > 0:
             logger.info(f"Updated {updated_count} cells in Bank Account Overview section (column {ltm_letter})")
     
+    def _detect_first_quarter_column_from_header_row(
+        self, sheet, header_row: int, up_to_col: int
+    ) -> Optional[int]:
+        """
+        Leftmost column in [2, up_to_col] on header_row whose value looks like a
+        quarter label (Q1–Q4). Used so horizontal SUMs include all quarter columns
+        when the template starts before column Y.
+        """
+        if up_to_col < 2:
+            return None
+        qpat = re.compile(r'\bQ\s*[1-4]\b', re.IGNORECASE)
+        for c in range(2, up_to_col + 1):
+            v = sheet.cell(row=header_row, column=c).value
+            if v is None:
+                continue
+            if qpat.search(str(v).strip()):
+                return c
+        return None
+
+    def _apply_interest_section_overrides(
+        self, sheet, new_quarter_col: int, ltm_col: int
+    ) -> None:
+        """
+        Safety-net for interest rows after template build / AI verification:
+        - Row 60 quarter col: copy prev quarter's formula, shifting column refs.
+        - Rows 61 & 64 LTM col: =SUM(Y{row}:{new_quarter_letter}{row}).
+        """
+        layout = self._rules.get('layout', {})
+        sum_start_col = layout.get('interest_quarter_horizontal_sum_start_column', 25)
+
+        prev_quarter_col = new_quarter_col - 1
+        prev_letter = get_column_letter(prev_quarter_col)
+        new_letter = get_column_letter(new_quarter_col)
+
+        prev_60 = sheet.cell(row=60, column=prev_quarter_col).value
+        if isinstance(prev_60, str) and prev_60.startswith('='):
+            shifted = _shift_formula_column_letter(prev_60, prev_letter, new_letter)
+            if shifted != prev_60:
+                sheet.cell(row=60, column=new_quarter_col).value = shifted
+                logger.info(
+                    f"Interest row 60: quarter formula derived from col {prev_letter} → {new_letter}"
+                )
+
+        if new_quarter_col < sum_start_col:
+            logger.warning(
+                f"Interest rows 61/64: quarter col {new_quarter_col} < "
+                f"start col {sum_start_col}, skipping LTM SUM"
+            )
+            return
+
+        start_letter = get_column_letter(sum_start_col)
+        quarter_letter = get_column_letter(new_quarter_col)
+        for row_num in (61, 64):
+            formula = f'=SUM({start_letter}{row_num}:{quarter_letter}{row_num})'
+            sheet.cell(row=row_num, column=ltm_col).value = formula
+        logger.info(
+            f"Interest rows 61 & 64: LTM col {get_column_letter(ltm_col)} "
+            f"=SUM({start_letter}*:{quarter_letter}*)"
+        )
+
     def _build_pl_formulas_from_templates(self, sheet, col_idx: int, bdo_column: str = 'G',
                                           prev_col_idx: int = None,
                                           quarter_col_idx: int = None):
@@ -1555,6 +1711,14 @@ class ManagementAccountsBuilder:
                     formula = self._build_ltm_sum_quarters_formula(
                         row_idx, sub_template.get('num_quarters', 4), quarter_col_idx
                     )
+                elif sub_type == 'horizontal_sum_quarters':
+                    formula = self._build_horizontal_sum_quarters_formula(
+                        sheet, row_idx, col_idx, prev_col_idx
+                    )
+                elif sub_type == 'static':
+                    target_cell.value = sub_template.get('value', 0)
+                    formulas_built += 1
+                    formula = None
                 else:
                     formula = None
                     
@@ -1613,6 +1777,33 @@ class ManagementAccountsBuilder:
         logger.debug(f"Row {row_idx}: LTM SUM formula: {formula}")
         return formula
     
+    def _build_horizontal_sum_quarters_formula(
+        self, sheet, row_idx: int, new_quarter_col: int,
+        prev_col_idx: Optional[int]
+    ) -> Optional[str]:
+        """
+        Build =SUM(Y{row}:{prev_quarter_col}{row}) for the LTM column.
+
+        Used for rows 61/64 in the LTM column: sums from the configured start
+        column (default Y/25) through the latest quarter column (prev_col_idx).
+        """
+        layout = self._rules.get('layout', {})
+        sum_start_col = layout.get('interest_quarter_horizontal_sum_start_column', 25)
+
+        prev_quarter_col = prev_col_idx if prev_col_idx else (new_quarter_col - 1)
+        if prev_quarter_col < sum_start_col:
+            logger.warning(
+                f"Row {row_idx}: prev_quarter_col {prev_quarter_col} < "
+                f"start col {sum_start_col}, cannot build horizontal SUM"
+            )
+            return None
+
+        start_letter = get_column_letter(sum_start_col)
+        prev_letter = get_column_letter(prev_quarter_col)
+        formula = f"=SUM({start_letter}{row_idx}:{prev_letter}{row_idx})"
+        logger.info(f"Row {row_idx}: horizontal SUM formula: {formula}")
+        return formula
+
     def _build_bdo_ref_formula(self, template: Dict[str, Any], bdo_sheet_name: str, 
                                 bdo_column: str) -> Optional[str]:
         """

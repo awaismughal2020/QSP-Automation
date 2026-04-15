@@ -441,6 +441,11 @@ class QuarterlyReportOrchestrator:
             ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
             results['output_files'].append(str(ma_verified))
 
+            # Step 4a.0b: Restore deterministic interest rows after AI patches
+            ManagementAccountsBuilder.reapply_interest_overrides_on_saved_workbook(
+                str(ma_verified), ma_config.summary_sheet_name
+            )
+
             # Step 4a.1: Post-AI verify BS19 vs PL68 and refresh computed_values
             logger.info("Step 4a.1: Post-AI identity check & computed_values refresh")
             ma_computed_values = self._verify_and_refresh(ma_verified, ma_computed_values, results)
@@ -825,6 +830,11 @@ class QuarterlyReportOrchestrator:
             logger.info("Step 4a: Running AI verification on Management Accounts")
             ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
             results['output_files'].append(str(ma_verified))
+
+            # Step 4a.0b: Restore deterministic interest rows after AI patches
+            ManagementAccountsBuilder.reapply_interest_overrides_on_saved_workbook(
+                str(ma_verified), ma_config.summary_sheet_name
+            )
 
             # Step 4a.1: Post-AI verify BS19 vs PL68 and refresh computed_values
             logger.info("Step 4a.1: Post-AI identity check & computed_values refresh")

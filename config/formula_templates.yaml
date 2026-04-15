@@ -376,9 +376,7 @@ profit_loss:
       account_codes: ["1790000"]
       sign: ""
     ltm_config:
-      type: static
-      value: 0
-      note: "Absorbed into row 60 for LTM"
+      type: horizontal_sum_quarters
 
   64:
     label: "(Net interest expenses - Hedge)"
@@ -389,9 +387,7 @@ profit_loss:
       sign: "-"
       operator: "-"
     ltm_config:
-      type: static
-      value: 0
-      note: "Absorbed into row 60 for LTM"
+      type: horizontal_sum_quarters
 
   65:
     label: "(Net interest income - DMRRP INV I)"

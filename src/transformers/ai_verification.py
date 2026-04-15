@@ -675,6 +675,15 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
         bdo = context.get('metadata', {}).get('bdo_sheet_name', 'BDO')
         q = context.get('quarter_col_letter', 'AA')
         ltm = context.get('ltm_col_letter', 'AB')
+        rules = context.get('accounting_rules', {})
+        layout = rules.get('layout', {})
+        sum_start_idx = layout.get('interest_quarter_horizontal_sum_start_column', 25)
+        sum_start_letter = get_column_letter(sum_start_idx)
+        try:
+            q_idx = column_index_from_string(str(q).upper())
+            prev_q_letter = get_column_letter(q_idx - 1) if q_idx > 1 else q
+        except Exception:
+            prev_q_letter = '(column immediately left of quarter column)'
 
         return f"""FORMULA CONSTRUCTION RULES (how to verify each formula type):
 
@@ -712,10 +721,17 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
    =SUM('{bdo}'!H31:'{bdo}'!H37)+'{bdo}'!H42+'{bdo}'!H43
 
 6. bdo_ref_conditional:
-   Quarter column: uses q_config (a bdo_ref, same rules as above).
+   Quarter column: uses q_config (a bdo_ref, same rules as above) for MOST rows.
    LTM column: uses ltm_config with type "ltm_sum_quarters" — formula is
    =SUM({{4 columns before LTM}}50:{{column before LTM}}50) spanning exactly
    the last 4 quarterly columns in Management Cijfers (NOT BDO references).
+
+   EXCEPTION — interest rows 60, 61, 64 in LTM column ({ltm}):
+   These cells are set deterministically — DO NOT PATCH THEM.
+   - {ltm}60: consolidated BDO H formula with exactly the configured account codes
+   - {ltm}61: =SUM({sum_start_letter}61:{q}61)
+   - {ltm}64: =SUM({sum_start_letter}64:{q}64)
+   Quarter column ({q}): rows 61/64 use normal BDO references via q_config.
 
 7. calc:
    Pattern uses {{COL}} placeholder → replace with the actual column letter.
@@ -870,6 +886,14 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
         dmrrp_code = interest_cfg.get('dmrrp_code', '4663000')
         dmrrp_ma_row = interest_cfg.get('dmrrp_row', 65)
 
+        sum_start_idx = layout.get('interest_quarter_horizontal_sum_start_column', 25)
+        sum_start_letter = get_column_letter(sum_start_idx)
+        try:
+            _q_idx = column_index_from_string(str(q).upper())
+            prev_q_letter = get_column_letter(_q_idx - 1) if _q_idx > 1 else q
+        except Exception:
+            prev_q_letter = '(column left of quarter)'
+
         # Computed values from MA builder (pre-computed expected values)
         computed = context.get('computed_values_snapshot', {})
         cv_section = ""
@@ -943,26 +967,33 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
    wrong BDO row numbers, missing accounts) — do NOT replace it with a
    hard-coded value. This applies to ALL rows including {auth_row} and {dep_row}.
 
-5. LTM INTEREST CONSOLIDATION (DYNAMIC):
-   For the LTM column, all P&L interest/financial items must be referenced
-   directly from the BDO {bdo_col_letter} column — never as SUM of quarterly
-   Management Cijfers values. Quarterly sums introduce rounding drift.
+5. LTM INTEREST CONSOLIDATION + QUARTER COLUMN ROWS 60 / 61 / 64 (DYNAMIC):
 
-   To identify the interest rows: look up these account codes in the BDO
-   ACCOUNT-CODE-TO-ROW MAP to find their CURRENT row numbers (they shift
-   between quarters):
+   LTM column ({ltm}) — consolidation only here:
+   All P&L interest/financial items must be referenced directly from BDO column
+   {bdo_col_letter} — never as SUM of quarterly Management Cijfers values (rounding drift).
+
+   LTM row {interest_ma_row} ({ltm}{interest_ma_row}) uses ONLY these account codes:
    {interest_codes_str}
+   Do NOT add any other account codes to this formula.
+   The formula must reference exactly these accounts in BDO column {bdo_col_letter}.
 
-   ALL found rows must be consolidated into Management Cijfers row
-   {interest_ma_row} as a single formula referencing BDO {bdo_col_letter}.
+   Latest QUARTER column ({q}) — rows 60, 61, 64:
+   - Row {interest_ma_row}: usually BDO q_config (per-quarter mutations), OR same-sheet
+     formula extended from column {prev_q_letter} (fill-right pattern). Both are valid.
+     Do NOT delete a working formula on {q}{interest_ma_row}.
+   - Rows 61 and 64 in column {q}: normal BDO reference formulas from q_config.
 
-   Rows {absorbed_rows_str} should be set to 0 for LTM (absorbed into
-   row {interest_ma_row}).
+   LTM column ({ltm}) — rows 60, 61, 64 (DO NOT MODIFY):
+   - {ltm}{interest_ma_row}: consolidated BDO {bdo_col_letter} formula with ONLY the
+     account codes listed above. Do NOT add extra BDO rows.
+   - {ltm}61 MUST contain =SUM({sum_start_letter}61:{q}61)
+   - {ltm}64 MUST contain =SUM({sum_start_letter}64:{q}64)
+   These sum all quarter columns from {sum_start_letter} through {q}.
+   Do NOT modify these cells. Do NOT change the SUM start column.
 
    The DMRRP income account ({dmrrp_code}) goes to its own row ({dmrrp_ma_row})
-   with a direct -{bdo_col_letter} reference.
-
-   The quarterly column ({q}) keeps its existing per-quarter references unchanged.
+   with a direct BDO {bdo_col_letter} reference (per template).
 
 6. LTM SUM RANGES: For row {cash_row} (manual_with_ltm),
    the LTM column must contain a SUM spanning exactly the last 4 quarterly
@@ -1009,6 +1040,11 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
     c) Emit a patch to add the missing reference.
     Pay special attention to UNLABELED ROWS and DUPLICATE ACCOUNT CODES.
 
+    EXCEPTION: Cells {ltm}60, {ltm}61, and {ltm}64 are managed deterministically.
+    - {ltm}60 uses ONLY the configured interest account codes — do NOT add extra rows.
+    - {ltm}61 and {ltm}64 contain SUM formulas with NO BDO references.
+    Do NOT flag these as missing coverage and do NOT patch them.
+
 13. SUM RANGE AND DUPLICATE ACCOUNT CHECK:
     NEVER extend a SUM range to handle duplicates or rows from a different section.
     SUM ranges represent contiguous BDO structural sections.
@@ -1018,6 +1054,15 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
       account code prefix (same structural section).
     - Check the DUPLICATE ACCOUNT CODES list: for each duplicate, verify ALL
       row occurrences are referenced in Management Cijfers formulas.
+
+14. INTEREST SECTION — PATCH POLICY (NON-NEGOTIABLE):
+    DO NOT PATCH any of these LTM cells — they are set deterministically:
+    - {ltm}{interest_ma_row}: consolidated BDO H formula with exactly the configured
+      account codes. NEVER add extra BDO rows.
+    - {ltm}61: =SUM({sum_start_letter}61:{q}61)
+    - {ltm}64: =SUM({sum_start_letter}64:{q}64)
+    If any of these cells look different from what you expect, PASS — they are
+    managed by deterministic code that runs after your patches.
 {cv_section}"""
 
     def _response_format_section(self) -> str:
@@ -1096,11 +1141,25 @@ class PatchApplier:
     Protected total rows (from config) reject value patches but allow formula patches.
     """
 
+    INTEREST_PROTECTED_ROWS = {60, 61, 64}
+
     def __init__(self, workbook_path: str, summary_sheet_name: str):
         self.workbook_path = Path(workbook_path)
         self.summary_sheet_name = summary_sheet_name
         self.applied_patches: List[Dict] = []
         self.rejected_patches: List[Dict] = []
+        self._ltm_col: Optional[int] = None
+
+    def _detect_ltm_col(self, wb) -> Optional[int]:
+        """Find the LTM column index from row 22 headers."""
+        for sn in wb.sheetnames:
+            if ALLOWLISTED_SHEET_PREFIX in sn:
+                sheet = wb[sn]
+                for c in range(sheet.max_column, 1, -1):
+                    v = sheet.cell(row=22, column=c).value
+                    if v and isinstance(v, str) and 'LTM' in v.upper():
+                        return c
+        return None
 
     def apply(self, patches: List[Dict], output_path: str) -> Tuple[int, List[Dict]]:
         """
@@ -1108,6 +1167,7 @@ class PatchApplier:
         Returns (count_applied, list_of_rejected).
         """
         wb = openpyxl.load_workbook(str(self.workbook_path))
+        self._ltm_col = self._detect_ltm_col(wb)
         applied = 0
 
         for patch in patches:
@@ -1154,6 +1214,15 @@ class PatchApplier:
             patch['rejection_reason'] = (
                 f"Row {row} is a protected total — value patches rejected; "
                 f"fix upstream rows instead"
+            )
+            logger.warning(f"Rejected patch: {patch['rejection_reason']}")
+            return False
+
+        col = patch.get('col', 0)
+        if row in self.INTEREST_PROTECTED_ROWS and self._ltm_col and col == self._ltm_col:
+            patch['rejection_reason'] = (
+                f"Row {row} in LTM column is deterministically managed — "
+                f"patches rejected"
             )
             logger.warning(f"Rejected patch: {patch['rejection_reason']}")
             return False

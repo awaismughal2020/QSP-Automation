@@ -9,7 +9,8 @@ from openpyxl import Workbook, load_workbook
 
 from src.transformers.management_accounts import (
     ManagementAccountsBuilder,
-    ManagementAccountsConfig
+    ManagementAccountsConfig,
+    _shift_formula_column_letter,
 )
 from src.parsers.bdo_parser import BDOParseResult, AccountEntry
 
@@ -206,7 +207,7 @@ class TestManagementAccountsBuilder:
             config
         )
         
-        builder._update_summary_sheet(bdo_result)
+        builder._update_summary_sheet()
         
         # Verify new column was added
         wb = load_workbook(output_path)
@@ -323,6 +324,36 @@ def _make_bdo_result(accounts=None):
         column_mapping={},
         schema_version="v1",
     )
+
+
+class TestDetectFirstQuarterColumn:
+    def test_finds_leftmost_q_header(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=5, value="Q1 2025")
+        ws.cell(row=22, column=10, value="Q2 2025")
+        ws.cell(row=22, column=28, value="LTM Q3 2025")
+        shell = ManagementAccountsBuilder.__new__(ManagementAccountsBuilder)
+        shell._rules = ManagementAccountsBuilder._load_accounting_rules()
+        col = shell._detect_first_quarter_column_from_header_row(ws, 22, 27)
+        assert col == 5
+
+
+class TestShiftFormulaColumnLetter:
+    """Regression tests for interest row 60 formula extension."""
+
+    def test_shifts_prev_column_refs_ab_to_ac(self):
+        f = "=AB57+AB60-$AB$61+SUM(Y60:AB60)"
+        out = _shift_formula_column_letter(f, "AB", "AC")
+        assert "AB57" not in out and "AC57" in out
+        assert "AC60" in out
+        assert "$AC$61" in out
+        assert "SUM(Y60:AC60)" in out
+
+    def test_does_not_replace_a_inside_aa(self):
+        f = "=AA10+A11"
+        out = _shift_formula_column_letter(f, "A", "B")
+        assert out == "=AA10+B11"
 
 
 class TestFuzzyAccountLookup:
