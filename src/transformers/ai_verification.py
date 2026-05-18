@@ -111,8 +111,24 @@ class WorkbookContextExtractor:
 
             summary_sheet = self._get_summary_sheet(wb)
             if summary_sheet:
-                ltm_col = self._find_ltm_column(summary_sheet)
-                quarter_col = ltm_col - 1 if ltm_col else None
+                from .management_accounts import (
+                    find_column_by_header_label,
+                    find_ltm_column_near_quarter,
+                    scan_summary_column_layout,
+                )
+
+                header_row = self._rules.get('layout', {}).get('header_row', 22)
+                layout = scan_summary_column_layout(summary_sheet, header_row)
+                ltm_col = layout.ltm_column
+                quarter_col = find_column_by_header_label(
+                    summary_sheet, self.config.quarter, header_row
+                )
+                if not quarter_col:
+                    quarter_col = layout.last_quarter_column
+                if quarter_col and not ltm_col:
+                    ltm_col = find_ltm_column_near_quarter(
+                        summary_sheet, quarter_col, header_row
+                    )
                 context['ltm_col'] = ltm_col
                 context['quarter_col'] = quarter_col
                 context['ltm_col_letter'] = get_column_letter(ltm_col) if ltm_col else None
@@ -159,12 +175,10 @@ class WorkbookContextExtractor:
         return None
 
     def _find_ltm_column(self, sheet) -> Optional[int]:
+        from .management_accounts import scan_summary_column_layout
+
         header_row = self._rules.get('layout', {}).get('header_row', 22)
-        for col_idx in range(sheet.max_column, 0, -1):
-            cell = sheet.cell(row=header_row, column=col_idx)
-            if cell.value and 'LTM' in str(cell.value):
-                return col_idx
-        return None
+        return scan_summary_column_layout(sheet, header_row).ltm_column
 
     def _build_bdo_row_map(self, sheet) -> Dict[str, int]:
         """Build account-code-to-row map. Keeps FIRST occurrence."""

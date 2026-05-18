@@ -140,18 +140,42 @@ def extract_values_from_management_accounts(ma_path: str, quarter: int, year: in
             wb.close()
             return {}
         
-        # Calculate column index DYNAMICALLY (fully automatic for any quarter/year)
-        # Base reference: Q3 2025 = Column AA (index 27) - used only as anchor point
-        # Formula: column = 27 + ((year * 4 + quarter) - (2025 * 4 + 3))
-        # This automatically calculates: Q4 2025 → AB, Q1 2026 → AC, Q2 2026 → AD, etc.
-        base_quarter_total = 2025 * 4 + 3  # Q3 2025 = 8103 (reference anchor)
-        target_quarter_total = year * 4 + quarter
-        quarterly_column = 27 + (target_quarter_total - base_quarter_total)
-        ltm_column = quarterly_column + 1  # LTM is always 1 column to the right
-        
+        from ..transformers.management_accounts import (
+            find_ltm_column_near_quarter,
+            resolve_quarter_column,
+        )
+
+        header_row = 22
+        quarter_label = f"Q{quarter} {year}"
+        quarterly_column = resolve_quarter_column(
+            cijfers_sheet, quarter_label, header_row
+        )
+        ltm_column = None
+        if quarterly_column:
+            ltm_column = find_ltm_column_near_quarter(
+                cijfers_sheet, quarterly_column, header_row
+            )
+
+        if not quarterly_column:
+            # Fallback: index from Q3 2025 = column AA (27) when headers are missing
+            base_quarter_total = 2025 * 4 + 3
+            target_quarter_total = year * 4 + quarter
+            quarterly_column = 27 + (target_quarter_total - base_quarter_total)
+            ltm_column = quarterly_column + 1
+            logger.warning(
+                f"Q{quarter} {year}: header {quarter_label!r} not found; "
+                f"using column index {quarterly_column}"
+            )
+
+        if not ltm_column:
+            ltm_column = quarterly_column + 1
+
         col_letter = get_column_letter(quarterly_column)
         ltm_letter = get_column_letter(ltm_column)
-        logger.info(f"Q{quarter} {year}: Extracting ALL values from column {col_letter} ({quarterly_column})")
+        logger.info(
+            f"Q{quarter} {year}: Extracting values from column {col_letter} "
+            f"(LTM {ltm_letter})"
+        )
         
         values = {}
         

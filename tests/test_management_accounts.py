@@ -11,6 +11,11 @@ from src.transformers.management_accounts import (
     ManagementAccountsBuilder,
     ManagementAccountsConfig,
     _shift_formula_column_letter,
+    find_column_by_header_label,
+    find_ltm_column_near_quarter,
+    ltm_column_after_insert,
+    resolve_quarter_column,
+    scan_summary_column_layout,
 )
 from src.parsers.bdo_parser import BDOParseResult, AccountEntry
 
@@ -337,6 +342,155 @@ class TestDetectFirstQuarterColumn:
         shell._rules = ManagementAccountsBuilder._load_accounting_rules()
         col = shell._detect_first_quarter_column_from_header_row(ws, 22, 27)
         assert col == 5
+
+
+class TestSummaryColumnLayout:
+    """Column insert must follow Q headers, not FY or misplaced LTM anchors."""
+
+    def test_standard_layout_inserts_before_ltm(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=27, value="Q3 2025")
+        ws.cell(row=22, column=28, value="Q4 2025")
+        ws.cell(row=22, column=29, value="LTM Q4 2025")
+        layout = scan_summary_column_layout(ws, 22)
+        assert layout.last_quarter_column == 28
+        assert layout.insert_column == 29
+        assert layout.previous_quarter_column == 28
+        assert layout.ltm_column == 29
+        assert ltm_column_after_insert(layout.ltm_column, 29, layout.fy_columns) == 30
+
+    def test_fy_between_quarter_and_ltm_inserts_after_quarter_not_ltm(self):
+        """Client template: Q4 | FY | LTM — new Q column belongs after Q4, before FY."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=28, value="Q3 2025")
+        ws.cell(row=22, column=29, value="Q4 2025")
+        ws.cell(row=22, column=30, value="FY 2025")
+        ws.cell(row=22, column=31, value="LTM Q4 2025")
+        layout = scan_summary_column_layout(ws, 22)
+        assert layout.last_quarter_column == 29
+        assert layout.insert_column == 30
+        assert layout.previous_quarter_column == 29
+        assert layout.ltm_column == 31
+        assert ltm_column_after_insert(31, 30, layout.fy_columns) == 32
+
+    def test_find_column_by_header_label(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=30, value="Q1 2026")
+        assert find_column_by_header_label(ws, "Q1 2026", 22) == 30
+        assert find_column_by_header_label(ws, "q1 2026", 22) == 30
+
+    def test_update_summary_inserts_q1_before_fy(self, tmp_path):
+        """Regression: Q1 2026 must appear before FY, not after hidden LTM."""
+        from openpyxl.utils import get_column_letter
+
+        prev_path = tmp_path / "prev_q4_fy.xlsx"
+        wb = Workbook()
+        bdo = wb.active
+        bdo.title = "BDO - Q4-25"
+        bdo.cell(row=6, column=1, value="8000003")
+        bdo.cell(row=6, column=7, value=100)
+
+        mc = wb.create_sheet("Management Cijfers - Q4 2025")
+        mc.cell(row=1, column=1, value="Management Accounts QSP ESS B.V. - Q4 2025")
+        mc.cell(row=22, column=28, value="Q3 2025")
+        mc.cell(row=22, column=29, value="Q4 2025")
+        mc.cell(row=22, column=30, value="FY 2025")
+        mc.cell(row=22, column=31, value="LTM Q4 2025")
+        mc.cell(row=2, column=31, value=datetime(2025, 12, 31))
+        mc.cell(row=23, column=29, value=1000)
+        mc.cell(row=23, column=31, value="='BDO - Q4-25'!H6")
+        wb.save(prev_path)
+
+        out_path = tmp_path / "ma_q1_2026.xlsx"
+        config = ManagementAccountsConfig(
+            quarter="Q1 2026",
+            period_end=datetime(2026, 3, 31),
+            bdo_sheet_name="BDO - Q1-26",
+            summary_sheet_name="Management Cijfers - Q1 2026",
+        )
+        builder = ManagementAccountsBuilder(str(prev_path), str(out_path), config)
+        builder.workbook = load_workbook(prev_path)
+        builder.config = config
+        builder._copy_bdo_data_to_new_sheet(_make_bdo_result())
+        new_bdo = builder.workbook[config.bdo_sheet_name]
+        builder._build_row_map(new_bdo, builder._new_bdo_row_map, builder._new_bdo_label_map)
+        builder._update_summary_sheet()
+        builder.workbook.save(out_path)
+
+        result = load_workbook(out_path)
+        sheet = result["Management Cijfers - Q1 2026"]
+        assert sheet.cell(row=22, column=30).value == "Q1 2026"
+        assert sheet.cell(row=22, column=31).value == "FY 2025"
+        assert "LTM" in str(sheet.cell(row=22, column=32).value)
+        assert get_column_letter(builder._new_quarter_col) == "AD"
+        result.close()
+
+    def test_standard_layout_matches_legacy_ltm_insert(self):
+        """Without FY, insert after last Q is the same as insert before LTM (Q3/Q4 2025 path)."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=27, value="Q3 2025")
+        ws.cell(row=22, column=28, value="Q4 2025")
+        ws.cell(row=22, column=29, value="LTM Q4 2025")
+        layout = scan_summary_column_layout(ws, 22)
+        assert layout.insert_column == layout.ltm_column
+        assert layout.previous_quarter_column == 28
+
+    @pytest.mark.parametrize(
+        "headers,expected_insert,expected_prev,expected_ltm_after",
+        [
+            (
+                [(28, "Q3 2025"), (29, "Q4 2025"), (30, "LTM Q4 2025")],
+                30,
+                29,
+                31,
+            ),
+            (
+                [(28, "Q3 2025"), (29, "Q4 2025"), (30, "FY 2025"), (31, "LTM Q4 2025")],
+                30,
+                29,
+                32,
+            ),
+            (
+                [(29, "Q4 2025"), (30, "Q1 2026"), (31, "FY 2025"), (32, "LTM Q1 2026")],
+                31,
+                30,
+                33,
+            ),
+            (
+                [(30, "Q1 2026"), (31, "Q2 2026"), (32, "FY 2026"), (33, "LTM Q2 2026")],
+                32,
+                31,
+                34,
+            ),
+        ],
+    )
+    def test_future_quarter_insert_positions(
+        self, headers, expected_insert, expected_prev, expected_ltm_after
+    ):
+        wb = Workbook()
+        ws = wb.active
+        for col, label in headers:
+            ws.cell(row=22, column=col, value=label)
+        layout = scan_summary_column_layout(ws, 22)
+        assert layout.insert_column == expected_insert
+        assert layout.previous_quarter_column == expected_prev
+        assert ltm_column_after_insert(
+            layout.ltm_column, layout.insert_column, layout.fy_columns
+        ) == expected_ltm_after
+
+    def test_resolve_quarter_column_skips_fy(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=29, value="Q4 2025")
+        ws.cell(row=22, column=30, value="Q1 2026")
+        ws.cell(row=22, column=31, value="FY 2025")
+        ws.cell(row=22, column=32, value="LTM Q1 2026")
+        assert resolve_quarter_column(ws, "Q1 2026", 22) == 30
+        assert find_ltm_column_near_quarter(ws, 30, 22) == 32
 
 
 class TestShiftFormulaColumnLetter:

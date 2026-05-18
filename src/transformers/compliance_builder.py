@@ -252,44 +252,59 @@ class ComplianceBuilder:
             
             cijfers_sheet = cijfers_sheet_data
             
-            # Find LTM column (rightmost column with 'LTM' in row 22 header)
-            ltm_column = None
-            for col in range(cijfers_sheet.max_column, 0, -1):
-                cell_val = cijfers_sheet.cell(row=22, column=col).value
-                if cell_val:
-                    cell_str = str(cell_val)
-                    if 'LTM' in cell_str:
-                        ltm_column = col
-                        logger.info(f"Found LTM column at {get_column_letter(col)} ({col}) via row 22 header: '{cell_val}'")
-                        break
-            
+            from .management_accounts import (
+                find_ltm_column_near_quarter,
+                resolve_quarter_column,
+                scan_summary_column_layout,
+            )
+
+            header_row = 22
+            layout = scan_summary_column_layout(cijfers_sheet, header_row)
+            ltm_column = layout.ltm_column
+            if ltm_column is not None:
+                logger.info(
+                    f"Found LTM column at {get_column_letter(ltm_column)} "
+                    f"({ltm_column}) via row {header_row} layout scan"
+                )
+
             if ltm_column is None:
                 for col in range(cijfers_sheet.max_column, 0, -1):
                     cell_val = cijfers_sheet.cell(row=3, column=col).value
                     if cell_val is not None and isinstance(cell_val, (int, float)):
                         ltm_column = col
-                        logger.info(f"Found LTM column at {get_column_letter(col)} ({col}) via row 3 value")
+                        logger.info(
+                            f"Found LTM column at {get_column_letter(col)} ({col}) via row 3 value"
+                        )
                         break
-            
+
             if ltm_column is None:
-                logger.warning("Could not find LTM column dynamically, falling back to column 27 (AA)")
+                logger.warning(
+                    "Could not find LTM column dynamically, falling back to column 27 (AA)"
+                )
                 ltm_column = 27
-            
-            # Find quarterly column (left of LTM, matching quarter header without 'LTM')
-            quarter_column = None
+
             quarter_header = f"Q{self.config.quarter} {self.config.year}"
-            for col in range(ltm_column - 1, 0, -1):
-                cell_val = cijfers_sheet.cell(row=22, column=col).value
-                if cell_val:
-                    cell_str = str(cell_val)
-                    if quarter_header in cell_str and 'LTM' not in cell_str:
-                        quarter_column = col
-                        logger.info(f"Found quarterly column at {get_column_letter(col)} ({col}) via header: '{cell_val}'")
-                        break
-            
-            if quarter_column is None:
+            quarter_column = resolve_quarter_column(
+                cijfers_sheet, quarter_header, header_row
+            )
+            if quarter_column is not None:
+                logger.info(
+                    f"Found quarterly column at {get_column_letter(quarter_column)} "
+                    f"({quarter_column}) via header {quarter_header!r}"
+                )
+            elif ltm_column:
                 quarter_column = ltm_column - 1
-                logger.info(f"Quarterly column defaulted to {get_column_letter(quarter_column)} ({quarter_column})")
+                logger.info(
+                    f"Quarterly column defaulted to {get_column_letter(quarter_column)} "
+                    f"({quarter_column})"
+                )
+
+            if quarter_column and not layout.ltm_column:
+                alt_ltm = find_ltm_column_near_quarter(
+                    cijfers_sheet, quarter_column, header_row
+                )
+                if alt_ltm:
+                    ltm_column = alt_ltm
             
             # Row mapping: target row in CC -> source row in Management Cijfers
             target_to_source_mapping = {}

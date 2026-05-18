@@ -3,7 +3,7 @@ Management Accounts Transformer
 
 Builds the Management Accounts Excel file by:
 1. Copying ALL data from the BDO file (Cijfers_QSP_) into a new sheet
-2. Inserting a new column in Management Cijfers before the LTM column
+2. Inserting a new column in Management Cijfers after the latest Q column (before FY/LTM)
 3. Building formulas for the new column using formula templates (account code mapping)
 4. Updating formulas to reference the new BDO sheet with correct row numbers
 5. Ensuring Management Cijfers sheet is always at the end
@@ -11,7 +11,7 @@ Builds the Management Accounts Excel file by:
 WORKFLOW:
 - Copy all data from BDO file → Create new sheet "BDO - Q{quarter}-{YY}"
 - Build account code to row mapping from new BDO sheet
-- In Management Cijfers sheet, insert new column before LTM column
+- In Management Cijfers sheet, insert new column after latest quarter (before FY/LTM)
 - Use formula templates to build formulas for new column (looking up account codes)
 - Update LTM column to reference new BDO sheet with column H
 - Move Management Cijfers sheet to be the last sheet
@@ -59,6 +59,143 @@ def _shift_formula_column_letter(formula: str, from_letter: str, to_letter: str)
         formula,
         flags=re.IGNORECASE,
     )
+
+
+_QUARTER_HEADER_RE = re.compile(r'^Q\s*([1-4])\s+(\d{4})\s*$', re.IGNORECASE)
+_FY_HEADER_RE = re.compile(r'^FY\s*(\d{4})\s*$', re.IGNORECASE)
+_LTM_IN_HEADER_RE = re.compile(r'\bLTM\b', re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class SummaryColumnLayout:
+    """Parsed Management Cijfers row-22 column structure before inserting a new quarter."""
+    quarter_columns: Tuple[int, ...]
+    fy_columns: Tuple[int, ...]
+    ltm_column: Optional[int]
+    last_quarter_column: Optional[int]
+    insert_column: int
+    previous_quarter_column: Optional[int]
+
+
+def scan_summary_column_layout(
+    sheet,
+    header_row: int = 22,
+) -> SummaryColumnLayout:
+    """
+    Classify row-22 headers so we insert the new quarter after the latest Q column,
+    not after an FY column or before a misplaced LTM anchor.
+    """
+    quarter_columns: List[int] = []
+    fy_columns: List[int] = []
+    ltm_column: Optional[int] = None
+
+    for col_idx in range(1, sheet.max_column + 1):
+        raw = sheet.cell(row=header_row, column=col_idx).value
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if _LTM_IN_HEADER_RE.search(text):
+            ltm_column = col_idx
+            continue
+        if _FY_HEADER_RE.match(text):
+            fy_columns.append(col_idx)
+            continue
+        if _QUARTER_HEADER_RE.match(text):
+            quarter_columns.append(col_idx)
+
+    last_quarter_column = max(quarter_columns) if quarter_columns else None
+
+    if last_quarter_column is not None:
+        insert_column = last_quarter_column + 1
+        previous_quarter_column = last_quarter_column
+    elif ltm_column is not None:
+        insert_column = ltm_column
+        previous_quarter_column = max(ltm_column - 1, 1)
+    else:
+        last_date_col = 1
+        for col_idx in range(1, sheet.max_column + 1):
+            cell_val = sheet.cell(row=2, column=col_idx).value
+            if isinstance(cell_val, datetime):
+                last_date_col = col_idx
+            elif isinstance(cell_val, (int, float)) and 30000 < cell_val < 60000:
+                # Excel serial date in balance-sheet row 2 (legacy templates)
+                last_date_col = col_idx
+        insert_column = last_date_col + 1
+        previous_quarter_column = max(insert_column - 1, 1)
+
+    return SummaryColumnLayout(
+        quarter_columns=tuple(quarter_columns),
+        fy_columns=tuple(fy_columns),
+        ltm_column=ltm_column,
+        last_quarter_column=last_quarter_column,
+        insert_column=insert_column,
+        previous_quarter_column=previous_quarter_column,
+    )
+
+
+def ltm_column_after_insert(
+    pre_ltm_col: Optional[int],
+    insert_column: int,
+    fy_columns: Tuple[int, ...],
+) -> int:
+    """Column index for LTM after insert_cols(insert_column)."""
+    if pre_ltm_col is not None:
+        return pre_ltm_col + 1 if pre_ltm_col >= insert_column else pre_ltm_col
+    if fy_columns:
+        shifted = [c + 1 if c >= insert_column else c for c in fy_columns]
+        return max(shifted) + 1
+    return insert_column + 1
+
+
+def find_column_by_header_label(
+    sheet,
+    label: str,
+    header_row: int = 22,
+) -> Optional[int]:
+    """Find a column whose row-22 header exactly matches label (case-insensitive)."""
+    target = label.strip().upper()
+    for col_idx in range(1, sheet.max_column + 1):
+        raw = sheet.cell(row=header_row, column=col_idx).value
+        if raw is not None and str(raw).strip().upper() == target:
+            return col_idx
+    return None
+
+
+def find_ltm_column_near_quarter(
+    sheet,
+    quarter_col: int,
+    header_row: int = 22,
+) -> Optional[int]:
+    """LTM column for a quarter: layout LTM if to the right, else next LTM header."""
+    layout = scan_summary_column_layout(sheet, header_row)
+    if layout.ltm_column is not None and layout.ltm_column > quarter_col:
+        return layout.ltm_column
+    for col_idx in range(quarter_col + 1, sheet.max_column + 1):
+        raw = sheet.cell(row=header_row, column=col_idx).value
+        if raw and _LTM_IN_HEADER_RE.search(str(raw)):
+            return col_idx
+    return None
+
+
+def resolve_quarter_column(
+    sheet,
+    quarter_label: str,
+    header_row: int = 22,
+    built_quarter_col: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Resolve the Management Cijfers column for the active quarter.
+    Prefer the column index assigned during build, then an exact row-22 header match.
+    """
+    if built_quarter_col is not None:
+        return built_quarter_col
+    found = find_column_by_header_label(sheet, quarter_label, header_row)
+    if found is not None:
+        return found
+    layout = scan_summary_column_layout(sheet, header_row)
+    return layout.last_quarter_column
 
 
 @dataclass
@@ -252,11 +389,24 @@ class ManagementAccountsBuilder:
                 )
                 return
             sheet = wb[summary_sheet_name]
-            ltm_col = shell._find_ltm_column(sheet)
+            header_row = rules.get('layout', {}).get('header_row', 22)
+            layout = scan_summary_column_layout(sheet, header_row)
+            ltm_col = layout.ltm_column
             if not ltm_col or ltm_col < 3:
                 logger.warning("reapply_interest_overrides: LTM column not found")
                 return
-            new_quarter_col = ltm_col - 1
+
+            quarter_match = re.search(r'(Q[1-4]\s+\d{4})', summary_sheet_name)
+            new_quarter_col = None
+            if quarter_match:
+                new_quarter_col = find_column_by_header_label(
+                    sheet, quarter_match.group(1), header_row
+                )
+            if not new_quarter_col:
+                new_quarter_col = layout.last_quarter_column
+            if not new_quarter_col or new_quarter_col < 2:
+                logger.warning("reapply_interest_overrides: quarter column not found")
+                return
 
             shell._apply_interest_section_overrides(
                 sheet, new_quarter_col, ltm_col
@@ -1129,22 +1279,31 @@ class ManagementAccountsBuilder:
         
         logger.info(f"Updating summary sheet: {new_summary_name}")
         
-        # Find the LTM column (this contains data for BOTH Balance Sheet and P&L)
-        ltm_col = self._find_ltm_column(summary_sheet)
-        if not ltm_col:
-            ltm_col = self._find_last_data_column(summary_sheet) + 1
+        header_row = self._rules.get('layout', {}).get('header_row', 22)
+        layout = scan_summary_column_layout(summary_sheet, header_row)
+        insert_position = layout.insert_column
+        prev_quarter_col = layout.previous_quarter_column
+        pre_ltm_col = layout.ltm_column
+
+        if not prev_quarter_col:
+            raise ValueError(
+                "Could not determine previous quarter column from Management Cijfers headers"
+            )
+
+        logger.info(
+            f"Summary layout: insert={get_column_letter(insert_position)}, "
+            f"prev_quarter={get_column_letter(prev_quarter_col)}, "
+            f"ltm={get_column_letter(pre_ltm_col) if pre_ltm_col else 'none'}, "
+            f"fy={[get_column_letter(c) for c in layout.fy_columns]}"
+        )
         
-        prev_quarter_col = ltm_col - 1  # Previous quarter column
-        insert_position = ltm_col
-        
-        logger.info(f"LTM column: {get_column_letter(ltm_col)}, Previous quarter: {get_column_letter(prev_quarter_col)}")
-        
-        # Step 1: Insert new column at LTM position
-        # This shifts the old LTM column to the right by 1
+        # Step 1: Insert new column immediately after the latest Q{n} YYYY header
         summary_sheet.insert_cols(insert_position)
         
-        new_quarter_col = insert_position  # The newly inserted blank column
-        new_ltm_col = insert_position + 1  # Where old LTM data now is
+        new_quarter_col = insert_position
+        new_ltm_col = ltm_column_after_insert(
+            pre_ltm_col, insert_position, layout.fy_columns
+        )
         self._new_quarter_col = new_quarter_col
         self._new_ltm_col = new_ltm_col
         
@@ -1614,10 +1773,25 @@ class ManagementAccountsBuilder:
                 f"{new_letter} (BDO !{q_bdo_letter}→!{ltm_bdo_letter})"
             )
 
-        # Rows 61 & 64 LTM: SUM of last 4 quarter columns
-        sum_start = new_quarter_col - 3
-        if sum_start < 2:
-            sum_start = 2
+        # Rows 61 & 64 LTM: SUM of last 4 quarter columns (skip FY / LTM columns)
+        header_row = self._rules.get('layout', {}).get('header_row', 22)
+        layout = scan_summary_column_layout(sheet, header_row)
+        prior_quarters = [c for c in layout.quarter_columns if c < new_quarter_col]
+        if len(prior_quarters) >= 4:
+            sum_start = prior_quarters[-4]
+        elif prior_quarters:
+            sum_start = prior_quarters[0]
+        else:
+            sum_start = new_quarter_col - 3
+        configured_start = self._rules.get('layout', {}).get(
+            'interest_quarter_horizontal_sum_start_column', 25
+        )
+        first_q = self._detect_first_quarter_column_from_header_row(
+            sheet, header_row, new_quarter_col
+        )
+        if first_q is not None:
+            sum_start = max(sum_start, first_q)
+        sum_start = max(sum_start, configured_start, 2)
         start_letter = get_column_letter(sum_start)
         quarter_letter = get_column_letter(new_quarter_col)
         for row_num in (61, 64):
@@ -2076,13 +2250,10 @@ class ManagementAccountsBuilder:
         
         logger.info(f"Copied {section_name} section (rows {start_row}-{end_row}): {copied_count} formulas from {source_letter} to {target_letter}")
     
-    def _find_ltm_column(self, sheet) -> int:
-        """Find the LTM column in row 22."""
-        for col_idx in range(sheet.max_column, 0, -1):
-            cell = sheet.cell(row=22, column=col_idx)
-            if cell.value and 'LTM' in str(cell.value):
-                return col_idx
-        return None
+    def _find_ltm_column(self, sheet) -> Optional[int]:
+        """Find the LTM column from row-22 headers."""
+        header_row = self._rules.get('layout', {}).get('header_row', 22)
+        return scan_summary_column_layout(sheet, header_row).ltm_column
     
     def _find_last_data_column(self, sheet) -> int:
         """Find the last date column in row 2."""
@@ -3151,7 +3322,15 @@ class ManagementAccountsBuilder:
                      if bdo_name in self.workbook.sheetnames else None)
         if bdo_sheet:
             structure = self._discover_bdo_structure(bdo_sheet)
-            q_col = ltm_col - 1
+            header_row = self._rules.get('layout', {}).get('header_row', 22)
+            q_col = resolve_quarter_column(
+                ws,
+                self.config.quarter,
+                header_row,
+                built_quarter_col=self._new_quarter_col,
+            )
+            if not q_col and ltm_col:
+                q_col = ltm_col - 1
 
             self._build_ltm_interest(
                 ws, ltm_col, bdo_sheet, bdo_name, structure)
@@ -3606,12 +3785,21 @@ class ManagementAccountsBuilder:
         
         sheet = self.workbook[summary_sheets[-1]]
         
-        ltm_col = self._find_ltm_column(sheet)
+        header_row = self._rules.get('layout', {}).get('header_row', 22)
+        layout = scan_summary_column_layout(sheet, header_row)
+        ltm_col = layout.ltm_column
         if not ltm_col:
             logger.warning("Structural validation skipped: LTM column not found")
             return True
-        
-        quarter_col = ltm_col - 1
+
+        quarter_col = find_column_by_header_label(
+            sheet, self.config.quarter, header_row
+        )
+        if not quarter_col:
+            quarter_col = layout.last_quarter_column
+        if not quarter_col:
+            logger.warning("Structural validation skipped: quarter column not found")
+            return True
         q_letter = get_column_letter(quarter_col)
         ltm_letter = get_column_letter(ltm_col)
         
