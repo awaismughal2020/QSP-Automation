@@ -510,6 +510,64 @@ class TestSummaryColumnLayout:
         assert resolve_quarter_column(ws, "Q1 2026", 22) == 30
         assert find_ltm_column_near_quarter(ws, 30, 22) == 32
 
+    def test_historical_ltm_at_left_is_ignored(self):
+        """Workbooks with years of history have an old 'LTM …' header far to the
+        left of the current quarterly block (e.g. column E).  That column must NOT
+        be treated as the active LTM anchor — the active LTM slot should be
+        computed from the FY column position instead."""
+        wb = Workbook()
+        ws = wb.active
+        # Historical LTM from 2019-era data, far left
+        ws.cell(row=22, column=5, value="LTM Q4 2025")
+        # Current quarterly block: Q4 at AB (28), FY at AC (29), with no adjacent LTM yet
+        ws.cell(row=22, column=27, value="Q3 2025")
+        ws.cell(row=22, column=28, value="Q4 2025")
+        ws.cell(row=22, column=29, value="FY 2025")
+        layout = scan_summary_column_layout(ws, 22)
+        # The historical LTM (col 5) is left of all quarters — must be None
+        assert layout.ltm_column is None, (
+            f"Historical LTM at col 5 should be ignored; got {layout.ltm_column}"
+        )
+        assert layout.insert_column == 29   # insert before FY (= after Q4)
+        assert layout.previous_quarter_column == 28
+
+        # After insert at 29: FY shifts from 29→30 (AD); LTM = max([30])+1 = 31 (AE)
+        new_ltm = ltm_column_after_insert(layout.ltm_column, 29, layout.fy_columns)
+        assert new_ltm == 31, (
+            f"Expected new LTM at col 31 (after shifted FY 29→30, LTM = FY+1), got {new_ltm}"
+        )
+
+    def test_historical_ltm_left_no_fy(self):
+        """Historical LTM left of quarters, no FY column: new LTM = insert+1."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=5, value="LTM Q4 2025")
+        ws.cell(row=22, column=27, value="Q3 2025")
+        ws.cell(row=22, column=28, value="Q4 2025")
+        layout = scan_summary_column_layout(ws, 22)
+        assert layout.ltm_column is None
+        assert layout.insert_column == 29
+        new_ltm = ltm_column_after_insert(layout.ltm_column, 29, layout.fy_columns)
+        assert new_ltm == 30  # insert+1
+
+    def test_active_ltm_right_of_quarters_still_shifts(self):
+        """An LTM column that IS to the right of the last quarter should still
+        shift right after insert — the original behaviour must be preserved."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=5, value="LTM Q3 2024")   # historical — ignored
+        ws.cell(row=22, column=28, value="Q3 2025")
+        ws.cell(row=22, column=29, value="Q4 2025")
+        ws.cell(row=22, column=30, value="LTM Q4 2025")  # active
+        layout = scan_summary_column_layout(ws, 22)
+        assert layout.ltm_column == 30                   # rightmost wins
+        # Q4 at 29 → insert_column = 30 (after Q4)
+        assert layout.insert_column == 30
+        assert layout.previous_quarter_column == 29
+        # LTM at 30 shifts to 31 because pre_ltm_col(30) >= insert_column(30)
+        new_ltm = ltm_column_after_insert(layout.ltm_column, 30, layout.fy_columns)
+        assert new_ltm == 31
+
 
 class TestShiftFormulaColumnLetter:
     """Regression tests for interest row 60 formula extension."""

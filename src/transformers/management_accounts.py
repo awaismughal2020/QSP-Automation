@@ -84,10 +84,17 @@ def scan_summary_column_layout(
     """
     Classify row-22 headers so we insert the new quarter after the latest Q column,
     not after an FY column or before a misplaced LTM anchor.
+
+    The workbook can have many years of historical columns, including old "LTM …"
+    headers far to the left of the current quarterly block (e.g. column E in a
+    workbook that now reaches column AD+).  Only an LTM header that sits *to the
+    right* of the last quarter column is treated as the active LTM anchor; any LTM
+    header to the left of the quarterly block is purely historical and is ignored
+    for insert-position and post-insert rebuild purposes.
     """
     quarter_columns: List[int] = []
     fy_columns: List[int] = []
-    ltm_column: Optional[int] = None
+    ltm_column_raw: Optional[int] = None  # rightmost LTM found anywhere
 
     for col_idx in range(1, sheet.max_column + 1):
         raw = sheet.cell(row=header_row, column=col_idx).value
@@ -97,7 +104,7 @@ def scan_summary_column_layout(
         if not text:
             continue
         if _LTM_IN_HEADER_RE.search(text):
-            ltm_column = col_idx
+            ltm_column_raw = col_idx   # keep updating so rightmost wins
             continue
         if _FY_HEADER_RE.match(text):
             fy_columns.append(col_idx)
@@ -106,6 +113,16 @@ def scan_summary_column_layout(
             quarter_columns.append(col_idx)
 
     last_quarter_column = max(quarter_columns) if quarter_columns else None
+
+    # Only count the LTM column as "active" when it is to the right of all
+    # quarterly columns.  If it is to the left (historical section), treat it
+    # as absent so ltm_column_after_insert falls through to the FY-based logic.
+    if ltm_column_raw is not None and last_quarter_column is not None:
+        ltm_column: Optional[int] = (
+            ltm_column_raw if ltm_column_raw > last_quarter_column else None
+        )
+    else:
+        ltm_column = ltm_column_raw
 
     if last_quarter_column is not None:
         insert_column = last_quarter_column + 1
@@ -140,9 +157,16 @@ def ltm_column_after_insert(
     insert_column: int,
     fy_columns: Tuple[int, ...],
 ) -> int:
-    """Column index for LTM after insert_cols(insert_column)."""
-    if pre_ltm_col is not None:
-        return pre_ltm_col + 1 if pre_ltm_col >= insert_column else pre_ltm_col
+    """Column index for LTM after insert_cols(insert_column).
+
+    Only treat ``pre_ltm_col`` as the active LTM if it is at or to the right
+    of the insert position — meaning it will shift right along with the other
+    trailing columns.  If it is to the left it is a historical column that does
+    not represent the current-quarter LTM slot; fall through to the FY-based
+    (or insert+1) logic in that case.
+    """
+    if pre_ltm_col is not None and pre_ltm_col >= insert_column:
+        return pre_ltm_col + 1
     if fy_columns:
         shifted = [c + 1 if c >= insert_column else c for c in fy_columns]
         return max(shifted) + 1
