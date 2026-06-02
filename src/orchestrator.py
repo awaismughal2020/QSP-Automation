@@ -165,11 +165,17 @@ class QuarterlyReportOrchestrator:
         self.reconciliation_validator = ReconciliationValidator()
         
     def _run_ai_verification(self, ma_output: Path, bdo_result, results: dict,
-                             computed_values: dict = None) -> Path:
+                             computed_values: dict = None,
+                             built_quarter_col: Optional[int] = None,
+                             built_ltm_col: Optional[int] = None) -> Path:
         """
         Run AI verification on the generated Management Accounts workbook.
         Returns the path to use downstream (verified file if patches applied,
         original otherwise).
+
+        ``built_quarter_col`` / ``built_ltm_col`` come from the MA builder and
+        let the AI context extractor and patch validator target the right
+        columns even if the row-22 header is somehow off.
         """
         try:
             pre_ai_path = ma_output.with_name(
@@ -191,6 +197,8 @@ class QuarterlyReportOrchestrator:
                 bdo_sheet_name=f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}",
                 summary_sheet_name=f"Management Cijfers - {self.config.quarter_str}",
                 previous_quarter_label=f"Q{prev_q} {prev_y}",
+                built_quarter_col=built_quarter_col,
+                built_ltm_col=built_ltm_col,
             )
 
             ai_orchestrator = AIVerificationOrchestrator(
@@ -271,12 +279,35 @@ class QuarterlyReportOrchestrator:
                 wb.close()
                 return computed_values
 
+            # Prefer LTM column lookup relative to the current quarter header
+            # (derived from the sheet name "Management Cijfers - Q1 2026")
+            # so we don't latch onto a stale "LTM Q4 2025" header.
+            from .transformers.management_accounts import (
+                find_ltm_column_near_quarter,
+                find_column_by_header_label,
+                scan_summary_column_layout,
+            )
+
             ltm_col = None
-            for col_idx in range(1, mc_sheet.max_column + 1):
-                hdr = mc_sheet.cell(row=22, column=col_idx).value
-                if hdr and isinstance(hdr, str) and hdr.strip().upper().startswith('LTM'):
-                    ltm_col = col_idx
-                    break
+            quarter_label = None
+            if mc_sheet.title and ' - ' in mc_sheet.title:
+                quarter_label = mc_sheet.title.split(' - ', 1)[1].strip()
+
+            quarter_col = None
+            if quarter_label:
+                quarter_col = find_column_by_header_label(mc_sheet, quarter_label, 22)
+            if not quarter_col:
+                layout = scan_summary_column_layout(mc_sheet, 22)
+                quarter_col = layout.last_quarter_column
+            if quarter_col:
+                ltm_col = find_ltm_column_near_quarter(mc_sheet, quarter_col, 22)
+
+            if ltm_col is None:
+                for col_idx in range(1, mc_sheet.max_column + 1):
+                    hdr = mc_sheet.cell(row=22, column=col_idx).value
+                    if hdr and isinstance(hdr, str) and hdr.strip().upper().startswith('LTM'):
+                        ltm_col = col_idx
+                        break
             if ltm_col is None:
                 for col_idx in range(mc_sheet.max_column, 0, -1):
                     val = mc_sheet.cell(row=auth_row, column=col_idx).value
@@ -426,7 +457,9 @@ class QuarterlyReportOrchestrator:
             )
             ma_builder.build(bdo_result)
             ma_computed_values = getattr(ma_builder, 'computed_values', None) or {}
-            
+            ma_quarter_col = getattr(ma_builder, '_new_quarter_col', None)
+            ma_ltm_col = getattr(ma_builder, '_new_ltm_col', None)
+
             ma_validation = getattr(ma_builder, 'validation_result', None)
             if ma_validation and not ma_validation.get('is_aligned', True):
                 results['warnings'].extend(ma_validation.get('messages', []))
@@ -438,7 +471,11 @@ class QuarterlyReportOrchestrator:
             }
             # Step 4a: AI Verification of Management Accounts (patches in-place)
             logger.info("Step 4a: Running AI verification on Management Accounts")
-            ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
+            ma_verified = self._run_ai_verification(
+                ma_output, bdo_result, results, ma_computed_values,
+                built_quarter_col=ma_quarter_col,
+                built_ltm_col=ma_ltm_col,
+            )
             results['output_files'].append(str(ma_verified))
 
             # Step 4a.0b: Restore deterministic interest rows after AI patches
@@ -816,7 +853,9 @@ class QuarterlyReportOrchestrator:
             )
             ma_builder.build(bdo_result)
             ma_computed_values = getattr(ma_builder, 'computed_values', None) or {}
-            
+            ma_quarter_col = getattr(ma_builder, '_new_quarter_col', None)
+            ma_ltm_col = getattr(ma_builder, '_new_ltm_col', None)
+
             ma_validation = getattr(ma_builder, 'validation_result', None)
             if ma_validation and not ma_validation.get('is_aligned', True):
                 results['warnings'].extend(ma_validation.get('messages', []))
@@ -828,7 +867,11 @@ class QuarterlyReportOrchestrator:
             }
             # Step 4a: AI Verification of Management Accounts (patches in-place)
             logger.info("Step 4a: Running AI verification on Management Accounts")
-            ma_verified = self._run_ai_verification(ma_output, bdo_result, results, ma_computed_values)
+            ma_verified = self._run_ai_verification(
+                ma_output, bdo_result, results, ma_computed_values,
+                built_quarter_col=ma_quarter_col,
+                built_ltm_col=ma_ltm_col,
+            )
             results['output_files'].append(str(ma_verified))
 
             # Step 4a.0b: Restore deterministic interest rows after AI patches

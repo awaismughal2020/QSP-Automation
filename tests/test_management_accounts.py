@@ -14,6 +14,8 @@ from src.transformers.management_accounts import (
     find_column_by_header_label,
     find_ltm_column_near_quarter,
     ltm_column_after_insert,
+    resolve_built_ltm_column,
+    resolve_built_quarter_column,
     resolve_quarter_column,
     scan_summary_column_layout,
 )
@@ -424,8 +426,24 @@ class TestSummaryColumnLayout:
         sheet = result["Management Cijfers - Q1 2026"]
         assert sheet.cell(row=22, column=30).value == "Q1 2026"
         assert sheet.cell(row=22, column=31).value == "FY 2025"
-        assert "LTM" in str(sheet.cell(row=22, column=32).value)
+        ltm_header = sheet.cell(row=22, column=32).value
+        assert "LTM" in str(ltm_header)
+        # Header is rewritten to the current LTM label, not the pre-existing one.
+        assert ltm_header == "LTM Q1 2026"
         assert get_column_letter(builder._new_quarter_col) == "AD"
+
+        # Quarter column (AD) references the current BDO sheet with column G.
+        q_val = sheet.cell(row=23, column=builder._new_quarter_col).value
+        assert isinstance(q_val, str) and "'BDO - Q1-26'!G" in q_val, q_val
+
+        # LTM column (AF) references the current BDO sheet with column H —
+        # the row-23 cell carried a stale 'BDO - Q4-25'!H6 before our fix.
+        ltm_val = sheet.cell(row=23, column=builder._new_ltm_col).value
+        assert (
+            isinstance(ltm_val, str)
+            and "'BDO - Q1-26'!H" in ltm_val
+            and "Q4-25" not in ltm_val
+        ), ltm_val
         result.close()
 
     def test_standard_layout_matches_legacy_ltm_insert(self):
@@ -637,4 +655,329 @@ class TestCCDirectCopy:
         assert ma_sheet.cell(row=22, column=2).value == 150.0
 
         result_wb.close()
+
+
+# ---------------------------------------------------------------------------
+# LTM column deterministic rebuild — regression guard for the Q1 2026 bugs
+# (stale 'BDO - Q4-25' refs in AD and SUM(AC...) subtotals where SUM(AD...)
+# is expected). Tests target both FY-present and no-FY layouts and verify
+# that the LTM column is fully rebuilt by _finalize_ltm_column.
+# ---------------------------------------------------------------------------
+
+
+def _make_q1_2026_bdo_accounts():
+    """Minimal BDO accounts for the rows referenced by formula_templates."""
+    rows = {
+        # P&L account codes -> rows
+        "8000003": 80,
+        "8000004": 81,
+        "8400600": 83,
+        "8400700": 84,
+        "8400800": 85,
+        "4100400": 90,
+        "4101000": 91,
+        "4310400": 92,
+        # Balance sheet codes
+        "1790002": 6,
+        "1600000": 10,
+        "1600200": 11,
+        "1601000": 12,
+        "1610803": 13,
+        "1611003": 14,
+        "1760000": 20,
+        "1790000": 21,
+        "2000000": 25,
+        "2000100": 26,
+        "2000300": 27,
+        "2400100": 31,
+        "2400200": 32,
+        "2400201": 33,
+        "2400202": 34,
+        "2400203": 35,
+        "2400204": 36,
+        "2400205": 37,
+        "2400206": 38,
+        "1000000": 50,
+        "1100000": 51,
+        "1160000": 52,
+        "1930001": 60,
+        "1930101": 61,
+    }
+    accounts = {}
+    for code, raw_row in rows.items():
+        accounts[code] = AccountEntry(
+            code=code,
+            name=f"Account {code}",
+            opening_balance=100.0,
+            closing_balance=100.0,
+            mutations={},
+            raw_row=raw_row,
+        )
+    return accounts
+
+
+def _build_prev_q4_workbook(prev_path: Path, *, with_fy: bool):
+    """
+    Build a minimal previous-quarter workbook that triggers the LTM rebuild
+    paths. Includes either:
+      - Q3 | Q4 | FY | LTM   (FY layout: insert at col 30, LTM at col 32)
+      - Q3 | Q4 | LTM        (no-FY layout: insert at col 29, LTM at col 30)
+    The LTM column is pre-populated with stale Q4-25 formulas in the exact
+    pattern that the FreshAIs file exhibited — so we know the rebuild must
+    overwrite them.
+    """
+    wb = Workbook()
+    bdo = wb.active
+    bdo.title = "BDO - Q4-25"
+    # Populate BDO rows for the accounts referenced by templates so the
+    # build doesn't skip rows with "account not found".
+    for code, raw_row in {
+        "8000003": 80, "8000004": 81, "8400600": 83, "8400700": 84, "8400800": 85,
+        "4100400": 90, "4101000": 91, "4310400": 92,
+        "1790002": 6, "1600000": 10, "1600200": 11, "1601000": 12, "1610803": 13, "1611003": 14,
+        "1760000": 20, "1790000": 21,
+        "2000000": 25, "2000100": 26, "2000300": 27,
+        "2400100": 31, "2400200": 32, "2400201": 33, "2400202": 34,
+        "2400203": 35, "2400204": 36, "2400205": 37, "2400206": 38,
+        "1000000": 50, "1100000": 51, "1160000": 52,
+        "1930001": 60, "1930101": 61,
+    }.items():
+        bdo.cell(row=raw_row, column=1, value=code)
+        bdo.cell(row=raw_row, column=2, value=f"Account {code}")
+        bdo.cell(row=raw_row, column=7, value=100)  # column G
+        bdo.cell(row=raw_row, column=8, value=400)  # column H
+
+    mc = wb.create_sheet("Management Cijfers - Q4 2025")
+    mc.cell(row=1, column=1, value="Management Accounts QSP ESS B.V. - Q4 2025")
+
+    if with_fy:
+        mc.cell(row=22, column=28, value="Q3 2025")
+        mc.cell(row=22, column=29, value="Q4 2025")
+        mc.cell(row=22, column=30, value="FY 2025")
+        mc.cell(row=22, column=31, value="LTM Q4 2025")
+        ltm_col_pre = 31
+    else:
+        # Client draft layout: prev Q3=AA, Q4=AB, LTM=AC. After Q1 insert
+        # we expect Q1=AC and LTM=AD, matching the bug report's AC/AD letters.
+        mc.cell(row=22, column=27, value="Q3 2025")
+        mc.cell(row=22, column=28, value="Q4 2025")
+        mc.cell(row=22, column=29, value="LTM Q4 2025")
+        ltm_col_pre = 29
+
+    mc.cell(row=2, column=ltm_col_pre, value=datetime(2025, 12, 31))
+
+    # Stale Q4 formulas in the OLD LTM column. After insert, these will shift
+    # right and (without our fix) survive into the new LTM column.
+    mc.cell(row=23, column=ltm_col_pre, value="=-'BDO - Q4-25'!H78")
+    mc.cell(row=25, column=ltm_col_pre, value="=SUM(AC23:AC24)")
+    mc.cell(row=30, column=ltm_col_pre, value="=SUM(AC27:AC29)")
+    mc.cell(row=44, column=ltm_col_pre, value="=SUM(AC32:AC43)")
+    mc.cell(row=45, column=ltm_col_pre, value="=AC25+AC30+AC44")
+    mc.cell(row=68, column=ltm_col_pre, value="=AC67+AC66")
+    mc.cell(row=114, column=ltm_col_pre, value="=SUM(AC107:AC113)")
+
+    wb.save(prev_path)
+    return wb
+
+
+def _run_builder(prev_path: Path, out_path: Path) -> ManagementAccountsBuilder:
+    """Run just the parts of build() needed for LTM verification."""
+    config = ManagementAccountsConfig(
+        quarter="Q1 2026",
+        period_end=datetime(2026, 3, 31),
+        bdo_sheet_name="BDO - Q1-26",
+        summary_sheet_name="Management Cijfers - Q1 2026",
+    )
+    builder = ManagementAccountsBuilder(str(prev_path), str(out_path), config)
+    builder.workbook = load_workbook(prev_path)
+    builder.config = config
+    builder._copy_bdo_data_to_new_sheet(
+        _make_bdo_result(_make_q1_2026_bdo_accounts())
+    )
+    new_bdo = builder.workbook[config.bdo_sheet_name]
+    builder._build_row_map(
+        new_bdo, builder._new_bdo_row_map, builder._new_bdo_label_map
+    )
+    builder._update_summary_sheet()
+    builder.workbook.save(out_path)
+    return builder
+
+
+class TestLtmColumnRebuild:
+    """LTM column must be fully rebuilt after insert_cols, with current BDO
+    sheet name and self-referencing subtotals."""
+
+    def test_fy_layout_ltm_header_and_formulas(self, tmp_path):
+        """Q3 | Q4 | FY | LTM → after Q1 insert: Q3 | Q4 | Q1 | FY | LTM."""
+        from openpyxl.utils import get_column_letter
+
+        prev_path = tmp_path / "prev_q4_fy.xlsx"
+        out_path = tmp_path / "ma_q1_2026_fy.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        builder = _run_builder(prev_path, out_path)
+
+        wb = load_workbook(out_path)
+        sheet = wb[builder.config.summary_sheet_name]
+        ltm_col = builder._new_ltm_col
+        q_col = builder._new_quarter_col
+        ltm_letter = get_column_letter(ltm_col)
+        q_letter = get_column_letter(q_col)
+
+        # Header sanity
+        assert sheet.cell(row=22, column=q_col).value == "Q1 2026"
+        assert sheet.cell(row=22, column=ltm_col).value == "LTM Q1 2026"
+
+        # LTM P&L bdo_ref now points at Q1-26 with column H
+        f23 = sheet.cell(row=23, column=ltm_col).value
+        assert isinstance(f23, str) and "'BDO - Q1-26'!H" in f23, f23
+
+        # LTM calc subtotals reference the LTM column, not the quarter column
+        f25 = sheet.cell(row=25, column=ltm_col).value
+        assert f25 == f"=SUM({ltm_letter}23:{ltm_letter}24)", f25
+        f30 = sheet.cell(row=30, column=ltm_col).value
+        assert f30 == f"=SUM({ltm_letter}27:{ltm_letter}29)", f30
+        f44 = sheet.cell(row=44, column=ltm_col).value
+        assert f44 == f"=SUM({ltm_letter}32:{ltm_letter}43)", f44
+        f114 = sheet.cell(row=114, column=ltm_col).value
+        assert f114 == f"=SUM({ltm_letter}107:{ltm_letter}113)", f114
+
+        # Quarter column still uses column G against the current BDO sheet
+        q23 = sheet.cell(row=23, column=q_col).value
+        assert isinstance(q23, str) and "'BDO - Q1-26'!G" in q23, q23
+
+        wb.close()
+
+    def test_no_fy_layout_matches_client_draft(self, tmp_path):
+        """Q3 | Q4 | LTM (client layout) → after insert: Q3 | Q4 | Q1 | LTM."""
+        from openpyxl.utils import get_column_letter
+
+        prev_path = tmp_path / "prev_q4_nofy.xlsx"
+        out_path = tmp_path / "ma_q1_2026_nofy.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=False)
+        builder = _run_builder(prev_path, out_path)
+
+        wb = load_workbook(out_path)
+        sheet = wb[builder.config.summary_sheet_name]
+        ltm_col = builder._new_ltm_col
+        q_col = builder._new_quarter_col
+        ltm_letter = get_column_letter(ltm_col)
+
+        # Matches the client's "AC = Q1, AD = LTM Q1 2026" layout
+        assert get_column_letter(q_col) == "AC"
+        assert ltm_letter == "AD"
+        assert sheet.cell(row=22, column=ltm_col).value == "LTM Q1 2026"
+        assert sheet.cell(row=22, column=q_col).value == "Q1 2026"
+
+        # Bug 1 fix: LTM BDO references the current quarter's BDO sheet
+        # at column H, not the previous quarter's.
+        f23 = sheet.cell(row=23, column=ltm_col).value
+        assert "'BDO - Q1-26'!H" in f23 and "Q4-25" not in f23, f23
+
+        # Bug 2 fix: subtotal rows sum the LTM column, not the quarter column.
+        assert sheet.cell(row=25, column=ltm_col).value == f"=SUM(AD23:AD24)"
+        assert sheet.cell(row=30, column=ltm_col).value == f"=SUM(AD27:AD29)"
+        assert sheet.cell(row=44, column=ltm_col).value == f"=SUM(AD32:AD43)"
+        assert sheet.cell(row=114, column=ltm_col).value == f"=SUM(AD107:AD113)"
+
+        wb.close()
+
+    def test_no_stale_bdo_sheet_anywhere_in_ltm(self, tmp_path):
+        """Scan every LTM cell — no formula may reference the previous BDO."""
+        prev_path = tmp_path / "prev_q4_nofy.xlsx"
+        out_path = tmp_path / "ma_q1_2026_scan.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=False)
+        builder = _run_builder(prev_path, out_path)
+
+        wb = load_workbook(out_path)
+        sheet = wb[builder.config.summary_sheet_name]
+        ltm_col = builder._new_ltm_col
+
+        offending = []
+        for row_idx in range(1, sheet.max_row + 1):
+            val = sheet.cell(row=row_idx, column=ltm_col).value
+            if isinstance(val, str) and "'BDO -" in val:
+                if builder.config.bdo_sheet_name not in val:
+                    offending.append((row_idx, val))
+
+        assert not offending, (
+            f"LTM column still references stale BDO sheet(s): {offending}"
+        )
+
+        wb.close()
+
+    def test_no_quarter_letter_self_ref_in_ltm_subtotals(self, tmp_path):
+        """No LTM subtotal row may still reference the new quarter column."""
+        from openpyxl.utils import get_column_letter
+
+        prev_path = tmp_path / "prev_q4_fy.xlsx"
+        out_path = tmp_path / "ma_q1_2026_calc.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        builder = _run_builder(prev_path, out_path)
+
+        wb = load_workbook(out_path)
+        sheet = wb[builder.config.summary_sheet_name]
+        ltm_col = builder._new_ltm_col
+        q_letter = get_column_letter(builder._new_quarter_col)
+
+        # Subtotal rows defined in calc_formulas.
+        for row in (25, 30, 44, 45, 48, 55, 57, 66, 68):
+            val = sheet.cell(row=row, column=ltm_col).value
+            assert isinstance(val, str), f"LTM row {row} is empty"
+            # Strip out cross-sheet BDO refs before checking column letters
+            import re
+            stripped = re.sub(r"'[^']*'![A-Z]+\$?\d+", '', val)
+            assert q_letter not in stripped, (
+                f"LTM row {row} still references quarter letter {q_letter}: {val}"
+            )
+
+        wb.close()
+
+    def test_validate_ltm_column_formulas_passes(self, tmp_path):
+        """End-to-end: _validate_ltm_column_formulas reports no hard errors."""
+        prev_path = tmp_path / "prev_q4_fy.xlsx"
+        out_path = tmp_path / "ma_q1_2026_validate.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        builder = _run_builder(prev_path, out_path)
+
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        result = builder._validate_ltm_column_formulas(sheet)
+        assert result['errors'] == [], (
+            f"LTM validation should pass, got errors: {result['errors']}"
+        )
+
+    def test_resolve_built_ltm_column_uses_header_first(self):
+        """``resolve_built_ltm_column`` should respect ``expected_col``
+        whenever its header contains ``LTM``."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=30, value="Q1 2026")
+        ws.cell(row=22, column=31, value="FY 2025")
+        ws.cell(row=22, column=32, value="LTM Q1 2026")
+        # expected_col matches the header → returned as-is
+        assert resolve_built_ltm_column(
+            ws, header_row=22, expected_col=32, quarter_col=30
+        ) == 32
+
+    def test_resolve_built_ltm_column_falls_back_to_near_quarter(self):
+        """When ``expected_col`` is wrong, fall back to the LTM near quarter."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=30, value="Q1 2026")
+        ws.cell(row=22, column=31, value="FY 2025")
+        ws.cell(row=22, column=32, value="LTM Q1 2026")
+        # expected_col points at FY — header check fails, fall back finds LTM
+        assert resolve_built_ltm_column(
+            ws, header_row=22, expected_col=31, quarter_col=30
+        ) == 32
+
+    def test_resolve_built_ltm_column_raises_when_no_ltm_anywhere(self):
+        """No LTM header anywhere → raise with a layout dump."""
+        wb = Workbook()
+        ws = wb.active
+        ws.cell(row=22, column=30, value="Q1 2026")
+        ws.cell(row=22, column=31, value="FY 2025")
+        with pytest.raises(ValueError, match="Could not resolve LTM column"):
+            resolve_built_ltm_column(
+                ws, header_row=22, expected_col=31, quarter_col=30
+            )
 

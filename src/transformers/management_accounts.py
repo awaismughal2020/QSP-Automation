@@ -198,6 +198,59 @@ def resolve_quarter_column(
     return layout.last_quarter_column
 
 
+def resolve_built_ltm_column(
+    sheet,
+    header_row: int,
+    expected_col: Optional[int],
+    quarter_col: Optional[int],
+) -> int:
+    """
+    Resolve the LTM column index after a new quarter column has been inserted.
+
+    Priority:
+    1. ``expected_col`` if its row-22 header contains "LTM" (case-insensitive).
+    2. The first LTM-labelled header to the right of ``quarter_col``.
+    3. ``ValueError`` with a layout dump (so the build fails loudly instead of
+       silently targeting the wrong column).
+    """
+    if expected_col is not None:
+        raw = sheet.cell(row=header_row, column=expected_col).value
+        if raw is not None and _LTM_IN_HEADER_RE.search(str(raw)):
+            return expected_col
+
+    if quarter_col is not None:
+        found = find_ltm_column_near_quarter(sheet, quarter_col, header_row)
+        if found is not None:
+            return found
+
+    layout = scan_summary_column_layout(sheet, header_row)
+    if layout.ltm_column is not None:
+        return layout.ltm_column
+
+    headers = []
+    for col_idx in range(1, sheet.max_column + 1):
+        val = sheet.cell(row=header_row, column=col_idx).value
+        if val is not None:
+            headers.append(f"{get_column_letter(col_idx)}={val!r}")
+    raise ValueError(
+        "Could not resolve LTM column after column insert. "
+        f"expected={expected_col}, quarter_col={quarter_col}, "
+        f"row-{header_row} headers: {', '.join(headers)}"
+    )
+
+
+def resolve_built_quarter_column(
+    sheet,
+    quarter_label: str,
+    header_row: int = 22,
+    built_quarter_col: Optional[int] = None,
+) -> Optional[int]:
+    """Compatibility shim — prefer the column index assigned during build."""
+    return resolve_quarter_column(
+        sheet, quarter_label, header_row, built_quarter_col
+    )
+
+
 @dataclass
 class ManagementAccountsConfig:
     """Configuration for Management Accounts generation."""
@@ -577,7 +630,23 @@ class ManagementAccountsBuilder:
         
         # Step 9: Validate calculations
         self.validation_result = self._validate_calculations(bdo_result)
-        
+
+        # Step 9b: Validate LTM column formulas (header, BDO sheet name,
+        # calc rows reference LTM letter not quarter letter). Errors are
+        # surfaced via validation_result but do not abort the save — the
+        # client still needs to see the workbook to triage.
+        summary_name = self.config.summary_sheet_name
+        if summary_name in self.workbook.sheetnames:
+            ltm_validation = self._validate_ltm_column_formulas(
+                self.workbook[summary_name]
+            )
+            self.validation_result['ltm_column'] = ltm_validation
+            if ltm_validation['errors']:
+                self.validation_result.setdefault('messages', []).extend(
+                    f"LTM column: {m}" for m in ltm_validation['errors']
+                )
+                self.validation_result['is_aligned'] = False
+
         # Save output
         self.workbook.save(self.output_path)
         logger.info(f"Saved to {self.output_path}")
@@ -1299,37 +1368,51 @@ class ManagementAccountsBuilder:
         
         # Step 1: Insert new column immediately after the latest Q{n} YYYY header
         summary_sheet.insert_cols(insert_position)
-        
+
         new_quarter_col = insert_position
-        new_ltm_col = ltm_column_after_insert(
+        provisional_ltm_col = ltm_column_after_insert(
             pre_ltm_col, insert_position, layout.fy_columns
+        )
+
+        # Step 1a: Write row-22 headers BEFORE any formula build so the new
+        # LTM column is unambiguously identifiable by header_value. This also
+        # overwrites any stale label (e.g. "FY 2025") that slid into the LTM
+        # slot during insert_cols().
+        summary_sheet.cell(row=22, column=new_quarter_col).value = self.config.quarter
+        summary_sheet.cell(row=22, column=provisional_ltm_col).value = (
+            f"LTM {self.config.quarter}"
+        )
+
+        # Step 1b: Re-resolve the LTM column via the header we just wrote.
+        # This guards against future layout changes where the provisional index
+        # diverges from the actual LTM column (raises with a layout dump if so).
+        new_ltm_col = resolve_built_ltm_column(
+            summary_sheet,
+            header_row=header_row,
+            expected_col=provisional_ltm_col,
+            quarter_col=new_quarter_col,
         )
         self._new_quarter_col = new_quarter_col
         self._new_ltm_col = new_ltm_col
-        
+
         new_quarter_letter = get_column_letter(new_quarter_col)
         new_ltm_letter = get_column_letter(new_ltm_col)
-        
+
         logger.info(f"After insert: New quarter col={new_quarter_letter}, LTM col={new_ltm_letter}")
-        
+
         # Step 2: Balance Sheet section (rows 1-20)
         # In the Balance Sheet, only the LTM column has formulas - quarterly columns are empty
         # The new quarter column should remain empty, we only update the LTM column
         # Clear any data that might have been shifted into the new column
         for row_idx in range(1, 21):
             summary_sheet.cell(row=row_idx, column=new_quarter_col).value = None
-        
-        # Step 3: Build P&L formulas from templates (row 22 onwards)
+
+        # Step 3: Build P&L formulas from templates for the new quarter column
         self._build_pl_formulas_from_templates(summary_sheet, new_quarter_col, bdo_column='G',
                                                prev_col_idx=prev_quarter_col,
                                                quarter_col_idx=new_quarter_col)
-        
-        # Step 4: Build LTM formulas (same structure but with column H)
-        self._build_pl_formulas_from_templates(summary_sheet, new_ltm_col, bdo_column='H',
-                                               prev_col_idx=new_quarter_col,
-                                               quarter_col_idx=new_quarter_col)
-        
-        # Step 4b: Set manual values (Row 50 - Cash proceeds sale)
+
+        # Step 4: Set manual values (Row 50 - Cash proceeds sale) in quarter column
         if self.config.cash_proceeds_sale:
             cash_cell = summary_sheet.cell(row=50, column=new_quarter_col)
             cash_cell.value = self.config.cash_proceeds_sale
@@ -1338,23 +1421,24 @@ class ManagementAccountsBuilder:
             if prev_cash_cell.number_format:
                 cash_cell.number_format = prev_cash_cell.number_format
             logger.info(f"Set Row 50 (Cash proceeds sale) to {self.config.cash_proceeds_sale:,.0f}")
-        
-        # Step 5: Build Balance Sheet formulas in LTM column
-        # Balance Sheet only exists in LTM column - build from templates
-        self._build_balance_sheet_formulas(summary_sheet, new_ltm_col, bdo_column='H')
-        
+
+        # Step 5: Finalize LTM column — single deterministic rebuild.
+        # All LTM cells (P&L, Balance Sheet, bank, identity, interest) are
+        # cleared and rewritten from templates + rules. This makes the LTM
+        # column independent of whatever shifted in via insert_cols().
+        self._finalize_ltm_column(summary_sheet)
+
         # Step 6: Update headers and copy styling from previous columns
         # Copy header styling from previous quarter column for new quarter (Row 22)
         prev_header_cell = summary_sheet.cell(row=22, column=prev_quarter_col)
         header_cell = summary_sheet.cell(row=22, column=new_quarter_col)
-        header_cell.value = self.config.quarter
         # Copy ALL styling including fill (background color) from previous quarter header
         if prev_header_cell.has_style:
             header_cell.font = copy(prev_header_cell.font)
             header_cell.alignment = copy(prev_header_cell.alignment)
             header_cell.border = copy(prev_header_cell.border)
             header_cell.fill = copy(prev_header_cell.fill)  # Copy background color
-        
+
         # Row 2: Balance sheet date header - only in LTM column, quarter column stays empty
         # The date cell in the new quarter column should remain None (cleared earlier)
         # Update the LTM column with the current period end date
@@ -1374,11 +1458,6 @@ class ManagementAccountsBuilder:
             ltm_date_cell.alignment = copy(prev_ltm_date_cell.alignment)
             ltm_date_cell.border = copy(prev_ltm_date_cell.border)
             ltm_date_cell.fill = copy(prev_ltm_date_cell.fill)
-        
-        # LTM column header (row 22): copy styling from old LTM header (now
-        # at new_ltm_col after the column insert) instead of hardcoding a font.
-        ltm_header = summary_sheet.cell(row=22, column=new_ltm_col)
-        ltm_header.value = f"LTM {self.config.quarter}"
         
         client_number_format = '_(* #,##0_);_(* \\(#,##0\\);_(* "-"??_);_(@_)'
         
@@ -1524,29 +1603,15 @@ class ManagementAccountsBuilder:
                 summary_sheet.column_dimensions[new_q_letter].width = prev_width
                 summary_sheet.column_dimensions[new_ltm_letter_dim].width = prev_width
         
-        # Step 7: Update LTM column SUM formulas to include new quarter column
-        self._update_ltm_sum_ranges(summary_sheet, new_ltm_col, new_quarter_col)
-        
-        # Step 8: Update Bank Account Overview section (rows 104-120)
-        self._update_bank_account_overview_section(summary_sheet, new_ltm_col)
-        
-        # Step 9: Enforce accounting identity in workbook (config-driven)
-        self._enforce_identity_formula(summary_sheet, new_ltm_col)
-
-        # Step 10: Add new quarter column to column group (outline)
+        # Step 7: Add new quarter column to column group (outline)
         new_col_letter = get_column_letter(new_quarter_col)
         summary_sheet.column_dimensions[new_col_letter].outlineLevel = 1
         summary_sheet.column_dimensions[new_col_letter].hidden = False
         logger.info(f"Added column {new_col_letter} to group (outline_level=1, hidden=False)")
-        
-        # Update title
+
+        # Step 8: Update title
         summary_sheet.cell(row=1, column=1).value = f"Management Accounts QSP ESS B.V. - {self.config.quarter}"
-        
-        # Step 11: Interest section safety net — row 60 quarter formula + rows 61/64 LTM SUM
-        self._apply_interest_section_overrides(
-            summary_sheet, new_quarter_col, new_ltm_col
-        )
-        
+
         logger.info(f"Updated summary sheet columns: {new_quarter_letter} and {new_ltm_letter}")
     
     def _copy_number_formatting(self, sheet, source_col: int, target_col: int, 
@@ -1559,6 +1624,340 @@ class ManagementAccountsBuilder:
             if source_cell.number_format and source_cell.number_format != 'General':
                 target_cell.number_format = source_cell.number_format
     
+    def _finalize_ltm_column(self, sheet) -> None:
+        """
+        Deterministic LTM column rebuild.
+
+        After ``insert_cols()`` shifts the old LTM column right, the cells in
+        ``self._new_ltm_col`` still carry stale formulas that point at the
+        previous BDO sheet (e.g. ``'BDO - Q4-25'!H78``) and stale subtotal
+        ranges (e.g. ``SUM(AC23:AC24)`` instead of ``SUM(AD23:AD24)``).
+
+        Rather than patch those cells in place, this method **clears** the
+        formula cells in the layout ranges and rebuilds the LTM column from
+        the same sources of truth used for the quarter column:
+
+        1. Clear stale formula cells in P&L / Balance Sheet / Bank ranges.
+        2. Re-apply P&L formulas from ``formula_templates.yaml`` (column H).
+        3. Re-apply Balance Sheet formulas from ``balance_sheet`` templates.
+        4. Apply every calc/ltm-override row from ``accounting_rules.yaml``
+           as a safety net so subtotal rows always reference the LTM column.
+        5. Sweep any surviving stale BDO sheet name and any self-reference
+           that still points at the new quarter column letter.
+        6. Refresh rolling 4-quarter SUM ranges, bank section, identity row,
+           and interest overrides.
+        """
+        ltm_col = self._new_ltm_col
+        new_quarter_col = self._new_quarter_col
+        if not ltm_col or not new_quarter_col:
+            raise ValueError("_finalize_ltm_column called before column indices were set")
+
+        ltm_letter = get_column_letter(ltm_col)
+        logger.info(
+            f"[LTM rebuild] Finalizing LTM column {ltm_letter} (col {ltm_col})"
+        )
+
+        # 1) Clear stale formula cells in the layout ranges so partial template
+        #    coverage cannot leave shifted formulas behind.
+        self._clear_ltm_formula_cells(sheet, ltm_col)
+
+        # 2) Re-apply P&L formulas from templates (column H = closing balance).
+        self._build_pl_formulas_from_templates(
+            sheet, ltm_col, bdo_column='H',
+            prev_col_idx=new_quarter_col,
+            quarter_col_idx=new_quarter_col,
+        )
+
+        # 3) Re-apply Balance Sheet formulas from templates.
+        self._build_balance_sheet_formulas(sheet, ltm_col, bdo_column='H')
+
+        # 4) Apply calc / ltm_calc_overrides from accounting_rules.yaml as a
+        #    safety net (covers rows 25, 30, 44, 45, 48, 51, 55, 57, 66, etc.).
+        self._apply_ltm_calc_formulas_from_rules(sheet, ltm_col)
+
+        # 5) Rewrite any residual references — stale BDO sheet name and any
+        #    self-reference still pointing at the quarter column letter.
+        self._rewrite_ltm_column_references(sheet, ltm_col, new_quarter_col)
+
+        # 6) Refresh rolling sums, bank section, identity formula, and the
+        #    interest overrides. These are idempotent.
+        self._update_ltm_sum_ranges(sheet, ltm_col, new_quarter_col)
+        self._update_bank_account_overview_section(sheet, ltm_col)
+        self._enforce_identity_formula(sheet, ltm_col)
+        self._apply_interest_section_overrides(sheet, new_quarter_col, ltm_col)
+
+    def _validate_ltm_column_formulas(self, sheet) -> Dict[str, Any]:
+        """
+        Sanity-check the rebuilt LTM column before save.
+
+        Hard failures (returned in ``errors``):
+        - Row-22 header is missing the literal "LTM".
+        - Any ``='BDO - …'!…`` reference uses a sheet name other than
+          ``self.config.bdo_sheet_name``.
+        - Any ``calc`` row from the rules has a formula whose only column
+          letter is the new quarter column (the ``SUM(AC…)`` in ``AD`` bug).
+
+        Soft warnings (returned in ``warnings``):
+        - ``bdo_ref`` rows that ended up with no formula (account not found).
+
+        Returns ``{"errors": [...], "warnings": [...], "ltm_col": int}``.
+        The result is attached to ``self.validation_result['ltm_column']`` so
+        callers can see exactly which rows failed which rule.
+        """
+        ltm_col = self._new_ltm_col
+        new_quarter_col = self._new_quarter_col
+        result: Dict[str, Any] = {
+            'errors': [],
+            'warnings': [],
+            'ltm_col': ltm_col,
+        }
+        if not ltm_col or not new_quarter_col:
+            result['errors'].append("LTM column index was not set during build")
+            return result
+
+        layout_cfg = self._rules.get('layout', {})
+        header_row = layout_cfg.get('header_row', 22)
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_range = layout_cfg.get('bank_rows', [107, 114])
+
+        ltm_letter = get_column_letter(ltm_col)
+        quarter_letter = get_column_letter(new_quarter_col)
+        expected_bdo = self.config.bdo_sheet_name
+
+        header_val = sheet.cell(row=header_row, column=ltm_col).value
+        if not header_val or 'LTM' not in str(header_val).upper():
+            result['errors'].append(
+                f"Row-{header_row} header at column {ltm_letter} is "
+                f"{header_val!r}, expected to contain 'LTM'"
+            )
+
+        bdo_ref_re = re.compile(r"'(BDO[^']*)'")
+        check_rows = (
+            list(range(bs_range[0], bs_range[1] + 1))
+            + list(range(pl_range[0], pl_range[1] + 1))
+            + list(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        # Rows that are calc subtotals — these must reference the LTM column,
+        # not the quarter column, in their in-sheet references.
+        calc_rows = set()
+        for source in (
+            layout_cfg.get('calc_formulas', {}) or {},
+            layout_cfg.get('ltm_calc_overrides', {}) or {},
+        ):
+            for r in source.keys():
+                try:
+                    calc_rows.add(int(r))
+                except (TypeError, ValueError):
+                    pass
+        for row_idx, tpl in self.formula_templates.items():
+            if tpl.get('type') == 'calc':
+                calc_rows.add(row_idx)
+
+        # bdo_ref rows from templates — used for the soft warning.
+        bdo_ref_rows = {
+            row_idx for row_idx, tpl in self.formula_templates.items()
+            if tpl.get('type') in ('bdo_ref', 'bdo_ref_label')
+        }
+        bs_bdo_ref_rows = {
+            row_idx for row_idx, tpl in self.balance_sheet_templates.items()
+            if tpl.get('type') in ('bdo_ref', 'bdo_sum_range')
+        }
+        bdo_ref_rows = bdo_ref_rows | bs_bdo_ref_rows
+
+        # Pattern for in-sheet column refs (mirrors _rewrite_ltm_column_references).
+        ref_pattern = re.compile(r'(?<![!A-Z])\$?([A-Z]+)\$?\d+')
+
+        for row_idx in check_rows:
+            cell = sheet.cell(row=row_idx, column=ltm_col)
+            val = cell.value
+
+            if not isinstance(val, str) or not val.startswith('='):
+                if row_idx in bdo_ref_rows and val is None:
+                    result['warnings'].append(
+                        f"Row {row_idx} (bdo_ref) LTM cell is empty — "
+                        f"account code likely not found in BDO sheet"
+                    )
+                continue
+
+            # Hard check: BDO sheet name normalised.
+            for match in bdo_ref_re.finditer(val):
+                if match.group(1) != expected_bdo:
+                    result['errors'].append(
+                        f"{ltm_letter}{row_idx} references stale BDO sheet "
+                        f"{match.group(1)!r}, expected {expected_bdo!r}: {val}"
+                    )
+                    break
+
+            # Hard check: calc rows should reference the LTM column letter, not
+            # the quarter column letter, in any in-sheet reference.
+            if row_idx in calc_rows:
+                # Strip sheet-qualified parts so 'BDO - Q1-26'!H80 doesn't trip
+                # the in-sheet ref check.
+                stripped = re.sub(r"'[^']*'![A-Z]+\$?\d+", '', val)
+                in_sheet_cols = {m.group(1) for m in ref_pattern.finditer(stripped)}
+                if in_sheet_cols and quarter_letter in in_sheet_cols and ltm_letter not in in_sheet_cols:
+                    result['errors'].append(
+                        f"{ltm_letter}{row_idx} (calc) still references the "
+                        f"quarter column {quarter_letter} instead of {ltm_letter}: {val}"
+                    )
+
+        if result['errors']:
+            for msg in result['errors']:
+                logger.error(f"[LTM validate] {msg}")
+        if result['warnings']:
+            for msg in result['warnings']:
+                logger.warning(f"[LTM validate] {msg}")
+        if not result['errors'] and not result['warnings']:
+            logger.info(
+                f"[LTM validate] Column {ltm_letter} passed all checks"
+            )
+
+        return result
+
+    def _clear_ltm_formula_cells(self, sheet, ltm_col: int) -> None:
+        """
+        Reset every formula cell in the LTM column inside the BS/P&L/Bank
+        layout ranges to ``None`` so the rebuild starts from a clean slate.
+
+        Non-formula values (manual entries, dates, header strings) are left
+        untouched so styling and the row-22 ``LTM {quarter}`` header survive.
+        """
+        layout_cfg = self._rules.get('layout', {})
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_section = layout_cfg.get('bank_section_rows', [104, 120])
+
+        rows_to_clear = (
+            set(range(bs_range[0], bs_range[1] + 1))
+            | set(range(pl_range[0], pl_range[1] + 1))
+            | set(range(bank_section[0], bank_section[1] + 1))
+        )
+
+        cleared = 0
+        for row_idx in rows_to_clear:
+            cell = sheet.cell(row=row_idx, column=ltm_col)
+            val = cell.value
+            if isinstance(val, str) and val.startswith('='):
+                cell.value = None
+                cleared += 1
+        if cleared:
+            logger.info(
+                f"[LTM rebuild] Cleared {cleared} stale formula cells in "
+                f"column {get_column_letter(ltm_col)}"
+            )
+
+    def _apply_ltm_calc_formulas_from_rules(self, sheet, ltm_col: int) -> None:
+        """
+        Apply every entry in ``layout.calc_formulas`` and
+        ``layout.ltm_calc_overrides`` as a safety net for subtotal rows.
+
+        Templates in ``formula_templates.yaml`` already cover most ``calc``
+        rows, but a missing template entry or a partial build would leave the
+        cell empty. The accounting_rules definitions are authoritative for
+        subtotal rows (19, 25, 26, 30, 44, 45, 48, 51, 55, 57, 66, 68), so we
+        re-apply them here using ``{col}`` → LTM letter.
+
+        ``ltm_calc_overrides`` wins over ``calc_formulas`` when a row appears
+        in both (e.g. row 19 uses ``=SUM({col}3:{col}18)`` in LTM but
+        ``={col}68`` in the quarter column).
+        """
+        layout_cfg = self._rules.get('layout', {})
+        calc_formulas = layout_cfg.get('calc_formulas', {}) or {}
+        ltm_overrides = layout_cfg.get('ltm_calc_overrides', {}) or {}
+
+        # ltm_overrides wins for the LTM column.
+        merged = {**calc_formulas, **ltm_overrides}
+        if not merged:
+            return
+
+        ltm_letter = get_column_letter(ltm_col)
+        applied = 0
+        for row_key, pattern in merged.items():
+            try:
+                row_idx = int(row_key)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(pattern, str) or not pattern.startswith('='):
+                continue
+            formula = pattern.replace('{col}', ltm_letter).replace('{COL}', ltm_letter)
+            sheet.cell(row=row_idx, column=ltm_col).value = formula
+            applied += 1
+        if applied:
+            logger.info(
+                f"[LTM rebuild] Applied {applied} calc formulas from "
+                f"accounting_rules.yaml in column {ltm_letter}"
+            )
+
+    def _rewrite_ltm_column_references(
+        self, sheet, ltm_col: int, new_quarter_col: int
+    ) -> None:
+        """
+        Final sweep over LTM column formulas:
+
+        - Replace any ``'BDO - …'`` sheet name that is not the current
+          ``config.bdo_sheet_name`` (catches references that survived the
+          rebuild for rows not covered by templates).
+        - Rewrite any in-sheet column reference whose letter still matches the
+          new quarter column letter to the LTM column letter. This catches the
+          ``SUM(AC23:AC24)`` family of bugs without touching cross-column
+          arithmetic (e.g. ``AB66+AB67`` from older columns is left alone).
+        """
+        ltm_letter = get_column_letter(ltm_col)
+        quarter_letter = get_column_letter(new_quarter_col)
+        new_bdo_name = self.config.bdo_sheet_name
+        bdo_pattern = re.compile(r"'(BDO[^']*)'")
+
+        # Match in-sheet refs: letter(s) + optional $ + row number, NOT
+        # preceded by '!' (which would make it a sheet-qualified reference).
+        # We rewrite only when the column letter exactly equals the new
+        # quarter column letter and the cell sits in the LTM column.
+        ref_pattern = re.compile(
+            r'(?<![!A-Z])(\$?)([A-Z]+)(\$?\d+)'
+        )
+
+        rewritten = 0
+        renamed = 0
+        for row_idx in range(1, sheet.max_row + 1):
+            cell = sheet.cell(row=row_idx, column=ltm_col)
+            val = cell.value
+            if not isinstance(val, str) or not val.startswith('='):
+                continue
+
+            new_val = val
+
+            # Step 1: Normalise BDO sheet name to the current quarter's sheet.
+            if 'BDO' in new_val:
+                before = new_val
+                new_val = bdo_pattern.sub(
+                    lambda m: f"'{new_bdo_name}'" if m.group(1) != new_bdo_name else m.group(0),
+                    new_val,
+                )
+                if new_val != before:
+                    renamed += 1
+
+            # Step 2: Rewrite in-sheet references that still point at the new
+            # quarter column letter (the classic SUM(AC...) in AD bug).
+            def _swap_col(match):
+                dollar1, col_letters, row_part = match.groups()
+                if col_letters == quarter_letter:
+                    return f"{dollar1}{ltm_letter}{row_part}"
+                return match.group(0)
+            swapped = ref_pattern.sub(_swap_col, new_val)
+            if swapped != new_val:
+                new_val = swapped
+
+            if new_val != val:
+                cell.value = new_val
+                rewritten += 1
+
+        if renamed or rewritten:
+            logger.info(
+                f"[LTM rebuild] Reference sweep in column {ltm_letter}: "
+                f"{renamed} BDO-name fixes, {rewritten} cells rewritten"
+            )
+
     def _update_ltm_sum_ranges(self, sheet, ltm_col: int, new_quarter_col: int):
         """
         Update SUM formulas in LTM column to include the new quarter column.
@@ -1692,23 +2091,17 @@ class ManagementAccountsBuilder:
                 logger.debug(f"Row {row_idx}: Set formula to '{correct_formula}' (was: {old_value})")
                 continue
             
-            # Handle SUM formula for Total row (row 114)
-            if isinstance(cell_value, str) and cell_value.startswith('=SUM('):
-                old_formula = cell_value
-                
-                # Pattern to match SUM formulas like =SUM(AA107:AA113)
-                sum_pattern = r'=SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)'
-                match = re.match(sum_pattern, old_formula, re.IGNORECASE)
-                
-                if match:
-                    start_row_num = match.group(2)
-                    end_row_num = match.group(4)
-                    
-                    # Set correct SUM formula with LTM column
-                    new_formula = f"=SUM({ltm_letter}{start_row_num}:{ltm_letter}{end_row_num})"
-                    cell.value = new_formula
-                    updated_count += 1
-                    logger.debug(f"Row {row_idx}: Updated SUM formula: {old_formula} -> {new_formula}")
+            # Handle SUM formula for Total row (row 114). Unconditionally
+            # write the canonical formula so the LTM rebuild produces a
+            # correct total even when the cleared cell was previously None.
+            bank_total_row = self._rules.get('bank_total_row', 114)
+            if row_idx == bank_total_row:
+                first_bank = min(bank_account_bdo_rows.keys())
+                last_bank = max(bank_account_bdo_rows.keys())
+                new_formula = f"=SUM({ltm_letter}{first_bank}:{ltm_letter}{last_bank})"
+                cell.value = new_formula
+                updated_count += 1
+                logger.debug(f"Row {row_idx}: Set SUM total to '{new_formula}'")
         
         if updated_count > 0:
             logger.info(f"Updated {updated_count} cells in Bank Account Overview section (column {ltm_letter})")
@@ -2431,61 +2824,6 @@ class ManagementAccountsBuilder:
         # No valid row found - keep original (formula will show 0 or error)
         logger.warning(f"No valid data found near row {original_row} in column {col_letter}")
         return original_row
-    
-    def _update_internal_sum_formulas(self, sheet, target_col: int, new_quarter_col: int):
-        """
-        Update internal SUM formulas that reference columns within the sheet.
-        When we insert a column, formulas like =SUM(AA3:AA18) need to be updated
-        to =SUM(AB3:AB18) if the column shifted.
-        
-        Also handles formulas that need to include the new quarter column.
-        """
-        target_letter = get_column_letter(target_col)
-        new_quarter_letter = get_column_letter(new_quarter_col)
-        updated_count = 0
-        
-        for row_idx in range(1, sheet.max_row + 1):
-            cell = sheet.cell(row=row_idx, column=target_col)
-            
-            if not cell.value or not isinstance(cell.value, str):
-                continue
-            
-            if not cell.value.startswith('='):
-                continue
-            
-            old_formula = cell.value
-            new_formula = old_formula
-            
-            # Pattern to find SUM ranges within the same column
-            # e.g., =SUM(AA3:AA18) or =SUM($AA$3:$AA$18)
-            sum_pattern = r'SUM\((\$?)([A-Z]+)(\$?)(\d+):(\$?)([A-Z]+)(\$?)(\d+)\)'
-            
-            def fix_sum_range(match):
-                d1, start_col, d2, start_row, d3, end_col, d4, end_row = match.groups()
-                
-                # If this SUM references the old LTM column letter (before shift),
-                # update it to the new target column letter
-                # The target_col now contains what was previously in ltm_col before the shift
-                
-                return f"SUM({d1}{target_letter}{d2}{start_row}:{d3}{target_letter}{d4}{end_row})"
-            
-            # Check if formula references the target column's own cells (self-referencing SUM)
-            if f'SUM(' in old_formula.upper():
-                # For SUM formulas, we need to ensure they reference the correct column
-                # After column insertion, the column letter in the formula should match target_letter
-                new_formula = re.sub(sum_pattern, fix_sum_range, new_formula, flags=re.IGNORECASE)
-            
-            # Also update any BDO references in LTM column
-            if 'BDO' in new_formula:
-                bdo_pattern = r"'(BDO[^']+)'"
-                new_formula = re.sub(bdo_pattern, f"'{self.config.bdo_sheet_name}'", new_formula)
-            
-            if new_formula != old_formula:
-                cell.value = new_formula
-                updated_count += 1
-        
-        if updated_count > 0:
-            logger.info(f"Updated {updated_count} internal formulas in column {target_letter}")
     
     def _update_date_references(self):
         """Update date references only in the Management Cijfers summary sheet.

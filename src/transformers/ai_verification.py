@@ -42,6 +42,11 @@ class VerificationConfig:
     bdo_sheet_name: str       # e.g. "BDO - Q4-25"
     summary_sheet_name: str   # e.g. "Management Cijfers - Q4 2025"
     previous_quarter_label: str  # e.g. "Q3 2025"
+    # Column indices assigned during the MA build. When set, the AI context
+    # extractor and patch validator use these instead of re-scanning the
+    # row-22 header — useful when the LTM header is missing or stale.
+    built_quarter_col: Optional[int] = None
+    built_ltm_col: Optional[int] = None
 
 
 @dataclass
@@ -118,17 +123,25 @@ class WorkbookContextExtractor:
                 )
 
                 header_row = self._rules.get('layout', {}).get('header_row', 22)
-                layout = scan_summary_column_layout(summary_sheet, header_row)
-                ltm_col = layout.ltm_column
-                quarter_col = find_column_by_header_label(
-                    summary_sheet, self.config.quarter, header_row
-                )
-                if not quarter_col:
-                    quarter_col = layout.last_quarter_column
-                if quarter_col and not ltm_col:
-                    ltm_col = find_ltm_column_near_quarter(
-                        summary_sheet, quarter_col, header_row
-                    )
+                # Prefer the column indices assigned during the MA build;
+                # the post-build header may still be wrong if a build error
+                # left a stale label in the LTM slot.
+                quarter_col = self.config.built_quarter_col
+                ltm_col = self.config.built_ltm_col
+                if quarter_col is None or ltm_col is None:
+                    layout = scan_summary_column_layout(summary_sheet, header_row)
+                    if quarter_col is None:
+                        quarter_col = find_column_by_header_label(
+                            summary_sheet, self.config.quarter, header_row
+                        )
+                        if not quarter_col:
+                            quarter_col = layout.last_quarter_column
+                    if ltm_col is None:
+                        ltm_col = layout.ltm_column
+                        if quarter_col and not ltm_col:
+                            ltm_col = find_ltm_column_near_quarter(
+                                summary_sheet, quarter_col, header_row
+                            )
                 context['ltm_col'] = ltm_col
                 context['quarter_col'] = quarter_col
                 context['ltm_col_letter'] = get_column_letter(ltm_col) if ltm_col else None
@@ -1146,12 +1159,19 @@ class PatchApplier:
 
     INTEREST_PROTECTED_ROWS = {60, 61, 64}
 
-    def __init__(self, workbook_path: str, summary_sheet_name: str):
+    def __init__(
+        self,
+        workbook_path: str,
+        summary_sheet_name: str,
+        expected_bdo_sheet_name: Optional[str] = None,
+        ltm_col: Optional[int] = None,
+    ):
         self.workbook_path = Path(workbook_path)
         self.summary_sheet_name = summary_sheet_name
+        self.expected_bdo_sheet_name = expected_bdo_sheet_name
         self.applied_patches: List[Dict] = []
         self.rejected_patches: List[Dict] = []
-        self._ltm_col: Optional[int] = None
+        self._ltm_col: Optional[int] = ltm_col
 
     def _detect_ltm_col(self, wb) -> Optional[int]:
         """Find the LTM column index from row 22 headers."""
@@ -1170,7 +1190,8 @@ class PatchApplier:
         Returns (count_applied, list_of_rejected).
         """
         wb = openpyxl.load_workbook(str(self.workbook_path))
-        self._ltm_col = self._detect_ltm_col(wb)
+        if self._ltm_col is None:
+            self._ltm_col = self._detect_ltm_col(wb)
         applied = 0
 
         for patch in patches:
@@ -1237,6 +1258,26 @@ class PatchApplier:
                 return False
             for disallowed in DISALLOWED_SHEET_REFS:
                 pass  # BDO refs within formulas are expected and valid
+
+            # LTM-column formula patches must reference the current quarter's
+            # BDO sheet — reject stale references (e.g. 'BDO - Q4-25' when the
+            # build target is 'BDO - Q1-26'). Guards against the AI patching
+            # the LTM column back to the prior quarter.
+            if (
+                self.expected_bdo_sheet_name
+                and self._ltm_col
+                and col == self._ltm_col
+                and 'BDO' in value
+            ):
+                bdo_refs = re.findall(r"'(BDO[^']*)'", value)
+                stale = [name for name in bdo_refs if name != self.expected_bdo_sheet_name]
+                if stale:
+                    patch['rejection_reason'] = (
+                        f"LTM formula patch references stale BDO sheet(s) "
+                        f"{stale!r}, expected {self.expected_bdo_sheet_name!r}"
+                    )
+                    logger.warning(f"Rejected patch: {patch['rejection_reason']}")
+                    return False
 
         return True
 
@@ -1692,6 +1733,8 @@ class AIVerificationOrchestrator:
 
                 applier = PatchApplier(
                     workbook_path, self.config.summary_sheet_name,
+                    expected_bdo_sheet_name=self.config.bdo_sheet_name,
+                    ltm_col=self.config.built_ltm_col,
                 )
                 applied, rejected = applier.apply(result.patches, workbook_path)
                 result.patches_applied = applied
