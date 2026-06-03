@@ -283,6 +283,7 @@ class ManagementAccountsConfig:
     bdo_sheet_name: str  # e.g., "BDO - Q3-25"
     summary_sheet_name: str  # e.g., "Management Cijfers - Q3 2025"
     cash_proceeds_sale: float = 0.0  # Row 50: Cash proceeds from sales tracker
+    quarter_num: Optional[int] = None  # 1-4; controls FY column retention
 
 
 class ManagementAccountsBuilder:
@@ -1374,6 +1375,29 @@ class ManagementAccountsBuilder:
         
         header_row = self._rules.get('layout', {}).get('header_row', 22)
         layout = scan_summary_column_layout(summary_sheet, header_row)
+
+        # Step 0: Remove FY column(s) when processing a non-Q4 quarter.
+        # FY 20XX represents the full prior year and only belongs in the
+        # workbook after a Q4 build. For Q1/Q2/Q3 it carries stale data
+        # (year-end balances + dates) and shifts the LTM slot to the wrong
+        # position. Deleting it before insert keeps the layout clean:
+        # `... | Q4 YYYY | LTM Q4 YYYY` becomes `... | Q4 | Qn | LTM Qn`.
+        if (
+            self.config.quarter_num is not None
+            and self.config.quarter_num != 4
+            and layout.fy_columns
+        ):
+            for fy_col in sorted(layout.fy_columns, reverse=True):
+                fy_letter = get_column_letter(fy_col)
+                summary_sheet.delete_cols(fy_col)
+                logger.info(
+                    f"Removed FY column at {fy_letter} "
+                    f"(quarter_num={self.config.quarter_num}, not Q4)"
+                )
+            # Re-scan so insert_position, prev_quarter_col, and pre_ltm_col
+            # all reflect the post-deletion column indices.
+            layout = scan_summary_column_layout(summary_sheet, header_row)
+
         insert_position = layout.insert_column
         prev_quarter_col = layout.previous_quarter_column
         pre_ltm_col = layout.ltm_column
@@ -1456,12 +1480,17 @@ class ManagementAccountsBuilder:
         # Copy header styling from previous quarter column for new quarter (Row 22)
         prev_header_cell = summary_sheet.cell(row=22, column=prev_quarter_col)
         header_cell = summary_sheet.cell(row=22, column=new_quarter_col)
-        # Copy ALL styling including fill (background color) from previous quarter header
+        # Copy ALL styling including fill (background color) AND the number
+        # format. Earlier versions left `number_format` untouched which is
+        # why the new quarter header carried "General" instead of the
+        # accounting format from the previous header.
         if prev_header_cell.has_style:
             header_cell.font = copy(prev_header_cell.font)
             header_cell.alignment = copy(prev_header_cell.alignment)
             header_cell.border = copy(prev_header_cell.border)
             header_cell.fill = copy(prev_header_cell.fill)  # Copy background color
+            if prev_header_cell.number_format and prev_header_cell.number_format != 'General':
+                header_cell.number_format = prev_header_cell.number_format
 
         # Row 2: Balance sheet date header - only in LTM column, quarter column stays empty
         # The date cell in the new quarter column should remain None (cleared earlier)
@@ -1484,7 +1513,26 @@ class ManagementAccountsBuilder:
             ltm_date_cell.fill = copy(prev_ltm_date_cell.fill)
         
         client_number_format = '_(* #,##0_);_(* \\(#,##0\\);_(* "-"??_);_(@_)'
-        
+
+        # Rows 2-21 styling for the new quarter column.
+        # The previous fix only handled row 22 (header) and rows 23+ (data),
+        # which left rows 1-21 with whatever insert_cols() copied — usually
+        # `Calibri 11 / General`. That diverged from the client reference
+        # (Avenir / accounting format). Copy from the previous quarter column
+        # for the date row + the empty Balance Sheet rows so the column
+        # carries consistent styling top to bottom.
+        for row_idx in range(2, 22):
+            prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
+            cell = summary_sheet.cell(row=row_idx, column=new_quarter_col)
+            if not prev_cell.has_style:
+                continue
+            cell.font = copy(prev_cell.font)
+            cell.alignment = copy(prev_cell.alignment)
+            cell.border = copy(prev_cell.border)
+            cell.fill = copy(prev_cell.fill)
+            if prev_cell.number_format and prev_cell.number_format != 'General':
+                cell.number_format = prev_cell.number_format
+
         # New quarter column: copy ALL styling from the previous quarter column.
         # The previous column already carries the correct Avenir book/10/bold font
         # and per-row colours; we must not replace it with a hardcoded font.
@@ -1539,6 +1587,26 @@ class ManagementAccountsBuilder:
             medium = Side(style='medium', color='FF000000')
             border_row_border = Border(bottom=medium, top=thin)
 
+        def _fill_is_theme_based(fill) -> bool:
+            """True if a PatternFill carries a theme-color reference.
+
+            The client reference workbook uses theme:4 (+ tint) for the
+            header band and the LTM data band. When `insert_cols()` shifts
+            the previous LTM column right, those theme fills are preserved
+            on the cell. Overwriting them with the hardcoded RGB
+            (FF5B9BD5 / FFDDEAF6) loses the theme link and can render
+            slightly off in different Excel themes, which is what produced
+            the `theme:4` vs `FF5B9BD5` divergence the client reported.
+            """
+            if fill is None or fill.fill_type != 'solid':
+                return False
+            for color_attr in (fill.fgColor, fill.bgColor, fill.start_color, fill.end_color):
+                if color_attr is None:
+                    continue
+                if getattr(color_attr, 'type', None) == 'theme':
+                    return True
+            return False
+
         for row_idx in range(date_row, summary_sheet.max_row + 1):
             prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
@@ -1552,7 +1620,13 @@ class ManagementAccountsBuilder:
                     else client_number_format
                 )
 
-                if row_idx in header_rows:
+                # Prefer the existing LTM cell's theme-based fill (shifted
+                # in by insert_cols). Only fall back to explicit RGB when
+                # the cell has no styled fill of its own.
+                existing_fill = cell.fill if cell.has_style else None
+                if _fill_is_theme_based(existing_fill):
+                    pass  # keep theme-based fill as-is
+                elif row_idx in header_rows:
                     cell.fill = header_fill
                 elif row_idx in ltm_data_rows:
                     cell.fill = blue_fill
@@ -1897,6 +1971,7 @@ class ManagementAccountsBuilder:
             return
 
         ltm_letter = get_column_letter(ltm_col)
+        bdo_name = self.config.bdo_sheet_name
         applied = 0
         for row_key, pattern in merged.items():
             try:
@@ -1905,7 +1980,15 @@ class ManagementAccountsBuilder:
                 continue
             if not isinstance(pattern, str) or not pattern.startswith('='):
                 continue
-            formula = pattern.replace('{col}', ltm_letter).replace('{COL}', ltm_letter)
+            # Substitutions:
+            #   {col} / {COL} → LTM column letter
+            #   {bdo}         → current BDO sheet name (no quotes; caller
+            #                   includes single quotes in the template).
+            formula = (
+                pattern.replace('{col}', ltm_letter)
+                       .replace('{COL}', ltm_letter)
+                       .replace('{bdo}', bdo_name)
+            )
             sheet.cell(row=row_idx, column=ltm_col).value = formula
             applied += 1
         if applied:
@@ -2066,8 +2149,8 @@ class ManagementAccountsBuilder:
         - Row 107 (RENT): H35
         - Row 108 (MAINT): H34
         - Row 109 (EXP): H36
-        - Row 110 (GEN): H32
-        - Row 111 (DEP): H33
+        - Row 110 (DEP): H33
+        - Row 111 (GEN): H32
         - Row 112 (CAPEX): H37
         - Row 113 (DISPOSAL): H31
         """
@@ -2075,36 +2158,56 @@ class ManagementAccountsBuilder:
         new_bdo_name = self.config.bdo_sheet_name
         period_end = self.config.period_end
         updated_count = 0
-        
+
         # Define the correct BDO row references for each bank account
-        # These are the closing balance (column H) rows in the BDO sheet
+        # These are the closing balance (column H) rows in the BDO sheet.
+        # Rows 110 (DEP) and 111 (GEN) ordering matches the client-reference
+        # workbook; the previous mapping had these two swapped which produced
+        # off-by-one totals in the bank section.
         bank_account_bdo_rows = {
             107: 'H35',  # ABN AMRO RENT account
             108: 'H34',  # ABN AMRO MAINT account
             109: 'H36',  # ABN AMRO EXP account
-            110: 'H32',  # ABN AMRO GEN account
-            111: 'H33',  # ABN AMRO DEP account
+            110: 'H33',  # ABN AMRO DEP account
+            111: 'H32',  # ABN AMRO GEN account
             112: 'H37',  # ABN AMRO CAPEX account
             113: 'H31',  # ABN AMRO DISPOSAL account
         }
-        
+
+        # Row 106: "Per DD-MM-YYYY" label is mandatory in the LTM column.
+        # The earlier `_clear_ltm_formula_cells` step can leave this cell as
+        # None when the previous workbook contained a date or formula here,
+        # so we write the label unconditionally before iterating the bank
+        # rows. Without this, `correct.xlsx` shows "Per 31-3-2026" while the
+        # automation leaves the cell blank or with a stale FY date.
+        label_row = 106
+        date_label = f"Per {period_end.day}-{period_end.month}-{period_end.year}"
+        sheet.cell(row=label_row, column=ltm_col).value = date_label
+        updated_count += 1
+        logger.debug(f"Row {label_row}: Set date label to '{date_label}'")
+
         # Define the Bank Account Overview section range
         start_row = 104
         end_row = min(sheet.max_row, 125)  # Safety limit
-        
+
         for row_idx in range(start_row, end_row + 1):
+            # Row 106 already handled unconditionally above; skip here to
+            # avoid double-counting and to prevent stale "Per …" detection
+            # from interfering when the cell was cleared.
+            if row_idx == label_row:
+                continue
+
             cell = sheet.cell(row=row_idx, column=ltm_col)
             cell_value = cell.value
-            
-            # Handle date header (row 106 typically: "Per 30-6-2025")
+
+            # Defensive: legacy templates can still carry "Per …" strings
+            # in unexpected rows; re-stamp them with the current period.
             if isinstance(cell_value, str) and cell_value.startswith('Per '):
-                # Update the date to current quarter end
-                new_date_str = f"Per {period_end.day}-{period_end.month}-{period_end.year}"
-                cell.value = new_date_str
+                cell.value = date_label
                 updated_count += 1
-                logger.debug(f"Row {row_idx}: Updated date header to '{new_date_str}'")
+                logger.debug(f"Row {row_idx}: Updated date header to '{date_label}'")
                 continue
-            
+
             # Set correct bank account formulas (rows 107-113)
             if row_idx in bank_account_bdo_rows:
                 bdo_cell_ref = bank_account_bdo_rows[row_idx]
@@ -3673,7 +3776,14 @@ class ManagementAccountsBuilder:
         for row_key in [dep_row, auth_row]:
             tmpl = all_calcs.get(row_key) or all_calcs.get(str(row_key))
             if tmpl:
-                formula = tmpl.replace('{col}', ltm_letter)
+                # Same substitutions as _apply_ltm_calc_formulas_from_rules
+                # so templates using {bdo} (e.g. row 19's -H134 correction)
+                # are written with the correct sheet name.
+                formula = (
+                    tmpl.replace('{col}', ltm_letter)
+                        .replace('{COL}', ltm_letter)
+                        .replace('{bdo}', bdo_name)
+                )
                 ws.cell(row=row_key, column=ltm_col).value = formula
                 logger.info(f"[BDO Align] Row {row_key}: {formula}")
             else:

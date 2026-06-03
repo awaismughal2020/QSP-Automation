@@ -68,9 +68,14 @@ balance_sheet:
     label: "Prepaid expenses"
     type: bdo_sum_range
     start_account: "2040200"
-    end_account: "2040900"
-    count: 3
-    additional: ["2300001", "2040601"]
+    end_account: "2040601"
+    count: 4
+    # Range: BDO rows 23-26 (2040200, 2040500, 2040900, 2040601).
+    # additional: 2300001 (LM Kruisposten pin, BDO row 30) and
+    #             2040501 (VOR Ingediende verzekeringszaken, BDO row 75).
+    # Previously "2040601" was in additional which double-counted the
+    # 2040601 row by also picking up its second occurrence at row 76.
+    additional: ["2300001", "2040501"]
     
   9:
     label: "Cash"
@@ -120,6 +125,10 @@ balance_sheet:
     start_account: "2730001"
     end_account: "2650001"
     count: 6
+    # additional: 2760000 (KLS Saldo lening DMRRP INV - I BV, BDO row 67).
+    # Client reference includes this loan-balance row in the Current Account
+    # subtotal; the automation was missing the +H67 term.
+    additional: ["2760000"]
     
   16:
     label: "VAT payable"
@@ -233,8 +242,13 @@ profit_loss:
   36:
     label: "(Property tax)"
     type: bdo_ref
-    account_codes: ["4100900"]
+    # 4100900 = KN Onroerende zaakbelasting (BDO row 93)
+    # 4100410 = Verhuurdersheffing       (BDO row 95)
+    # Client reference includes both as Property tax; automation was
+    # missing the second term.
+    account_codes: ["4100900", "4100410"]
     sign: "-"
+    operator: "-"
     column: G
     
   37:
@@ -262,7 +276,21 @@ profit_loss:
   40:
     label: "(Other costs)"
     type: bdo_ref
-    account_codes: ["4501200", "4501300", "4300200", "4300500", "4310700", "4311000", "4311900", "4319800", "4101300"]
+    # Aligned with client reference (correct.xlsx); added 4300600 (BDO row
+    # 105, KN Kosten automatisering) and 4310000 (BDO row 107, KN
+    # Abonnementen en contributies) which were missing.
+    account_codes:
+      - "4501200"   # BDO 100
+      - "4501300"   # BDO 101
+      - "4300200"   # BDO 103
+      - "4300500"   # BDO 104
+      - "4300600"   # BDO 105 (was missing)
+      - "4310000"   # BDO 107 (was missing)
+      - "4310700"   # BDO 111
+      - "4311000"   # BDO 113
+      - "4311900"   # BDO 115
+      - "4319800"   # BDO 117
+      - "4101300"   # BDO  98
     sign: "-"
     column: G
     operator: "-"
@@ -358,7 +386,16 @@ profit_loss:
     type: bdo_ref_conditional
     q_config:
       type: bdo_ref
-      account_codes: ["4611000", "4613000", "4620200", "4623001", "4642000"]
+      # 4601000 (H119) and 4613001 (H122) were missing in the previous
+      # template; client reference covers BDO rows 119-124 + 126.
+      account_codes:
+        - "4601000"   # BDO 119 — FINBL Rente RC D.M. Equity Partners C.V.
+        - "4611000"   # BDO 120
+        - "4613000"   # BDO 121
+        - "4613001"   # BDO 122 — FINBL Rente D.M. Equity Management Company BV
+        - "4620200"   # BDO 123
+        - "4623001"   # BDO 124
+        - "4642000"   # BDO 126 — added back (positive interest income)
       sign: "-"
       operator: "-"
     ltm_config:

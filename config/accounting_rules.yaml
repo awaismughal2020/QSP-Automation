@@ -41,13 +41,13 @@ rounding:
 # ─── Bank-account overview section in Management Cijfers ───
 # Keys = MA row numbers, values = BDO account codes (resolved at runtime).
 bank_bdo_row_map:
-  107: 35
-  108: 34
-  109: 36
-  110: 32
-  111: 33
-  112: 37
-  113: 31
+  107: 35    # ABN AMRO RENT
+  108: 34    # ABN AMRO MAINT
+  109: 36    # ABN AMRO EXP
+  110: 33    # ABN AMRO DEP   (was 32 — corrected to match client reference)
+  111: 32    # ABN AMRO GEN   (was 33 — corrected to match client reference)
+  112: 37    # ABN AMRO CAPEX
+  113: 31    # ABN AMRO DISPOSAL
 bank_total_row: 114            # SUM of the bank rows above
 
 # ─── Protected rows ───
@@ -88,8 +88,16 @@ layout:
     68: "={col}66+{col}67"
 
   # LTM-only calc formula overrides (overrides calc_formulas for LTM column only)
+  # Placeholders:
+  #   {col}  → LTM column letter (e.g. AD)
+  #   {bdo}  → current BDO sheet name (no quotes; include single quotes in pattern)
   ltm_calc_overrides:
-    19: "=SUM({col}3:{col}18)"
+    # Row 19 = Total Equity Movement. The closing-balance section (rows 3-18)
+    # plus a small reconciliation term '<BDO>'!H134 ("Verschil balans en winst-
+    # en-verlies") which the client reference workbook subtracts. Without
+    # this term the totals diverge from BDO's Resultaat na belasting by the
+    # amount of that reconciliation row.
+    19: "=SUM({col}3:{col}18)-'{bdo}'!H134"
 
   # Intermediate P&L rows (net interest, derivatives, etc.)
   intermediate_rows: [60, 61, 64, 65, 67]

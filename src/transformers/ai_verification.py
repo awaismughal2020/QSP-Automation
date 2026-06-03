@@ -154,9 +154,58 @@ class WorkbookContextExtractor:
                     context['formatting_snapshot'] = self._extract_formatting(
                         summary_sheet, quarter_col, ltm_col
                     )
+                    # Previous-quarter formulas as few-shot reference. The
+                    # column immediately left of the current quarter is the
+                    # previous quarter (Q4 2025 when current = Q1 2026, etc.)
+                    # and its formulas are already client-validated history.
+                    # Claude uses them to spot row-mapping drift on the new
+                    # column without re-deriving every BDO row from scratch.
+                    context['previous_quarter_formulas'] = (
+                        self._extract_previous_quarter_formulas(
+                            summary_sheet, quarter_col
+                        )
+                    )
             return context
         finally:
             wb.close()
+
+    def _extract_previous_quarter_formulas(
+        self, sheet, quarter_col: int
+    ) -> Dict[str, Dict[int, str]]:
+        """Capture every formula in the previous quarter column.
+
+        Returns a dict with ``previous_quarter_col_letter`` and ``formulas``
+        (a map row_idx -> formula string) so the prompt builder can render a
+        compact reference block.
+        """
+        layout_cfg = self._rules.get('layout', {})
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_range = layout_cfg.get('bank_rows', [107, 114])
+
+        prev_col = quarter_col - 1
+        if prev_col < 2:
+            return {'previous_quarter_col_letter': None, 'formulas': {}}
+
+        rows_of_interest = (
+            list(range(bs_range[0], bs_range[1] + 1))
+            + list(range(pl_range[0], pl_range[1] + 1))
+            + list(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        prev_letter = get_column_letter(prev_col)
+        header = sheet.cell(row=22, column=prev_col).value
+        formulas: Dict[int, str] = {}
+        for row_idx in rows_of_interest:
+            val = sheet.cell(row=row_idx, column=prev_col).value
+            if isinstance(val, str) and val.startswith('='):
+                formulas[row_idx] = val
+
+        return {
+            'previous_quarter_col_letter': prev_letter,
+            'previous_quarter_header': header,
+            'formulas': formulas,
+        }
 
     def _extract_metadata(self) -> Dict[str, Any]:
         return {
@@ -584,6 +633,36 @@ only report actual errors found in the workbook."""
             json.dumps(context.get('formatting_snapshot', {}), indent=2),
         ]
 
+        # Previous-quarter formulas as a known-good reference (few-shot).
+        # When the client signed off on Q4 2025, every formula in that
+        # column became authoritative for *structure* (which BDO rows feed
+        # which Management Cijfers row). The new column should mirror that
+        # structure cell-for-cell, only swapping the BDO sheet name and
+        # column letter (G vs H). Diffing against this catches row-mapping
+        # drift that the static `formula_templates.yaml` alone can miss.
+        prev_q = context.get('previous_quarter_formulas') or {}
+        prev_col_letter = prev_q.get('previous_quarter_col_letter')
+        prev_header = prev_q.get('previous_quarter_header')
+        prev_formulas = prev_q.get('formulas') or {}
+        if prev_col_letter and prev_formulas:
+            parts.append("")
+            parts.append(
+                f"PREVIOUS QUARTER FORMULAS — known-correct reference "
+                f"(column {prev_col_letter}, header={prev_header!r}):"
+            )
+            parts.append(
+                "These formulas were validated by the client for the prior "
+                "quarter. For every row that has a previous-quarter formula, "
+                "the new quarter's formula should match it structurally — "
+                "same BDO row numbers, same operators, same set of accounts. "
+                "Only the BDO sheet name and BDO column letter (G vs H) "
+                "should differ. Anything else is a row-mapping bug."
+            )
+            parts.append(json.dumps(
+                {str(k): v for k, v in sorted(prev_formulas.items())},
+                indent=2,
+            ))
+
         shadow_pl = context.get('shadow_pl')
         shadow_bs = context.get('shadow_bs')
         if shadow_pl:
@@ -793,8 +872,8 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
         all_calcs = {**calc_formulas, **ltm_overrides}
         auth_tmpl = all_calcs.get(auth_row) or all_calcs.get(str(auth_row), f"={{col}}{dep_row}")
         dep_tmpl = all_calcs.get(dep_row) or all_calcs.get(str(dep_row), f"={{col}}{dep_row-2}+{{col}}{dep_row-1}")
-        auth_expected = auth_tmpl.replace('{col}', ltm)
-        dep_expected = dep_tmpl.replace('{col}', ltm)
+        auth_expected = auth_tmpl.replace('{col}', ltm).replace('{bdo}', bdo_name)
+        dep_expected = dep_tmpl.replace('{col}', ltm).replace('{bdo}', bdo_name)
 
         return f"""BDO RESULT AFTER TAXES — EXECUTIVE ALIGNMENT RULE
 (Reporting period: {quarter}, year {year})
@@ -865,13 +944,13 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
 
         q_calc_lines = []
         for row_num, tmpl in sorted(calc_formulas.items()):
-            formula = tmpl.replace('{col}', q)
+            formula = tmpl.replace('{col}', q).replace('{bdo}', bdo_name)
             q_calc_lines.append(f"     Row {row_num}: {formula}")
 
         ltm_calc_lines = []
         all_ltm = {**calc_formulas, **ltm_overrides}
         for row_num, tmpl in sorted(all_ltm.items()):
-            formula = tmpl.replace('{col}', ltm)
+            formula = tmpl.replace('{col}', ltm).replace('{bdo}', bdo_name)
             ltm_calc_lines.append(f"     Row {row_num}: {formula}")
 
         q_calc_block = "\n".join(q_calc_lines)
@@ -1079,6 +1158,29 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
     - {ltm}64: =SUM({sum_start_letter}64:{q}64)
     If any of these cells look different from what you expect, PASS — they are
     managed by deterministic code that runs after your patches.
+
+15. PREVIOUS-QUARTER STRUCTURAL CROSS-CHECK (NEW):
+    The PREVIOUS QUARTER FORMULAS section above lists every formula from the
+    prior quarter's column. That column has been client-validated. For EVERY
+    row that appears in that reference:
+    a) Find the corresponding formula in the current quarter column ({q}).
+    b) Confirm the set of BDO row numbers referenced is IDENTICAL.
+    c) Confirm the operators (+, -, SUM ranges) are IDENTICAL.
+    d) The ONLY allowed differences:
+         - BDO sheet name (e.g. 'BDO - Q4-25' → '{bdo_name}')
+         - BDO column letter (G in quarter column, H in LTM column)
+         - In-sheet column references in calc formulas (Q letter → LTM letter)
+    e) If the current quarter formula uses a DIFFERENT set of BDO rows than
+       the previous quarter (e.g. drops a row, swaps row numbers, adds a row
+       that wasn't there before), emit a `formula` patch that mirrors the
+       previous-quarter row set exactly. Do this BEFORE falling back to the
+       template-based reconstruction in checks 1-2.
+    f) Apply the same check to the LTM column ({ltm}): every row that has a
+       previous-quarter formula should have an LTM formula referencing the
+       SAME BDO rows but via column H.
+
+    This is the single most reliable correctness check — the template can
+    drift over time, but a client-signed-off prior quarter cannot.
 {cv_section}"""
 
     def _response_format_section(self) -> str:
@@ -1818,9 +1920,11 @@ class AIVerificationOrchestrator:
 
         # Check 1: dep_row (68) must be a formula
         dep_template = all_calcs.get(dep_row) or all_calcs.get(str(dep_row))
-        expected_dep = (dep_template.replace('{col}', ltm_letter)
-                        if dep_template else
-                        f"={ltm_letter}{dep_row - 2}+{ltm_letter}{dep_row - 1}")
+        expected_dep = (
+            dep_template.replace('{col}', ltm_letter).replace('{bdo}', bdo_name)
+            if dep_template else
+            f"={ltm_letter}{dep_row - 2}+{ltm_letter}{dep_row - 1}"
+        )
         cell_dep = sheet.cell(row=dep_row, column=ltm_col)
         if not isinstance(cell_dep.value, str) or not cell_dep.value.startswith('='):
             cell_dep.value = expected_dep
@@ -1829,8 +1933,10 @@ class AIVerificationOrchestrator:
 
         # Check 2: auth_row (19) must be a formula
         auth_template = all_calcs.get(auth_row) or all_calcs.get(str(auth_row))
-        expected_auth = (auth_template.replace('{col}', ltm_letter)
-                         if auth_template else f"={ltm_letter}{dep_row}")
+        expected_auth = (
+            auth_template.replace('{col}', ltm_letter).replace('{bdo}', bdo_name)
+            if auth_template else f"={ltm_letter}{dep_row}"
+        )
         cell_auth = sheet.cell(row=auth_row, column=ltm_col)
         if not isinstance(cell_auth.value, str) or not cell_auth.value.startswith('='):
             cell_auth.value = expected_auth
@@ -1948,6 +2054,7 @@ class AIVerificationOrchestrator:
                 period_end=_parse_period_end(self.config.period_end),
                 bdo_sheet_name=self.config.bdo_sheet_name,
                 summary_sheet_name=self.config.summary_sheet_name,
+                quarter_num=getattr(self.config, 'quarter_num', None),
             )
 
             builder = ManagementAccountsBuilder.__new__(ManagementAccountsBuilder)
@@ -2064,6 +2171,7 @@ class AIVerificationOrchestrator:
                 period_end=_parse_period_end(self.config.period_end),
                 bdo_sheet_name=self.config.bdo_sheet_name,
                 summary_sheet_name=self.config.summary_sheet_name,
+                quarter_num=getattr(self.config, 'quarter_num', None),
             )
 
             builder = ManagementAccountsBuilder.__new__(ManagementAccountsBuilder)

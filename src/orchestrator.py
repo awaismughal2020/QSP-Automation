@@ -447,7 +447,8 @@ class QuarterlyReportOrchestrator:
                 period_end=self.config.period_end,
                 bdo_sheet_name=f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}",
                 summary_sheet_name=f"Management Cijfers - {self.config.quarter_str}",
-                cash_proceeds_sale=sales_data.quarter_proceeds  # Row 50: from sales tracker
+                cash_proceeds_sale=sales_data.quarter_proceeds,  # Row 50: from sales tracker
+                quarter_num=self.config.quarter,
             )
             ma_builder = ManagementAccountsBuilder(
                 str(self.config.previous_management_accounts),
@@ -843,7 +844,8 @@ class QuarterlyReportOrchestrator:
                 period_end=self.config.period_end,
                 bdo_sheet_name=f"BDO - Q{self.config.quarter}-{str(self.config.year)[-2:]}",
                 summary_sheet_name=f"Management Cijfers - {self.config.quarter_str}",
-                cash_proceeds_sale=sales_data.quarter_proceeds
+                cash_proceeds_sale=sales_data.quarter_proceeds,
+                quarter_num=self.config.quarter,
             )
             ma_builder = ManagementAccountsBuilder(
                 str(self.config.previous_management_accounts),

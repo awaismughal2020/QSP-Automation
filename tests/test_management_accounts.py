@@ -1039,3 +1039,275 @@ class TestLtmColumnRebuild:
                 ws, header_row=22, expected_col=31, quarter_col=30
             )
 
+
+# ---------------------------------------------------------------------------
+# Fix Management Accounts Column Issues — new regression tests.
+# ---------------------------------------------------------------------------
+
+
+def _run_builder_with_quarter_num(
+    prev_path: Path, out_path: Path, quarter_num: int
+) -> ManagementAccountsBuilder:
+    """Same as `_run_builder` but threads a quarter_num through the config so
+    the FY-removal branch in `_update_summary_sheet` is exercised."""
+    config = ManagementAccountsConfig(
+        quarter="Q1 2026",
+        period_end=datetime(2026, 3, 31),
+        bdo_sheet_name="BDO - Q1-26",
+        summary_sheet_name="Management Cijfers - Q1 2026",
+        quarter_num=quarter_num,
+    )
+    builder = ManagementAccountsBuilder(str(prev_path), str(out_path), config)
+    builder.workbook = load_workbook(prev_path)
+    builder.config = config
+    builder._copy_bdo_data_to_new_sheet(
+        _make_bdo_result(_make_q1_2026_bdo_accounts())
+    )
+    new_bdo = builder.workbook[config.bdo_sheet_name]
+    builder._build_row_map(
+        new_bdo, builder._new_bdo_row_map, builder._new_bdo_label_map
+    )
+    builder._update_summary_sheet()
+    builder.workbook.save(out_path)
+    return builder
+
+
+class TestFYColumnRemoval:
+    """FY 2025 must disappear when the new quarter is Q1/Q2/Q3 and be kept
+    when the new quarter is Q4. With FY gone, the new LTM lands directly
+    after the new quarter column."""
+
+    def test_fy_removed_for_q1(self, tmp_path):
+        """Q4|FY|LTM input + quarter_num=1 → FY deleted, layout Q4|Q1|LTM."""
+        from openpyxl.utils import get_column_letter
+        prev_path = tmp_path / "prev_q4_fy_q1.xlsx"
+        out_path = tmp_path / "out_q1.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+
+        builder = _run_builder_with_quarter_num(
+            prev_path, out_path, quarter_num=1
+        )
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+
+        # Input had Q3=AB(28), Q4=AC(29), FY=AD(30), LTM=AE(31).
+        # After deleting FY: Q3=28, Q4=29, LTM=30.
+        # After inserting Q1 at 30: Q3=28, Q4=29, Q1=30, LTM=31.
+        assert builder._new_quarter_col == 30
+        assert builder._new_ltm_col == 31
+        assert get_column_letter(builder._new_quarter_col) == "AD"
+        assert get_column_letter(builder._new_ltm_col) == "AE"
+
+        # No FY column anywhere on row 22
+        fy_columns = []
+        for col_idx in range(1, sheet.max_column + 1):
+            v = sheet.cell(row=22, column=col_idx).value
+            if v and isinstance(v, str) and v.strip().upper().startswith("FY"):
+                fy_columns.append((col_idx, v))
+        assert fy_columns == [], (
+            f"FY column should have been removed but found: {fy_columns}"
+        )
+
+        # Headers placed correctly
+        assert sheet.cell(row=22, column=builder._new_quarter_col).value == "Q1 2026"
+        assert sheet.cell(row=22, column=builder._new_ltm_col).value == "LTM Q1 2026"
+
+    def test_fy_kept_for_q4(self, tmp_path):
+        """Q3|FY|LTM input + quarter_num=4 → FY retained."""
+        from openpyxl.utils import get_column_letter
+
+        prev_path = tmp_path / "prev_q3_fy.xlsx"
+        out_path = tmp_path / "out_q4.xlsx"
+
+        # Build a Q3 2025 workbook with the FY-of-prior-year still present.
+        wb = Workbook()
+        bdo = wb.active
+        bdo.title = "BDO - Q3-25"
+        for code, raw_row in {
+            "8000003": 80, "8400600": 83, "1790002": 6, "1600000": 10,
+        }.items():
+            bdo.cell(row=raw_row, column=1, value=code)
+            bdo.cell(row=raw_row, column=2, value=f"Account {code}")
+            bdo.cell(row=raw_row, column=7, value=100)
+            bdo.cell(row=raw_row, column=8, value=400)
+        mc = wb.create_sheet("Management Cijfers - Q3 2025")
+        mc.cell(row=1, column=1, value="Management Accounts QSP ESS B.V. - Q3 2025")
+        mc.cell(row=22, column=27, value="Q2 2025")
+        mc.cell(row=22, column=28, value="Q3 2025")
+        mc.cell(row=22, column=29, value="FY 2024")
+        mc.cell(row=22, column=30, value="LTM Q3 2025")
+        mc.cell(row=2, column=30, value=datetime(2025, 9, 30))
+        wb.save(prev_path)
+
+        # Reuse builder plumbing but with a Q4 config and quarter_num=4.
+        config = ManagementAccountsConfig(
+            quarter="Q4 2025",
+            period_end=datetime(2025, 12, 31),
+            bdo_sheet_name="BDO - Q4-25",
+            summary_sheet_name="Management Cijfers - Q4 2025",
+            quarter_num=4,
+        )
+        builder = ManagementAccountsBuilder(str(prev_path), str(out_path), config)
+        builder.workbook = load_workbook(prev_path)
+        builder.config = config
+        builder._copy_bdo_data_to_new_sheet(
+            _make_bdo_result(_make_q1_2026_bdo_accounts())
+        )
+        # Rename copied BDO sheet to Q4-25 for the test fixture
+        if "BDO - Q1-26" in builder.workbook.sheetnames:
+            builder.workbook["BDO - Q1-26"].title = "BDO - Q4-25"
+        new_bdo = builder.workbook["BDO - Q4-25"]
+        builder._build_row_map(
+            new_bdo, builder._new_bdo_row_map, builder._new_bdo_label_map
+        )
+        builder._update_summary_sheet()
+
+        sheet = builder.workbook[config.summary_sheet_name]
+        # FY 2024 must still exist somewhere on row 22
+        fy_seen = any(
+            isinstance(sheet.cell(row=22, column=c).value, str)
+            and sheet.cell(row=22, column=c).value.strip().upper().startswith("FY")
+            for c in range(1, sheet.max_column + 1)
+        )
+        assert fy_seen, "FY column must be retained when quarter_num == 4"
+
+    def test_fy_removal_is_skipped_when_quarter_num_none(self, tmp_path):
+        """Backward compat: legacy callers without quarter_num keep FY."""
+        prev_path = tmp_path / "prev_legacy.xlsx"
+        out_path = tmp_path / "out_legacy.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        # _run_builder (no quarter_num) → quarter_num defaults to None → no removal
+        builder = _run_builder(prev_path, out_path)
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        fy_seen = any(
+            isinstance(sheet.cell(row=22, column=c).value, str)
+            and sheet.cell(row=22, column=c).value.strip().upper().startswith("FY")
+            for c in range(1, sheet.max_column + 1)
+        )
+        assert fy_seen, (
+            "Legacy callers without quarter_num must not lose the FY column"
+        )
+
+
+class TestRow106DateLabel:
+    """Row 106 'Per DD-MM-YYYY' label must be written unconditionally in the
+    LTM column, even when the previous workbook left that cell empty."""
+
+    def test_row_106_label_written_with_period_end(self, tmp_path):
+        prev_path = tmp_path / "prev_q4_fy_dates.xlsx"
+        out_path = tmp_path / "out_dates.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        # Wipe row 106 in the input LTM column so we know the fix is unconditional
+        wb = load_workbook(prev_path)
+        wb["Management Cijfers - Q4 2025"].cell(row=106, column=31).value = None
+        wb.save(prev_path)
+
+        builder = _run_builder_with_quarter_num(
+            prev_path, out_path, quarter_num=1
+        )
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        ltm_val = sheet.cell(row=106, column=builder._new_ltm_col).value
+        assert ltm_val == "Per 31-3-2026", (
+            f"Expected 'Per 31-3-2026' in LTM row 106, got {ltm_val!r}"
+        )
+
+    def test_row_2_ltm_date_is_period_end(self, tmp_path):
+        prev_path = tmp_path / "prev_q4_fy_row2.xlsx"
+        out_path = tmp_path / "out_row2.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        builder = _run_builder_with_quarter_num(
+            prev_path, out_path, quarter_num=1
+        )
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        row2 = sheet.cell(row=2, column=builder._new_ltm_col).value
+        assert row2 == datetime(2026, 3, 31), (
+            f"Expected period_end 2026-03-31 in row 2 of LTM, got {row2!r}"
+        )
+
+
+class TestQuarterColumnStylingPropagation:
+    """Rows 2-21 in the new quarter column must inherit styling (font,
+    number_format) from the previous quarter column, not Calibri 11/General."""
+
+    def test_quarter_row_22_number_format_copied(self, tmp_path):
+        from openpyxl.styles import Font
+        prev_path = tmp_path / "prev_styling.xlsx"
+        out_path = tmp_path / "out_styling.xlsx"
+        # Build a workbook with explicit Avenir / accounting format on the
+        # previous quarter header and row 2 so we can assert propagation.
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        wb = load_workbook(prev_path)
+        mc = wb["Management Cijfers - Q4 2025"]
+        target_num_fmt = '_(* #,##0_);_(* \\(#,##0\\);_(* "-"??_);_(@_)'
+        mc.cell(row=22, column=29).font = Font(name="Avenir Book", size=10, bold=True)
+        mc.cell(row=22, column=29).number_format = target_num_fmt
+        mc.cell(row=2, column=29).font = Font(name="Avenir Book", size=10)
+        mc.cell(row=2, column=29).number_format = "mm-dd-yy"
+        wb.save(prev_path)
+
+        builder = _run_builder_with_quarter_num(
+            prev_path, out_path, quarter_num=1
+        )
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        # The new quarter header should carry the same number format as the
+        # previous quarter header (was missing before — fell back to General).
+        new_q22 = sheet.cell(row=22, column=builder._new_quarter_col)
+        assert new_q22.number_format == target_num_fmt, (
+            f"Quarter header number_format not copied: {new_q22.number_format!r}"
+        )
+
+
+class TestBankRowMap:
+    """Bank rows 110 and 111 must reference BDO rows 33 and 32 respectively
+    (DEP then GEN), matching the client reference workbook."""
+
+    def test_accounting_rules_bank_map(self):
+        import yaml
+        with open("config/accounting_rules.yaml", encoding="utf-8") as fh:
+            rules = yaml.safe_load(fh)
+        bank = rules["bank_bdo_row_map"]
+        assert bank[110] == 33, f"Row 110 must map to BDO H33 (DEP), got {bank[110]}"
+        assert bank[111] == 32, f"Row 111 must map to BDO H32 (GEN), got {bank[111]}"
+
+    def test_bank_formulas_written_to_ltm(self, tmp_path):
+        prev_path = tmp_path / "prev_q4_bank.xlsx"
+        out_path = tmp_path / "out_bank.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        # Add the bank rows in the fixture BDO so the bank section has data
+        wb = load_workbook(prev_path)
+        bdo = wb["BDO - Q4-25"]
+        for raw_row in (31, 32, 33, 34, 35, 36, 37):
+            bdo.cell(row=raw_row, column=1, value=f"bank_{raw_row}")
+            bdo.cell(row=raw_row, column=8, value=raw_row * 1000)
+        wb.save(prev_path)
+
+        builder = _run_builder_with_quarter_num(
+            prev_path, out_path, quarter_num=1
+        )
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        ltm_col = builder._new_ltm_col
+
+        f110 = sheet.cell(row=110, column=ltm_col).value
+        f111 = sheet.cell(row=111, column=ltm_col).value
+        assert isinstance(f110, str) and "H33" in f110, f"Row 110 should ref H33: {f110}"
+        assert isinstance(f111, str) and "H32" in f111, f"Row 111 should ref H32: {f111}"
+
+
+class TestRow19BdoCorrection:
+    """Row 19 LTM must contain `=SUM({ltm}3:{ltm}18)-'<bdo>'!H134`."""
+
+    def test_row19_includes_h134_correction(self, tmp_path):
+        from openpyxl.utils import get_column_letter
+        prev_path = tmp_path / "prev_row19.xlsx"
+        out_path = tmp_path / "out_row19.xlsx"
+        _build_prev_q4_workbook(prev_path, with_fy=True)
+        builder = _run_builder_with_quarter_num(
+            prev_path, out_path, quarter_num=1
+        )
+        sheet = builder.workbook[builder.config.summary_sheet_name]
+        ltm_letter = get_column_letter(builder._new_ltm_col)
+        f19 = sheet.cell(row=19, column=builder._new_ltm_col).value
+        expected = f"=SUM({ltm_letter}3:{ltm_letter}18)-'BDO - Q1-26'!H134"
+        assert f19 == expected, (
+            f"Row 19 LTM should be {expected!r}, got {f19!r}"
+        )
+
