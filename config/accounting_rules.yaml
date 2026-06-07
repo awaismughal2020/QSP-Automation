@@ -128,6 +128,13 @@ styling:
   bank_text_color: "FF00B050"          # green text for bank account data rows
   error_fill_color: "FFFFCCCC"         # light red fill for warnings
   number_format: '_(* #,##0_);_(* \(#,##0\);_(* "-"??_);_(@_)'
+  # Canonical font for the LTM column's BS section (rows 2–20). The client
+  # reference workbook uses Avenir Book 10. The deterministic styling
+  # safety net in `_update_summary_sheet` falls back to these values when
+  # `insert_cols` leaves a cell with default Calibri / no font.
+  font:
+    name: "Avenir Book"
+    size: 10
 
 # ─── BDO sheet structure ───
 # NOTE: data_rows and special_rows are HINTS — all scanning is done dynamically.

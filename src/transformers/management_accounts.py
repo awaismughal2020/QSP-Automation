@@ -1607,39 +1607,39 @@ class ManagementAccountsBuilder:
                     return True
             return False
 
+        # The LTM column source is the cell at `new_ltm_col` itself —
+        # `insert_cols` shifted the prior LTM column right and its cells
+        # now sit at this index, carrying the original Avenir/themed
+        # styling that the client reference uses for rows 2–20. Copying
+        # styling from `prev_quarter_col` (the prior Q4 quarter column,
+        # whose BS rows 3–18 are typically empty Calibri placeholders)
+        # would *overwrite* that correct styling with the wrong source.
+        # We therefore source styling from the cell itself wherever
+        # possible and only enforce the explicit color rules below.
         for row_idx in range(date_row, summary_sheet.max_row + 1):
-            prev_cell = summary_sheet.cell(row=row_idx, column=prev_quarter_col)
             cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
 
-            if prev_cell.has_style:
-                base_font = copy(prev_cell.font)
-                cell.alignment = copy(prev_cell.alignment)
-                cell.number_format = (
-                    prev_cell.number_format
-                    if prev_cell.number_format != 'General'
-                    else client_number_format
-                )
+            base_font = copy(cell.font) if cell.has_style and cell.font else None
 
-                # Prefer the existing LTM cell's theme-based fill (shifted
-                # in by insert_cols). Only fall back to explicit RGB when
-                # the cell has no styled fill of its own.
-                existing_fill = cell.fill if cell.has_style else None
-                if _fill_is_theme_based(existing_fill):
-                    pass  # keep theme-based fill as-is
-                elif row_idx in header_rows:
-                    cell.fill = header_fill
-                elif row_idx in ltm_data_rows:
-                    cell.fill = blue_fill
-                else:
-                    cell.fill = copy(prev_cell.fill)
+            if cell.number_format == 'General':
+                cell.number_format = client_number_format
 
-                if row_idx == border_row:
-                    cell.border = border_row_border
-                else:
-                    cell.border = copy(prev_cell.border)
+            # Fill restoration runs unconditionally so the LTM column
+            # always carries the right header/data fill even when the
+            # post-insert cell did not retain a styled fill of its own.
+            existing_fill = cell.fill if cell.has_style else None
+            if _fill_is_theme_based(existing_fill):
+                pass  # keep theme-based fill as-is
+            elif row_idx in header_rows:
+                cell.fill = header_fill
+            elif row_idx in ltm_data_rows:
+                cell.fill = blue_fill
 
-                # White text on header rows, black on data rows
-                row_text_color = header_text_color if row_idx in header_rows else text_color
+            if row_idx == border_row:
+                cell.border = border_row_border
+
+            row_text_color = header_text_color if row_idx in header_rows else text_color
+            if base_font is not None:
                 cell.font = Font(
                     name=base_font.name,
                     size=base_font.size,
@@ -1648,14 +1648,38 @@ class ManagementAccountsBuilder:
                     underline=base_font.underline,
                     color=row_text_color,
                 )
-            elif cell.number_format == 'General':
-                cell.number_format = client_number_format
+            else:
+                cell.font = Font(color=row_text_color)
 
         # Header rows: apply header blue fill across ALL columns (B through LTM)
         for hdr_row in header_rows:
             for col_idx in range(2, new_ltm_col + 1):
                 hdr_cell = summary_sheet.cell(row=hdr_row, column=col_idx)
                 hdr_cell.fill = header_fill
+
+        # Deterministic floor for the LTM column's Balance Sheet section
+        # (rows date_row+1 .. bs_range[1]). The client reference uses
+        # Avenir Book 10 with black text; if `insert_cols` left a cell
+        # with default Calibri or no font, force the canonical font here
+        # so rows 2–20 always render identically to the client template.
+        font_cfg = style_cfg.get('font', {}) or {}
+        canonical_font_name = font_cfg.get('name', 'Avenir Book')
+        canonical_font_size = font_cfg.get('size', 10)
+        bs_total_row = bs_range[1]
+        bs_data_start = bs_range[0]
+        for row_idx in range(bs_data_start, bs_total_row + 1):
+            cell = summary_sheet.cell(row=row_idx, column=new_ltm_col)
+            base = copy(cell.font) if cell.font else Font()
+            current_name = (base.name or '').strip().lower()
+            if not current_name or current_name in ('calibri', 'general'):
+                cell.font = Font(
+                    name=canonical_font_name,
+                    size=canonical_font_size,
+                    bold=base.bold or (row_idx == bs_total_row),
+                    italic=base.italic,
+                    underline=base.underline,
+                    color=text_color,
+                )
 
         identity_cfg = self._rules.get('identity_alignment', {})
         bold_rows = set(identity_cfg.get(

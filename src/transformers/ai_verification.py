@@ -187,12 +187,23 @@ class WorkbookContextExtractor:
 
     def _extract_previous_quarter_formulas(
         self, sheet, quarter_col: int
-    ) -> Dict[str, Dict[int, str]]:
-        """Capture every formula in the previous quarter column.
+    ) -> Dict[str, Any]:
+        """Capture every formula in the previous quarter column and derive
+        the expected LTM-column equivalents.
 
-        Returns a dict with ``previous_quarter_col_letter`` and ``formulas``
-        (a map row_idx -> formula string) so the prompt builder can render a
-        compact reference block.
+        For every previous-quarter formula we also emit a derived
+        ``expected_ltm_formula`` by:
+        - swapping any ``'<old BDO sheet>'!`` reference to the current BDO
+          sheet name (so the new column references the correct BDO sheet),
+        - swapping the BDO data column letter (``G`` → ``H``) wherever it
+          appears in a sheet-qualified BDO reference,
+        - leaving everything else (BDO row numbers, in-sheet refs, operators)
+          untouched.
+
+        These derived LTM formulas give Claude a concrete, row-by-row
+        reference for what the new LTM column should look like, instead of
+        only handing it the quarter formulas with a "swap G→H mentally"
+        instruction.
         """
         layout_cfg = self._rules.get('layout', {})
         bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
@@ -201,7 +212,11 @@ class WorkbookContextExtractor:
 
         prev_col = quarter_col - 1
         if prev_col < 2:
-            return {'previous_quarter_col_letter': None, 'formulas': {}}
+            return {
+                'previous_quarter_col_letter': None,
+                'formulas': {},
+                'expected_ltm_formulas': {},
+            }
 
         rows_of_interest = (
             list(range(bs_range[0], bs_range[1] + 1))
@@ -217,10 +232,37 @@ class WorkbookContextExtractor:
             if isinstance(val, str) and val.startswith('='):
                 formulas[row_idx] = val
 
+        bdo_cfg = self._rules.get('bdo', {})
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        last_q_col = q_cols[-1] if q_cols else 7
+        bdo_quarter_letter = get_column_letter(last_q_col)
+        bdo_data_letter = get_column_letter(bdo_cfg.get('data_column', 8))
+
+        bdo_sheet_name = self.config.bdo_sheet_name
+        bdo_quoted_re = re.compile(r"'([^']*)'!")
+        bdo_col_swap_re = re.compile(
+            rf"(?P<sheet>'[^']*'!)(?P<col>{re.escape(bdo_quarter_letter)})(?P<row>\d+)"
+        )
+
+        def _derive_ltm(formula: str) -> str:
+            swapped = bdo_quoted_re.sub(f"'{bdo_sheet_name}'!", formula)
+            swapped = bdo_col_swap_re.sub(
+                lambda m: f"{m.group('sheet')}{bdo_data_letter}{m.group('row')}",
+                swapped,
+            )
+            return swapped
+
+        expected_ltm_formulas = {
+            row_idx: _derive_ltm(f) for row_idx, f in formulas.items()
+        }
+
         return {
             'previous_quarter_col_letter': prev_letter,
             'previous_quarter_header': header,
             'formulas': formulas,
+            'expected_ltm_formulas': expected_ltm_formulas,
+            'bdo_quarter_column_letter': bdo_quarter_letter,
+            'bdo_data_column_letter': bdo_data_letter,
         }
 
     def _extract_metadata(self) -> Dict[str, Any]:
@@ -647,6 +689,21 @@ class VerificationPromptBuilder:
         reasons = prior.get('failure_reasons') or []
         reasons_block = "\n".join(f"  - {r}" for r in reasons) or "  - (none captured)"
 
+        quarter = context.get('quarter_col_letter', 'AA')
+        ltm_mismatches = prior.get('ltm_row_mismatches') or []
+        if ltm_mismatches:
+            ltm_mismatch_block = "\n".join(
+                f"  - row {m.get('row')}: actual={m.get('actual')!r}, "
+                f"expected={m.get('expected')!r}"
+                for m in ltm_mismatches[:30]
+            )
+            if len(ltm_mismatches) > 30:
+                ltm_mismatch_block += (
+                    f"\n  - … and {len(ltm_mismatches) - 30} more rows"
+                )
+        else:
+            ltm_mismatch_block = "  - (no per-row LTM mismatches captured)"
+
         return (
             f"PRIOR_ROUND_FAILURE — RECONCILIATION DID NOT PASS\n"
             f"=================================================\n"
@@ -663,6 +720,10 @@ class VerificationPromptBuilder:
             f"Failure reasons reported by the deterministic re-validator:\n"
             f"{reasons_block}\n"
             f"\n"
+            f"LTM COLUMN ROW-BY-ROW MISMATCHES (column {ltm}, comparing "
+            f"actual formula vs. expected derived from previous-quarter):\n"
+            f"{ltm_mismatch_block}\n"
+            f"\n"
             f"Total patches applied across all prior rounds: "
             f"{prior.get('patches_applied_in_prior_rounds', 0)}\n"
             f"Last-round notes from your previous response:\n"
@@ -671,22 +732,32 @@ class VerificationPromptBuilder:
             f"WHAT TO DO NOW:\n"
             f"1. The total-row formulas ({ltm}{auth_row} and {ltm}{dep_row}) "
             f"are deterministically correct; do NOT patch them.\n"
-            f"2. The error is in upstream detail rows. Re-examine every "
-            f"bdo_ref / bdo_sum_range formula in rows {bs_range[0]}–"
-            f"{auth_row - 1} (Balance Sheet) and rows 23–{dep_row - 1} "
-            f"(P&L). Search the BDO LABEL-TO-ROW MAP and BDO FULL ROW "
-            f"INVENTORY for the correct row numbers — never rely on a "
-            f"previously-assumed row position.\n"
-            f"3. Pay special attention to the BDO VERSCHIL BALANS row "
+            f"2. The error is in upstream detail rows on BOTH the QUARTER "
+            f"column ({quarter}) AND the LTM column ({ltm}). Re-examine "
+            f"every bdo_ref / bdo_sum_range formula in rows "
+            f"{bs_range[0]}–{auth_row - 1} (Balance Sheet) and rows "
+            f"23–{dep_row - 1} (P&L) on BOTH columns. For each row "
+            f"listed in 'LTM COLUMN ROW-BY-ROW MISMATCHES' above, emit a "
+            f"formula patch on {ltm}<row> with the expected formula.\n"
+            f"3. PAIRED PATCH RULE: if you patch a quarter-column row "
+            f"({quarter}<row>) to fix a BDO reference (column G), ALSO "
+            f"patch the LTM-column row ({ltm}<row>) with the same BDO row "
+            f"number but column letter H. Search the BDO LABEL-TO-ROW MAP "
+            f"and BDO FULL ROW INVENTORY for the correct row numbers — "
+            f"never rely on a previously-assumed row position.\n"
+            f"4. Pay special attention to the BDO VERSCHIL BALANS row "
             f"in CONTEXT: row 19 references "
             f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> and the "
             f"row number must be the dynamically-discovered one, never a "
             f"hardcoded value such as H134.\n"
-            f"4. Emit ONLY the formula patches needed to make "
-            f"SUM({ltm}{bs_range[0]}:{ltm}{auth_row - 1}) - "
+            f"5. Emit the formula patches needed to make BOTH:\n"
+            f"   - SUM({quarter}{bs_range[0]}:{quarter}{auth_row - 1}) "
+            f"reconcile with the quarter ground truth, AND\n"
+            f"   - SUM({ltm}{bs_range[0]}:{ltm}{auth_row - 1}) - "
             f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> equal "
-            f"the BDO ground truth above. Do not repeat the prior round's "
-            f"patches verbatim — they did not solve the problem."
+            f"the BDO LTM ground truth above.\n"
+            f"Do not repeat the prior round's patches verbatim — they did "
+            f"not solve the problem."
         )
 
     def _role_section(self) -> str:
@@ -766,7 +837,12 @@ only report actual errors found in the workbook."""
         prev_col_letter = prev_q.get('previous_quarter_col_letter')
         prev_header = prev_q.get('previous_quarter_header')
         prev_formulas = prev_q.get('formulas') or {}
+        expected_ltm_formulas = prev_q.get('expected_ltm_formulas') or {}
+        bdo_qtr_letter = prev_q.get('bdo_quarter_column_letter', 'G')
+        bdo_ltm_letter = prev_q.get('bdo_data_column_letter', 'H')
         if prev_col_letter and prev_formulas:
+            ltm_letter_for_msg = context.get('ltm_col_letter', 'AB')
+            quarter_letter_for_msg = context.get('quarter_col_letter', 'AA')
             parts.append("")
             parts.append(
                 f"PREVIOUS QUARTER FORMULAS — known-correct reference "
@@ -775,30 +851,94 @@ only report actual errors found in the workbook."""
             parts.append(
                 "These formulas were validated by the client for the prior "
                 "quarter. For every row that has a previous-quarter formula, "
-                "the new quarter's formula should match it structurally — "
-                "same BDO row numbers, same operators, same set of accounts. "
-                "Only the BDO sheet name and BDO column letter (G vs H) "
-                "should differ. Anything else is a row-mapping bug."
+                f"the new quarter's formula in column {quarter_letter_for_msg} "
+                "should match it structurally — same BDO row numbers, same "
+                "operators, same set of accounts. Only the BDO sheet name "
+                f"and BDO column letter ({bdo_qtr_letter} vs "
+                f"{bdo_ltm_letter}) should differ. Anything else is a "
+                "row-mapping bug."
             )
             parts.append(json.dumps(
                 {str(k): v for k, v in sorted(prev_formulas.items())},
                 indent=2,
             ))
 
+            if expected_ltm_formulas:
+                parts.append("")
+                parts.append(
+                    f"EXPECTED LTM-COLUMN FORMULAS — derived row-by-row from "
+                    f"the PREVIOUS QUARTER FORMULAS above by:\n"
+                    f"  1) swapping the prior BDO sheet name to "
+                    f"'{meta.get('bdo_sheet_name', 'BDO')}', and\n"
+                    f"  2) swapping the BDO column letter "
+                    f"{bdo_qtr_letter}->{bdo_ltm_letter} (quarter mutation -> "
+                    f"LTM closing balance).\n"
+                    f"Every formula in column {ltm_letter_for_msg} of the "
+                    f"NEW workbook MUST match the corresponding entry below "
+                    f"exactly, except for in-sheet references which use "
+                    f"{ltm_letter_for_msg} instead of "
+                    f"{quarter_letter_for_msg}. If a row in column "
+                    f"{ltm_letter_for_msg} references a different BDO row "
+                    f"than the entry below (or references column "
+                    f"{bdo_qtr_letter} instead of {bdo_ltm_letter}), it is "
+                    f"a row-mapping bug — emit a formula patch on column "
+                    f"{ltm_letter_for_msg} for that row."
+                )
+                parts.append(json.dumps(
+                    {
+                        str(k): v
+                        for k, v in sorted(expected_ltm_formulas.items())
+                    },
+                    indent=2,
+                ))
+
         shadow_pl = context.get('shadow_pl')
         shadow_bs = context.get('shadow_bs')
         if shadow_pl:
             parts.append("")
             parts.append("SHADOW P&L (expected values computed from raw BDO data):")
-            parts.append("Each row shows label, expected numeric value, formula type,")
-            parts.append("account codes used, and any missing codes (missing = BDO account")
-            parts.append("not found, which would cause an incorrect zero in the formula).")
+            parts.append(
+                "Each row shows label, formula type, account codes used, and "
+                "any missing codes (missing = BDO account not found, which "
+                "would cause an incorrect zero in the formula). It also "
+                "carries:"
+            )
+            parts.append(
+                "  - quarter_value: expected value for the new QUARTER "
+                "column (BDO column G mutation)"
+            )
+            parts.append(
+                "  - ltm_value: expected value for the LTM column "
+                "(BDO column H closing balance / LTM total)"
+            )
+            parts.append(
+                "Use BOTH targets to verify the workbook: the QUARTER "
+                "column total at row 68 must reconcile with the row 68 "
+                "quarter_value here, AND the LTM column total at row 68 "
+                "must reconcile with the row 68 ltm_value. Apply the same "
+                "row-by-row check to every upstream P&L row in both "
+                "columns. If the LTM cell evaluates to something other "
+                "than ltm_value (e.g. references the wrong BDO row), emit "
+                "a formula patch on the LTM column for that row."
+            )
             parts.append(json.dumps(
                 {str(k): v for k, v in shadow_pl.items()}, indent=2
             ))
         if shadow_bs:
             parts.append("")
-            parts.append("SHADOW BALANCE SHEET (expected values computed from raw BDO data):")
+            parts.append(
+                "SHADOW BALANCE SHEET (expected LTM values computed from "
+                "raw BDO data — column H closing balances):"
+            )
+            parts.append(
+                "Every Balance Sheet row in the LTM column MUST evaluate "
+                "to the value below. SUM(ltm_col rows 3..18) MUST equal "
+                "the BDO Resultaat na belasting (sign-adjusted) ground "
+                "truth. If a BS row in the LTM column evaluates to a "
+                "different value, the bdo_ref / bdo_sum_range formula "
+                "for that row references the wrong BDO row — emit a "
+                "formula patch on the LTM column for that row."
+            )
             parts.append(json.dumps(
                 {str(k): v for k, v in shadow_bs.items()}, indent=2
             ))
@@ -1335,7 +1475,7 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
     If any of these cells look different from what you expect, PASS — they are
     managed by deterministic code that runs after your patches.
 
-15. PREVIOUS-QUARTER STRUCTURAL CROSS-CHECK (NEW):
+15. PREVIOUS-QUARTER STRUCTURAL CROSS-CHECK:
     The PREVIOUS QUARTER FORMULAS section above lists every formula from the
     prior quarter's column. That column has been client-validated. For EVERY
     row that appears in that reference:
@@ -1351,12 +1491,40 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
        that wasn't there before), emit a `formula` patch that mirrors the
        previous-quarter row set exactly. Do this BEFORE falling back to the
        template-based reconstruction in checks 1-2.
-    f) Apply the same check to the LTM column ({ltm}): every row that has a
-       previous-quarter formula should have an LTM formula referencing the
-       SAME BDO rows but via column H.
 
-    This is the single most reliable correctness check — the template can
-    drift over time, but a client-signed-off prior quarter cannot.
+    This is the single most reliable correctness check for the QUARTER
+    column — the template can drift over time, but a client-signed-off
+    prior quarter cannot.
+
+16. LTM COLUMN STRUCTURAL CROSS-CHECK (LTM GROUND TRUTH):
+    The LTM column ({ltm}) has its OWN ground truth — it is not just a
+    follow-up of the quarter column. Every patch you emit for an upstream
+    BDO reference in the QUARTER column ({q}) MUST be paired with an
+    equivalent LTM-column patch ({ltm}) so the LTM total reconciles with
+    the BDO Resultaat na belasting in column {bdo_col_letter} (LTM target
+    = {gt_ltm}).
+
+    Use the EXPECTED LTM-COLUMN FORMULAS block above as the source of
+    truth: it lists, row-by-row, the formula every {ltm}<row> cell MUST
+    contain (derived by swapping the BDO sheet name to '{bdo_name}' and
+    the BDO column letter G->H). For each row in that block:
+    a) Read the actual cell at {ltm}<row> from ACTUAL CELL CONTENTS.
+    b) Compare it to the expected LTM formula.
+    c) If they differ in BDO row number, BDO column letter, or operator
+       structure, emit a `formula` patch on {ltm}<row> with the expected
+       LTM formula above.
+
+    PAIRED PATCH RULE (NON-NEGOTIABLE):
+    Whenever you emit a formula patch on the QUARTER column ({q}<row>)
+    that changes a BDO row reference (e.g. fixing 'BDO'!G27 -> 'BDO'!G28),
+    you MUST also emit the equivalent LTM patch on {ltm}<row> with the
+    SAME BDO row number but column letter G->H (e.g. 'BDO'!H28). The two
+    columns share the same upstream account-code-to-row map, so a wrong
+    row in {q} is ALWAYS also wrong in {ltm}. Never patch only one
+    column; the LTM ground truth requires both.
+
+    EXCEPTIONS — do NOT emit LTM-column patches for these rows
+    (managed deterministically): {interest_ma_row}, 61, 64.
 {cv_section}"""
 
     def _response_format_section(self) -> str:
@@ -2147,6 +2315,9 @@ class AIVerificationOrchestrator:
                     'auth_row_value': revalidation_report.get('auth_row_value'),
                     'dep_row_value': revalidation_report.get('dep_row_value'),
                     'bdo_ground_truth': revalidation_report.get('bdo_ground_truth'),
+                    'ltm_row_mismatches': revalidation_report.get(
+                        'ltm_row_mismatches', []
+                    ),
                     'patches_applied_in_prior_rounds': cumulative_patches_applied,
                     'last_claude_notes': last_notes,
                 }
@@ -2413,12 +2584,149 @@ class AIVerificationOrchestrator:
                     return row_idx
         return None
 
+    def _diff_quarter_vs_ltm_rows(
+        self, sheet, ltm_col: int, rules: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Compare BDO row references between the quarter column and LTM
+        column, row-by-row, in the BS / P&L / Bank ranges.
+
+        For each MA row in those ranges:
+        - Extract every BDO row number referenced via column G in the
+          quarter formula and every BDO row number referenced via column
+          H in the LTM formula.
+        - If the two sets differ, record a mismatch with the actual cell
+          values and an "expected" LTM string derived from the quarter
+          formula by swapping G->H.
+
+        Skipped rows:
+        - Identity totals (auth_row, dep_row).
+        - Interest-managed rows (60, 61, 64) — set deterministically.
+        - cash_proceeds_sale row (50) — manual_with_ltm, intentionally
+          asymmetric (manual quarter value, SUM-of-last-4-quarters LTM).
+        - Bank total row (e.g. 114) — LTM is a SUM, not a BDO ref.
+        - Rows where neither column has a formula.
+        """
+        if not ltm_col or ltm_col <= 1:
+            return []
+
+        layout_cfg = rules.get('layout', {})
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_range = layout_cfg.get('bank_rows', [107, 114])
+        bank_total_row = rules.get('bank_total_row', bank_range[1])
+        cash_row = layout_cfg.get('cash_proceeds_row', 50)
+        identity = rules.get('identity_alignment', {})
+        auth_row = identity.get('authoritative_row', 19)
+        dep_row = identity.get('dependent_row', 68)
+
+        interest_cfg = rules.get('interest_section', {})
+        interest_ma_row = interest_cfg.get('management_row', 60)
+        interest_skip_rows = {interest_ma_row, 61, 64}
+
+        bdo_cfg = rules.get('bdo', {})
+        q_cols_cfg = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        last_q_col = q_cols_cfg[-1] if q_cols_cfg else 7
+        bdo_qtr_letter = get_column_letter(last_q_col)
+        bdo_data_letter = get_column_letter(bdo_cfg.get('data_column', 8))
+
+        rows_of_interest = (
+            list(range(bs_range[0], bs_range[1] + 1))
+            + list(range(pl_range[0], pl_range[1] + 1))
+            + list(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        skip = {auth_row, dep_row, cash_row, bank_total_row} | interest_skip_rows
+
+        # Resolve the active quarter column from the row-22 header so the
+        # diff still works when the LTM column is not exactly to the right
+        # of the quarter column (e.g. layouts that include an FY slot or
+        # other intermediate columns between them).
+        header_row = layout_cfg.get('header_row', 22)
+        quarter_label = (self.config.quarter or '').strip().upper()
+        quarter_col = None
+        if quarter_label:
+            for c in range(2, ltm_col):
+                raw = sheet.cell(row=header_row, column=c).value
+                if raw and str(raw).strip().upper() == quarter_label:
+                    quarter_col = c
+                    break
+        if quarter_col is None:
+            quarter_col = ltm_col - 1
+        if quarter_col < 2:
+            return []
+
+        bdo_qtr_re = re.compile(
+            rf"'[^']*'!{re.escape(bdo_qtr_letter)}(\d+)"
+        )
+        bdo_ltm_re = re.compile(
+            rf"'[^']*'!{re.escape(bdo_data_letter)}(\d+)"
+        )
+
+        mismatches: List[Dict[str, Any]] = []
+        for row_idx in rows_of_interest:
+            if row_idx in skip:
+                continue
+            q_val = sheet.cell(row=row_idx, column=quarter_col).value
+            l_val = sheet.cell(row=row_idx, column=ltm_col).value
+            q_is_formula = isinstance(q_val, str) and q_val.startswith('=')
+            l_is_formula = isinstance(l_val, str) and l_val.startswith('=')
+
+            q_rows = (
+                {int(m) for m in bdo_qtr_re.findall(q_val)}
+                if q_is_formula else set()
+            )
+            l_rows = (
+                {int(m) for m in bdo_ltm_re.findall(l_val)}
+                if l_is_formula else set()
+            )
+
+            if not q_rows and not l_rows:
+                continue
+
+            if q_rows != l_rows:
+                expected_ltm = None
+                if q_is_formula:
+                    bdo_quoted_re = re.compile(r"'([^']*)'!")
+                    bdo_col_swap_re = re.compile(
+                        rf"(?P<sheet>'[^']*'!)"
+                        rf"(?P<col>{re.escape(bdo_qtr_letter)})"
+                        rf"(?P<row>\d+)"
+                    )
+                    bdo_name = self.config.bdo_sheet_name
+                    expected_ltm = bdo_quoted_re.sub(
+                        f"'{bdo_name}'!", q_val
+                    )
+                    expected_ltm = bdo_col_swap_re.sub(
+                        lambda m: (
+                            f"{m.group('sheet')}{bdo_data_letter}"
+                            f"{m.group('row')}"
+                        ),
+                        expected_ltm,
+                    )
+                mismatches.append({
+                    'row': row_idx,
+                    'actual': l_val,
+                    'expected': expected_ltm,
+                    'quarter_bdo_rows': sorted(q_rows),
+                    'ltm_bdo_rows': sorted(l_rows),
+                })
+
+        return mismatches
+
     def _compute_shadow_models(
         self, workbook_path: str, bdo_result: BDOParseResult
     ) -> Tuple[Optional[Dict], Optional[Dict]]:
         """
         Compute shadow P&L and shadow BS from raw BDO data.
-        Returns (shadow_pl, shadow_bs) dicts or (None, None) on failure.
+
+        Returns ``(shadow_pl, shadow_bs)`` where:
+        - ``shadow_pl`` is the P&L for the new quarter (column G mutation
+          values) and additionally carries an ``ltm_value`` per row holding
+          the LTM-closing equivalent (column H values), so Claude can
+          ground-truth check both columns from the same context block.
+        - ``shadow_bs`` is the LTM Balance Sheet (column H values).
+        Returns ``(None, None)`` on failure.
         """
         try:
             from .management_accounts import ManagementAccountsBuilder, ManagementAccountsConfig
@@ -2451,15 +2759,32 @@ class AIVerificationOrchestrator:
                     bdo_sheet, builder._new_bdo_row_map, builder._new_bdo_label_map
                 )
 
-            shadow_pl = builder._compute_shadow_pl(bdo_result)
+            shadow_pl_quarter = builder._compute_shadow_pl(
+                bdo_result, use_closing=False
+            )
+            shadow_pl_ltm = builder._compute_shadow_pl(
+                bdo_result, use_closing=True
+            )
+
+            # Merge the LTM expected values onto the quarter shadow so each
+            # row carries both scopes in a single block. Downstream prompt
+            # rendering can then surface "expected quarter / expected LTM"
+            # side-by-side without duplicating the entire shadow structure.
+            for row_idx, ltm_entry in shadow_pl_ltm.items():
+                target = shadow_pl_quarter.setdefault(row_idx, {})
+                target['quarter_value'] = target.get('value')
+                target['ltm_value'] = ltm_entry.get('value')
+
             shadow_bs = builder._compute_shadow_bs(bdo_result)
             builder.workbook.close()
 
             logger.info(
-                f"[AI Verify] Shadow models: P&L row 68={shadow_pl.get(68, {}).get('value', 'N/A')}, "
-                f"BS row 19={shadow_bs.get(19, {}).get('value', 'N/A')}"
+                f"[AI Verify] Shadow models: "
+                f"P&L row 68 quarter={shadow_pl_quarter.get(68, {}).get('quarter_value', 'N/A')}, "
+                f"P&L row 68 ltm={shadow_pl_quarter.get(68, {}).get('ltm_value', 'N/A')}, "
+                f"BS row 19 ltm={shadow_bs.get(19, {}).get('value', 'N/A')}"
             )
-            return shadow_pl, shadow_bs
+            return shadow_pl_quarter, shadow_bs
 
         except Exception as e:
             logger.warning(f"[AI Verify] Shadow model computation failed: {e}")
@@ -2499,6 +2824,11 @@ class AIVerificationOrchestrator:
         3. PL68 and BS19 reconcile against each other within tolerance.
         4. PL68 / BS19 reconcile against the BDO Resultaat na belasting
            ground truth (sign-adjusted) within tolerance.
+        5. Row-by-row LTM-vs-quarter parity: for every BS/P&L detail row,
+           the LTM formula (column H BDO refs) must reference the SAME
+           BDO row numbers as the quarter formula (column G BDO refs).
+           Mismatches surface as ``ltm_row_mismatches`` for the prior-
+           round-failure feedback block.
         """
         report: Dict[str, Any] = {
             'passed': False,
@@ -2506,6 +2836,7 @@ class AIVerificationOrchestrator:
             'auth_row_value': None,
             'dep_row_value': None,
             'bdo_ground_truth': None,
+            'ltm_row_mismatches': [],
         }
 
         rules_path = Path("config/accounting_rules.yaml")
@@ -2584,6 +2915,39 @@ class AIVerificationOrchestrator:
                                 logger.error(f"REVALIDATION FAIL: {msg}")
                                 report['failure_reasons'].append(msg)
                                 formula_ok = False
+
+                        # Row-by-row LTM vs quarter parity check.
+                        # The LTM column shares the same upstream BDO
+                        # account-code-to-row map as the quarter column,
+                        # so a wrong BDO row in the quarter formula is
+                        # ALWAYS also wrong in the LTM formula and vice
+                        # versa. Any divergence in BDO row references
+                        # between the two columns (after stripping the
+                        # G/H column letter) is a row-mapping bug.
+                        ltm_row_mismatches = self._diff_quarter_vs_ltm_rows(
+                            sheet, ltm_col, rules
+                        )
+                        if ltm_row_mismatches:
+                            report['ltm_row_mismatches'] = ltm_row_mismatches
+                            preview = ", ".join(
+                                f"row {m['row']}" for m in ltm_row_mismatches[:5]
+                            )
+                            extra = (
+                                f" (+{len(ltm_row_mismatches) - 5} more)"
+                                if len(ltm_row_mismatches) > 5 else ""
+                            )
+                            report['failure_reasons'].append(
+                                f"LTM column has {len(ltm_row_mismatches)} "
+                                f"row(s) whose BDO references diverge from "
+                                f"the quarter column: {preview}{extra}. The "
+                                f"LTM cell formulas must reference the same "
+                                f"BDO row numbers as the quarter column, "
+                                f"swapping G->H only."
+                            )
+                            logger.error(
+                                f"[AI Verify] LTM row mismatches: "
+                                f"{[m['row'] for m in ltm_row_mismatches]}"
+                            )
                     break
         finally:
             wb.close()
@@ -2667,13 +3031,16 @@ class AIVerificationOrchestrator:
                     abs(bs19 - bdo_ground_truth),
                 )
                 ground_passed = ground_diff <= tolerance
-            passed = internal_passed and ground_passed
+            ltm_parity_passed = not bool(report.get('ltm_row_mismatches'))
+            passed = internal_passed and ground_passed and ltm_parity_passed
             logger.info(
                 f"[AI Verify] Re-validation (computed_values): "
                 f"PL68={pl68:,.2f}, BS19={bs19:,.2f}, "
                 f"internal_diff={internal_diff:,.2f}, "
                 f"bdo_ground_truth={bdo_ground_truth}, "
-                f"ground_diff={ground_diff}, passed={passed}"
+                f"ground_diff={ground_diff}, "
+                f"ltm_parity_passed={ltm_parity_passed}, "
+                f"passed={passed}"
             )
             if not internal_passed:
                 report['failure_reasons'].append(
@@ -2748,12 +3115,15 @@ class AIVerificationOrchestrator:
                     abs(em - bdo_ground_truth),
                 )
                 ground_passed = ground_diff <= tolerance
-            passed = internal_passed and ground_passed
+            ltm_parity_passed = not bool(report.get('ltm_row_mismatches'))
+            passed = internal_passed and ground_passed and ltm_parity_passed
             logger.info(
                 f"[AI Verify] Re-validation (shadow): DR={dr:,.2f}, "
                 f"EM={em:,.2f}, internal_diff={internal_diff:,.2f}, "
                 f"bdo_ground_truth={bdo_ground_truth}, "
-                f"ground_diff={ground_diff}, passed={passed}"
+                f"ground_diff={ground_diff}, "
+                f"ltm_parity_passed={ltm_parity_passed}, "
+                f"passed={passed}"
             )
             if not internal_passed:
                 report['failure_reasons'].append(
