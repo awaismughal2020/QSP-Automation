@@ -1293,21 +1293,78 @@ class TestBankRowMap:
 
 
 class TestRow19BdoCorrection:
-    """Row 19 LTM must contain `=SUM({ltm}3:{ltm}18)-'<bdo>'!H134`."""
+    """
+    Row 19 LTM must contain
+    ``=SUM({ltm}3:{ltm}18)-'<bdo>'!H<verschil_row>`` where
+    ``<verschil_row>`` is the dynamically-discovered row whose column A
+    label is "Verschil balans en winst-en-verlies" in the new BDO sheet.
 
-    def test_row19_includes_h134_correction(self, tmp_path):
+    The BDO position of that label varies between quarterly files, so
+    the formula must NEVER hardcode H134 (which historically referenced
+    "Afschrijving prepaid" in some quarterly BDO sheets and silently
+    broke reconciliation).
+    """
+
+    def test_row19_uses_dynamically_resolved_verschil_row(self, tmp_path):
+        from openpyxl import load_workbook
         from openpyxl.utils import get_column_letter
+
         prev_path = tmp_path / "prev_row19.xlsx"
         out_path = tmp_path / "out_row19.xlsx"
         _build_prev_q4_workbook(prev_path, with_fy=True)
+
+        # Inject a "Verschil balans en winst-en-verlies" label at a
+        # non-default row (135) in the prev-quarter BDO sheet AND in the
+        # source data path used by _make_q1_2026_bdo_accounts. The Q1
+        # BDO copy step writes account rows starting near row 5, so an
+        # injected label at row 135 will be preserved and discoverable
+        # by _find_verschil_row().
+        wb = load_workbook(prev_path)
+        bdo = wb["BDO - Q4-25"]
+        verschil_row_in_prev = 135
+        bdo.cell(row=verschil_row_in_prev, column=1, value="Verschil balans en winst-en-verlies")
+        wb.save(prev_path)
+        wb.close()
+
         builder = _run_builder_with_quarter_num(
             prev_path, out_path, quarter_num=1
         )
         sheet = builder.workbook[builder.config.summary_sheet_name]
         ltm_letter = get_column_letter(builder._new_ltm_col)
+
+        # Discover the verschil row in the freshly-written BDO sheet —
+        # the Q1 BDO copy step may place its data at a different offset
+        # so we look up the label rather than assume the prev row index.
+        new_bdo = builder.workbook[builder.config.bdo_sheet_name]
+        resolved_verschil_row = None
+        for r in range(1, new_bdo.max_row + 1):
+            v = new_bdo.cell(row=r, column=1).value
+            if isinstance(v, str) and 'verschil balans' in v.lower():
+                resolved_verschil_row = r
+                break
+        assert resolved_verschil_row is not None, (
+            "Test setup error: the new BDO sheet should contain a "
+            "'Verschil balans en winst-en-verlies' label."
+        )
+
         f19 = sheet.cell(row=19, column=builder._new_ltm_col).value
-        expected = f"=SUM({ltm_letter}3:{ltm_letter}18)-'BDO - Q1-26'!H134"
+        expected = (
+            f"=SUM({ltm_letter}3:{ltm_letter}18)"
+            f"-'BDO - Q1-26'!H{resolved_verschil_row}"
+        )
         assert f19 == expected, (
             f"Row 19 LTM should be {expected!r}, got {f19!r}"
         )
+        # Defensive: must NOT be a direct reference to row 68 (a
+        # tautology) and must NOT hardcode the legacy H134 row when the
+        # Verschil label lives elsewhere.
+        assert f19 != f"={ltm_letter}68", (
+            "Row 19 must derive from SUM(3:18) - H<verschil>, never "
+            "from a direct reference to row 68."
+        )
+        if resolved_verschil_row != 134:
+            assert "H134" not in f19, (
+                f"Row 19 must use the dynamically-resolved verschil "
+                f"row {resolved_verschil_row}, not the legacy H134."
+            )
 

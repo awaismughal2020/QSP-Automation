@@ -1,0 +1,154 @@
+CLAUDE PROMPT — QSP Management Accounts Automation
+====================================================
+
+CONTEXT
+-------
+You are processing a new quarterly BDO report for QSP ESS B.V. Your job is to populate two new columns in the "Management Cijfers" tab of the Management Accounts Excel file:
+
+1. Actuals column — the new quarter's figures (referencing column G of the new BDO sheet)
+2. LTM column — Last Twelve Months figures (referencing column H of the new BDO sheet)
+
+The new BDO sheet has already been added to the workbook by the automation. Your task is to verify and correct the Excel formulas for each row in both columns if the ground truth check fails (see end of prompt).
+
+INPUTS
+------
+- BDO sheet name: {bdo_sheet_name} (e.g. "BDO - Q1-26")
+- New actuals column: {actuals_col} (e.g. "AC")
+- New LTM column: {ltm_col} (e.g. "AD")
+- Quarter: {quarter} (e.g. "Q1")
+- Year: {year} (e.g. "2026")
+- Previous 3 actuals columns: {q_minus3}, {q_minus2}, {q_minus1} (for LTM trailing-4Q sums)
+
+
+COLUMN HEADER RULES (rows 2 and 22)
+-------------------------------------
+
+Actuals column:
+- Row 2: period-end date of the quarter
+    Q1 = 31-03-{year}, Q2 = 30-06-{year}, Q3 = 30-09-{year}, Q4 = 31-12-{year}
+- Row 22: quarter label, e.g. "Q1 2026"
+
+LTM column:
+- Row 2: same period-end date as the actuals column
+- Row 22:
+    If Q4 → "FY {year}" (e.g. "FY 2025")
+    All other quarters → "LTM Q{n} {year}" (e.g. "LTM Q1 2026")
+
+FY COLUMN RULE
+--------------
+Only insert a FY (full year) column when a Q4 sheet is added. For Q1, Q2, Q3 skip the FY column entirely. The layout must always be:
+...{q_minus1} | {actuals_col} = new quarter | {ltm_col} = LTM | next col = Commentary
+
+
+SECTION 1: EQUITY MOVEMENT (rows 3–19) — LTM column only
+----------------------------------------------------------
+Rows 3–18 are only populated in the LTM column, not in the actuals column. The actuals column rows 3–18 remain empty.
+
+Use column H of the BDO sheet for all rows in this section.
+
+Row 3  | Deferred Tax Asset          | Account code 1790002 (Latente belastingvordering)
+Row 4  | Real estate                 | SUM of all rows with account code starting with "160" (Materiële vaste activa)
+Row 5  | Financial fixed assets      | SUM of rows with code starting "176" or "179", excluding the DTA row (row 3)
+Row 6  | Accounts receivable         | 2000000 + 2040100 + 2000300 + 2040601 (second occurrence, in Vorderingen section)
+Row 7  | Service costs to be settled | SUM of all 2502xxx rows (Servicekosten per jaar) + 2741000 + 2741001 + 2742000
+Row 8  | Prepaid expenses            | SUM of 2040200–2040900 + 2300001 + 2040501
+Row 9  | Cash                        | SUM of all 2400xxx rows (LM ABN AMRO Bank accounts)
+Row 10 | Equity                      | SUM of 1000002 + 1100000 + 1160000
+Row 11 | AC Shareholder              | 2000100 (Debiteuren intercompany)
+Row 12 | Bank loan                   | 1930001 + 1930101
+Row 13 | Amortised fee               | 1930200
+Row 14 | Accounts payable            | 2730000 + 2741004 + 2741200 + 2741000 + 2300000
+Row 15 | Current account             | SUM of 2620000–2650002 + 2760000
+Row 16 | VAT payable                 | 2512100
+Row 17 | Deposits                    | 2740300
+Row 18 | Rent invoiced in advance    | 2740100
+
+Row 19 | Total (Equity Movement):
+= SUM({ltm_col}3:{ltm_col}18) - {bdo_sheet_name}!H_verschil
+
+Where H_verschil = column H of the row where column A = "Verschil balans en winst-en-verlies".
+
+
+SECTION 2: P&L — REVENUE & COSTS (rows 23–55)
+-----------------------------------------------
+Actuals column: reference column G of the BDO sheet.
+LTM column: reference column H of the BDO sheet.
+
+Exception — LTM trailing-4Q sum rows:
+Some rows use a trailing 4-quarter sum instead of a direct BDO H reference:
+= SUM({q_minus3_col}{row}:{actuals_col}{row})
+Always exactly 4 columns, always ending on the actuals column.
+
+
+SECTION 3: DIRECT RESULT (rows 57–68)
+---------------------------------------
+Both actuals AND LTM columns must be independently populated for every row in this section.
+
+Row 57 | EBIT               | Actuals: ={actuals_col}56+{actuals_col}55 | LTM: ={ltm_col}56+{ltm_col}55
+Row 60 | Net interest (SFA) | Actuals: =-G[4601000]-SUM(G[4611000:4623001])+G[4642000] | LTM: same with H
+Row 61 | Prepaid derivatives| Actuals: =G[1790000] | LTM: trailing 4Q sum
+Row 63 | Net interest (Tax) | Actuals: =-G[4312600] | LTM: ={actuals_col}63
+Row 64 | Net interest (Hedge)| Actuals: =-G[4643000]-G[1790000]-G[4642000] | LTM: trailing 4Q sum
+Row 65 | Net interest (DMRRP)| Actuals: =-G[4663000] | LTM: same with H
+Row 66 | EBT                | Actuals: =SUM({actuals_col}57:{actuals_col}65) | LTM: =SUM({ltm_col}57:{ltm_col}65)
+Row 67 | Delta DTA & CIT    | Actuals: =-G[9500000]-G[9510000] | LTM: same with H
+Row 68 | Direct result      | Actuals: ={actuals_col}67+{actuals_col}66 | LTM: ={ltm_col}67+{ltm_col}66
+
+[X] = find the row in the BDO sheet where column A = account code X.
+
+
+SECTION 4: BALANCE SHEET (rows 106–114) — LTM column only
+-----------------------------------------------------------
+Row 106: label = "Per {period_end_date}" (same date as row 2)
+Rows 107–113: reference column H of the BDO sheet, same label-based mapping as Section 1.
+Row 114: =SUM({ltm_col}107:{ltm_col}113)
+
+
+FORMATTING RULES
+----------------
+When writing the new actuals and LTM columns, copy all formatting from the immediately preceding actuals column:
+- Cell fill colours (blue cells must stay blue)
+- Border styles (black bottom borders on separator rows)
+- Font colours and styles
+- Number formats
+
+
+GROUND TRUTH VERIFICATION & SELF-CORRECTION LOOP
+--------------------------------------------------
+The automation writes the initial formulas using hardcoded row numbers. You are triggered when the ground truth check fails. When that happens:
+
+Step 1 — Identify the ground truth
+Find the row in the BDO sheet where column A = "Resultaat na belasting".
+Ground truth = SUM(D:G) of that row = net profit for the period.
+
+Step 2 — Run the checks
+Check A: {ltm_col}19 (Total Equity Movement) must equal the ground truth.
+Check B: {ltm_col}68 (Direct Result) must equal the ground truth.
+
+Important: row 19 and row 68 must NEVER be a direct reference to each other.
+- Row 19 must derive from SUM(rows 3–18)
+- Row 68 must derive from SUM(rows 57–67)
+They arrive at the same number independently. If one references the other, the check is meaningless.
+
+Step 3 — If checks fail
+1. Identify which row(s) in the equity movement section (3–18) or direct result section (57–67) are wrong
+2. Re-examine the BDO sheet — find the correct rows by searching column A for the account code or column B for the label
+3. Correct the formula(s)
+4. Re-run both checks
+5. Repeat until both checks pass
+
+Do not finalise output until both checks pass.
+
+
+SUMMARY OF RULES
+----------------
+- Initial formulas are written hardcoded by the automation; Claude only corrects when ground truth fails
+- When correcting: always find BDO rows by label/account code in column A or B, never assume a row number
+- Rows 3–18 (equity movement): LTM column only, actuals column stays empty
+- Row 19 = SUM(rows 3–18) minus "Verschil balans en winst-en-verlies" H value
+- Row 68 = EBT (row 66) + Delta DTA (row 67), never a reference to row 19
+- Both row 19 and row 68 must independently equal SUM(D:G) of "Resultaat na belasting" in BDO
+- FY column only on Q4, never on Q1/Q2/Q3
+- LTM trailing-4Q sums: always exactly 4 columns, ending on the actuals column
+- Formatting always carried forward from the previous actuals column
+- Dates always derived from quarter number, never hardcoded

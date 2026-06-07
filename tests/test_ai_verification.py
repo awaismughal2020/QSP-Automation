@@ -664,7 +664,16 @@ class TestAIVerificationOrchestrator:
         assert Path(result.original_file).exists()
 
     def test_end_to_end_with_patches(self, sample_workbook, verification_config, sample_bdo_result):
-        """Simulate Claude finding issues and returning patches."""
+        """
+        Simulate Claude finding issues and returning patches.
+
+        With the retry loop introduced for BDO reconciliation, the
+        orchestrator may call Claude up to ``MAX_VERIFY_ROUNDS`` times
+        when reconciliation does not pass. The synthetic mock here always
+        returns the same patch, so each round re-applies it; we therefore
+        assert that *at least* one patch was applied and that the final
+        cell value reflects Claude's patch.
+        """
         mock_response = {
             'status': 'ISSUES_FOUND',
             'checks_performed': 50,
@@ -706,7 +715,8 @@ class TestAIVerificationOrchestrator:
             )
 
         assert result.status == 'ISSUES_FOUND'
-        assert result.patches_applied == 1
+        assert result.patches_applied >= 1
+        assert result.patches_applied <= AIVerificationOrchestrator.MAX_VERIFY_ROUNDS
         assert len(result.issues) == 1
         assert Path(result.verified_file).exists()
 

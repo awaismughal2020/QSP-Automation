@@ -1972,6 +1972,16 @@ class ManagementAccountsBuilder:
 
         ltm_letter = get_column_letter(ltm_col)
         bdo_name = self.config.bdo_sheet_name
+
+        # Resolve the BDO "Verschil balans en winst-en-verlies" row dynamically.
+        # The override formula for row 19 includes a {verschil_row} placeholder
+        # because the position of that label varies between BDO files.
+        bdo_sheet = (
+            self.workbook[bdo_name]
+            if bdo_name in self.workbook.sheetnames else None
+        )
+        verschil_row = self._find_verschil_row(bdo_sheet)
+
         applied = 0
         for row_key, pattern in merged.items():
             try:
@@ -1981,20 +1991,25 @@ class ManagementAccountsBuilder:
             if not isinstance(pattern, str) or not pattern.startswith('='):
                 continue
             # Substitutions:
-            #   {col} / {COL} → LTM column letter
-            #   {bdo}         → current BDO sheet name (no quotes; caller
-            #                   includes single quotes in the template).
+            #   {col} / {COL}     → LTM column letter
+            #   {bdo}             → current BDO sheet name (no quotes; caller
+            #                       includes single quotes in the template).
+            #   {verschil_row}    → dynamically-discovered row of the
+            #                       "Verschil balans en winst-en-verlies"
+            #                       label (never hardcoded).
             formula = (
                 pattern.replace('{col}', ltm_letter)
                        .replace('{COL}', ltm_letter)
                        .replace('{bdo}', bdo_name)
+                       .replace('{verschil_row}', str(verschil_row))
             )
             sheet.cell(row=row_idx, column=ltm_col).value = formula
             applied += 1
         if applied:
             logger.info(
                 f"[LTM rebuild] Applied {applied} calc formulas from "
-                f"accounting_rules.yaml in column {ltm_letter}"
+                f"accounting_rules.yaml in column {ltm_letter} "
+                f"(verschil_row={verschil_row})"
             )
 
     def _rewrite_ltm_column_references(
@@ -3773,16 +3788,27 @@ class ManagementAccountsBuilder:
         ltm_overrides = self._rules.get('layout', {}).get('ltm_calc_overrides', {})
         all_calcs = {**calc_formulas, **ltm_overrides}
 
+        # Resolve the BDO "Verschil balans en winst-en-verlies" row dynamically
+        # for templates that reference {verschil_row} (currently the row 19
+        # override). The position varies between BDO files.
+        bdo_sheet_for_verschil = (
+            self.workbook[bdo_name]
+            if bdo_name in self.workbook.sheetnames else None
+        )
+        verschil_row = self._find_verschil_row(bdo_sheet_for_verschil)
+
         for row_key in [dep_row, auth_row]:
             tmpl = all_calcs.get(row_key) or all_calcs.get(str(row_key))
             if tmpl:
                 # Same substitutions as _apply_ltm_calc_formulas_from_rules
-                # so templates using {bdo} (e.g. row 19's -H134 correction)
-                # are written with the correct sheet name.
+                # so templates using {bdo} and {verschil_row} (e.g. row 19's
+                # -H{verschil_row} reconciliation correction) are written
+                # with dynamically-resolved values.
                 formula = (
                     tmpl.replace('{col}', ltm_letter)
                         .replace('{COL}', ltm_letter)
                         .replace('{bdo}', bdo_name)
+                        .replace('{verschil_row}', str(verschil_row))
                 )
                 ws.cell(row=row_key, column=ltm_col).value = formula
                 logger.info(f"[BDO Align] Row {row_key}: {formula}")
@@ -3824,6 +3850,35 @@ class ManagementAccountsBuilder:
                 )
             else:
                 logger.info("[BDO Align] Quarter PL68 matches ground truth")
+
+    def _find_verschil_row(self, bdo_sheet) -> int:
+        """
+        Locate the row whose column A label is "Verschil balans en
+        winst-en-verlies" in a BDO sheet. The position differs between
+        quarterly BDO files, so the row number must always be discovered
+        dynamically — never hardcoded.
+
+        Returns the discovered 1-based row number, or 127 as a last-resort
+        default that mirrors the historical layout for older BDO files.
+        """
+        if bdo_sheet is None:
+            return 127
+
+        bdo_cfg = self._rules.get('bdo', {})
+        label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
+        scan_limit = min(bdo_sheet.max_row + 1, 200)
+
+        for row_idx in range(1, scan_limit):
+            for col in label_cols:
+                cell_val = bdo_sheet.cell(row=row_idx, column=col).value
+                if isinstance(cell_val, str) and 'verschil balans' in cell_val.lower():
+                    return row_idx
+
+        logger.warning(
+            "[BDO Align] 'Verschil balans en winst-en-verlies' row not "
+            "found in BDO sheet; defaulting to row 127"
+        )
+        return 127
 
     def _read_bdo_resultaat_na_belasting_cached(self) -> Optional[float]:
         """

@@ -112,6 +112,22 @@ class WorkbookContextExtractor:
                 context['bdo_resultaat_na_belasting'] = self._read_bdo_resultaat(bdo_sheet)
                 context['bdo_full_inventory'] = self._build_bdo_full_inventory(bdo_sheet)
 
+                # Resolve the "Verschil balans en winst-en-verlies" row dynamically.
+                # The row 19 LTM override formula in accounting_rules.yaml uses a
+                # {verschil_row} placeholder because the position of this label
+                # varies between quarterly BDO files. Earlier versions baked
+                # H134 in, which silently referenced "Afschrijving prepaid" in
+                # some files and broke reconciliation against Resultaat na
+                # belasting.
+                verschil_row = self._find_verschil_row(bdo_sheet)
+                context['bdo_verschil_row'] = verschil_row
+                if verschil_row is not None:
+                    bdo_cfg = self._rules.get('bdo', {})
+                    data_col = bdo_cfg.get('data_column', 8)
+                    context['bdo_verschil_h_value'] = bdo_sheet.cell(
+                        row=verschil_row, column=data_col
+                    ).value
+
             context['accounting_rules'] = self._load_accounting_rules()
 
             summary_sheet = self._get_summary_sheet(wb)
@@ -385,6 +401,29 @@ class WorkbookContextExtractor:
             result[row_idx] = row_data
         return result
 
+    def _find_verschil_row(self, sheet) -> Optional[int]:
+        """
+        Locate the row whose column A label is "Verschil balans en
+        winst-en-verlies" in a BDO sheet.
+
+        The position of this row varies between quarterly BDO files, so the
+        row number must always be discovered dynamically — never hardcoded.
+        Returns the discovered 1-based row number, or None when the label
+        cannot be found.
+        """
+        if sheet is None:
+            return None
+
+        bdo_cfg = self._rules.get('bdo', {})
+        label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
+
+        for row_idx in range(1, min(sheet.max_row + 1, 200)):
+            for col in label_cols:
+                cell_val = sheet.cell(row=row_idx, column=col).value
+                if isinstance(cell_val, str) and 'verschil balans' in cell_val.lower():
+                    return row_idx
+        return None
+
     def _read_bdo_resultaat(self, sheet) -> Optional[Dict[str, Any]]:
         """Read Resultaat na belasting from BDO sheet dynamically."""
         bdo_cfg = self._rules.get('bdo', {})
@@ -576,9 +615,79 @@ class VerificationPromptBuilder:
             self._formula_construction_guide(context),
             self._executive_alignment_section(context),
             self._checks_section(context),
-            self._response_format_section(),
         ]
+        prior_failure_section = self._prior_round_failure_section(context)
+        if prior_failure_section:
+            prompt_parts.append(prior_failure_section)
+        prompt_parts.append(self._response_format_section())
         return '\n\n'.join(prompt_parts)
+
+    def _prior_round_failure_section(
+        self, context: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Render a structured feedback block for retry rounds. Claude must
+        treat this as the most recent ground-truth signal: the previous
+        round's patches were applied but reconciliation still failed, so
+        the issue is in upstream BDO row mappings rather than the total
+        rows themselves.
+        """
+        prior = context.get('prior_round_failure')
+        if not prior:
+            return None
+
+        meta = context.get('metadata', {})
+        ltm = context.get('ltm_col_letter', 'AB')
+        rules = context.get('accounting_rules', {})
+        identity = rules.get('identity_alignment', {})
+        auth_row = identity.get('authoritative_row', 19)
+        dep_row = identity.get('dependent_row', 68)
+        bs_range = rules.get('layout', {}).get('balance_sheet_rows', [3, 19])
+
+        reasons = prior.get('failure_reasons') or []
+        reasons_block = "\n".join(f"  - {r}" for r in reasons) or "  - (none captured)"
+
+        return (
+            f"PRIOR_ROUND_FAILURE — RECONCILIATION DID NOT PASS\n"
+            f"=================================================\n"
+            f"Round {prior.get('round')} of verification has just been "
+            f"applied to the workbook, but the patched output still fails "
+            f"the BDO reconciliation check. The current cell values:\n"
+            f"  - {ltm}{auth_row} (Total Equity Movement) = "
+            f"{prior.get('auth_row_value')}\n"
+            f"  - {ltm}{dep_row} (Direct Result) = "
+            f"{prior.get('dep_row_value')}\n"
+            f"  - BDO ground truth (sign-adjusted Resultaat na belasting) = "
+            f"{prior.get('bdo_ground_truth')}\n"
+            f"\n"
+            f"Failure reasons reported by the deterministic re-validator:\n"
+            f"{reasons_block}\n"
+            f"\n"
+            f"Total patches applied across all prior rounds: "
+            f"{prior.get('patches_applied_in_prior_rounds', 0)}\n"
+            f"Last-round notes from your previous response:\n"
+            f"  {prior.get('last_claude_notes') or '(none)'}\n"
+            f"\n"
+            f"WHAT TO DO NOW:\n"
+            f"1. The total-row formulas ({ltm}{auth_row} and {ltm}{dep_row}) "
+            f"are deterministically correct; do NOT patch them.\n"
+            f"2. The error is in upstream detail rows. Re-examine every "
+            f"bdo_ref / bdo_sum_range formula in rows {bs_range[0]}–"
+            f"{auth_row - 1} (Balance Sheet) and rows 23–{dep_row - 1} "
+            f"(P&L). Search the BDO LABEL-TO-ROW MAP and BDO FULL ROW "
+            f"INVENTORY for the correct row numbers — never rely on a "
+            f"previously-assumed row position.\n"
+            f"3. Pay special attention to the BDO VERSCHIL BALANS row "
+            f"in CONTEXT: row 19 references "
+            f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> and the "
+            f"row number must be the dynamically-discovered one, never a "
+            f"hardcoded value such as H134.\n"
+            f"4. Emit ONLY the formula patches needed to make "
+            f"SUM({ltm}{bs_range[0]}:{ltm}{auth_row - 1}) - "
+            f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> equal "
+            f"the BDO ground truth above. Do not repeat the prior round's "
+            f"patches verbatim — they did not solve the problem."
+        )
 
     def _role_section(self) -> str:
         return """ROLE:
@@ -625,6 +734,19 @@ only report actual errors found in the workbook."""
             "",
             "BDO RESULTAAT NA BELASTING (ground truth):",
             json.dumps(context.get('bdo_resultaat_na_belasting', {}), indent=2),
+            "",
+            "BDO VERSCHIL BALANS EN WINST-EN-VERLIES (reconciliation row):",
+            json.dumps({
+                'row': context.get('bdo_verschil_row'),
+                'h_value': context.get('bdo_verschil_h_value'),
+                'note': (
+                    "Used by the row 19 LTM override "
+                    "(=SUM({ltm}3:{ltm}18) - '{bdo}'!H<row>). The position of "
+                    "this label varies between BDO files, so this row number "
+                    "is discovered dynamically and must be used in any patch "
+                    "to row 19. Never hardcode H134 or any other fixed row."
+                ),
+            }, indent=2),
             "",
             "ACCOUNTING RULES (from config/accounting_rules.yaml):",
             json.dumps(context.get('accounting_rules', {}), indent=2),
@@ -872,8 +994,21 @@ for Balance Sheet rows where BDO values already have the correct sign)."""
         all_calcs = {**calc_formulas, **ltm_overrides}
         auth_tmpl = all_calcs.get(auth_row) or all_calcs.get(str(auth_row), f"={{col}}{dep_row}")
         dep_tmpl = all_calcs.get(dep_row) or all_calcs.get(str(dep_row), f"={{col}}{dep_row-2}+{{col}}{dep_row-1}")
-        auth_expected = auth_tmpl.replace('{col}', ltm).replace('{bdo}', bdo_name)
-        dep_expected = dep_tmpl.replace('{col}', ltm).replace('{bdo}', bdo_name)
+        # The row 19 LTM override formula contains a {verschil_row} placeholder
+        # because the "Verschil balans en winst-en-verlies" row position varies
+        # between BDO files. Resolve it from context.
+        verschil_row = context.get('bdo_verschil_row')
+        verschil_token = str(verschil_row) if verschil_row is not None else ''
+        auth_expected = (
+            auth_tmpl.replace('{col}', ltm)
+                     .replace('{bdo}', bdo_name)
+                     .replace('{verschil_row}', verschil_token)
+        )
+        dep_expected = (
+            dep_tmpl.replace('{col}', ltm)
+                    .replace('{bdo}', bdo_name)
+                    .replace('{verschil_row}', verschil_token)
+        )
 
         return f"""BDO RESULT AFTER TAXES — EXECUTIVE ALIGNMENT RULE
 (Reporting period: {quarter}, year {year})
@@ -942,19 +1077,49 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
         calc_formulas = layout.get('calc_formulas', {})
         ltm_overrides = layout.get('ltm_calc_overrides', {})
 
+        # The row 19 LTM override formula uses a {verschil_row} placeholder
+        # because the "Verschil balans en winst-en-verlies" row position
+        # varies between BDO files. Resolve it from context (or leave the
+        # placeholder visible if it can't be discovered, so Claude can flag).
+        verschil_row = context.get('bdo_verschil_row')
+        verschil_token = str(verschil_row) if verschil_row is not None else '{verschil_row}'
+
+        def _render(tmpl: str, col_letter: str) -> str:
+            return (
+                tmpl.replace('{col}', col_letter)
+                    .replace('{bdo}', bdo_name)
+                    .replace('{verschil_row}', verschil_token)
+            )
+
         q_calc_lines = []
         for row_num, tmpl in sorted(calc_formulas.items()):
-            formula = tmpl.replace('{col}', q).replace('{bdo}', bdo_name)
-            q_calc_lines.append(f"     Row {row_num}: {formula}")
+            q_calc_lines.append(f"     Row {row_num}: {_render(tmpl, q)}")
 
         ltm_calc_lines = []
         all_ltm = {**calc_formulas, **ltm_overrides}
         for row_num, tmpl in sorted(all_ltm.items()):
-            formula = tmpl.replace('{col}', ltm).replace('{bdo}', bdo_name)
-            ltm_calc_lines.append(f"     Row {row_num}: {formula}")
+            ltm_calc_lines.append(f"     Row {row_num}: {_render(tmpl, ltm)}")
 
         q_calc_block = "\n".join(q_calc_lines)
         ltm_calc_block = "\n".join(ltm_calc_lines)
+
+        # Pre-render the expected LTM formulas for the two protected total
+        # rows from the YAML templates (with all placeholders resolved). The
+        # earlier hardcoded "{ltm}{auth_row} = ={ltm}{dep_row}" in the prompt
+        # body told Claude that row 19 should directly reference row 68 — a
+        # tautology that defeated the whole BS-vs-PL cross-check.
+        auth_tmpl = (
+            all_ltm.get(auth_row)
+            or all_ltm.get(str(auth_row))
+            or f"={{col}}{dep_row}"
+        )
+        dep_tmpl = (
+            all_ltm.get(dep_row)
+            or all_ltm.get(str(dep_row))
+            or f"={{col}}{dep_row - 2}+{{col}}{dep_row - 1}"
+        )
+        auth_expected_ltm = _render(auth_tmpl, ltm)
+        dep_expected_ltm = _render(dep_tmpl, ltm)
 
         # BDO ground truth from context
         bdo_gt = context.get('bdo_resultaat_na_belasting') or {}
@@ -1035,12 +1200,23 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
    FORMULAS — never hardcoded numeric values. A hardcoded number breaks the
    dynamic spreadsheet and makes SUM({ltm}{bs_range[0]}:{ltm}{auth_row_minus_1}) != {ltm}{auth_row}.
 
-   Expected LTM formulas:
-   - {ltm}{auth_row} (Total Equity Movement): ={ltm}{dep_row}
-   - {ltm}{dep_row} (Direct result): ={ltm}{dep_row - 2}+{ltm}{dep_row - 1}
+   Expected LTM formulas (rendered from accounting_rules.yaml — these
+   are the ONLY correct formulas for these cells):
+   - {ltm}{auth_row} (Total Equity Movement): {auth_expected_ltm}
+   - {ltm}{dep_row} (Direct result): {dep_expected_ltm}
 
-   If either cell contains a hardcoded numeric value instead of a formula,
-   emit a formula patch to restore the correct formula above.
+   IMPORTANT: Row {auth_row} MUST derive from SUM(rows {bs_range[0]}-{auth_row_minus_1})
+   minus the BDO "Verschil balans en winst-en-verlies" reconciliation term.
+   It MUST NEVER be a direct reference to row {dep_row} (e.g. ={ltm}{dep_row}).
+   Row {dep_row} MUST derive from row {dep_row - 2} + row {dep_row - 1}, never
+   from row {auth_row}. The two totals are computed independently from
+   different upstream sections (Balance Sheet vs P&L) and must
+   reconcile at the same value via the BDO ground truth — that
+   independent reconciliation is the whole point of the check.
+
+   If either cell contains a hardcoded numeric value or the wrong
+   structural formula, emit a formula patch to restore the correct
+   formula above.
 
    BDO GROUND TRUTH VALUES (sign-adjusted, from Resultaat na belasting):
    - LTM target (sign_adjusted_ltm): {gt_ltm}
@@ -1731,7 +1907,16 @@ class AIVerificationOrchestrator:
     """
     Main orchestrator for AI verification of Management Accounts.
     Always runs after MA build, applies patches, re-validates.
+
+    The verification loop runs up to ``MAX_VERIFY_ROUNDS`` times. After each
+    Claude round the workbook is re-validated against the BDO ground truth
+    (Resultaat na belasting); on failure the context is re-extracted from
+    the patched file and Claude is called again with a structured
+    ``prior_round_failure`` summary so it can correct upstream BDO row
+    mappings instead of repeating the same patch.
     """
+
+    MAX_VERIFY_ROUNDS = 3
 
     def __init__(self, config: VerificationConfig,
                  api_key: Optional[str] = None,
@@ -1799,63 +1984,187 @@ class AIVerificationOrchestrator:
                 context['computed_values_snapshot'] = cv_snapshot
                 logger.info(f"[AI Verify] Added {len(cv_snapshot)} computed_values to context")
 
-            # Phase B: Build prompt
-            logger.info("[AI Verify] Phase B: Building verification prompt...")
+            # Phase B–D loop. The first round runs the standard prompt; if
+            # the patched workbook fails reconciliation, subsequent rounds
+            # rebuild the context from the patched state and append a
+            # PRIOR_ROUND_FAILURE block instructing Claude to re-examine
+            # upstream BDO row mappings. The user-facing requirement: if
+            # SUM(LTM rows 3-18) does not equal H of "Resultaat na
+            # belasting" in BDO, Claude must loop back, re-check the
+            # mappings, and retry until the check passes.
             prompt_builder = VerificationPromptBuilder()
-            prompt = prompt_builder.build(context)
-
-            # Add BDO copy verification to prompt if available
-            if 'bdo_copy_verification' in context:
-                prompt += "\n\nBDO COPY VERIFICATION CONTEXT:\n"
-                prompt += json.dumps(context['bdo_copy_verification'], indent=2)
-
-            logger.info(f"[AI Verify] Prompt size: {len(prompt)} chars")
-
-            # Phase C: Send to Claude
-            logger.info("[AI Verify] Phase C: Sending to Claude for verification...")
             verifier = ClaudeVerifier(api_key=self.api_key)
-            claude_response = verifier.verify(prompt)
+            applier_factory = lambda: PatchApplier(
+                workbook_path, self.config.summary_sheet_name,
+                expected_bdo_sheet_name=self.config.bdo_sheet_name,
+                ltm_col=self.config.built_ltm_col,
+            )
 
-            if claude_response.get('status') == 'ERROR':
-                result.status = 'ERROR'
-                result.error = claude_response.get('error', 'Unknown error')
-                result.notes = f"Claude API error: {result.error}"
-                logger.warning(f"[AI Verify] Claude error — original file unchanged: {result.error}")
-                return result
+            prior_round_failure: Optional[Dict[str, Any]] = None
+            revalidation_report: Dict[str, Any] = {}
+            cumulative_patches_applied = 0
+            last_claude_status = 'PASS'
+            last_issues: List[Dict[str, Any]] = []
+            last_patches: List[Dict[str, Any]] = []
+            last_validation_summary: Dict[str, Any] = {}
+            last_notes = ''
 
-            result.status = claude_response.get('status', 'PASS')
-            result.issues = claude_response.get('issues', [])
-            result.patches = claude_response.get('patches', [])
-            result.validation_summary = claude_response.get('validation_summary', {})
-            result.notes = claude_response.get('notes', '')
-
-            # Phase D: Apply patches in-place to the original workbook
-            if result.patches:
-                logger.info(f"[AI Verify] Phase D: Applying {len(result.patches)} patches in-place...")
-
-                applier = PatchApplier(
-                    workbook_path, self.config.summary_sheet_name,
-                    expected_bdo_sheet_name=self.config.bdo_sheet_name,
-                    ltm_col=self.config.built_ltm_col,
+            for round_num in range(1, self.MAX_VERIFY_ROUNDS + 1):
+                # Phase B: build prompt for this round
+                if prior_round_failure is not None:
+                    context['prior_round_failure'] = prior_round_failure
+                logger.info(
+                    f"[AI Verify] Phase B (round {round_num}/"
+                    f"{self.MAX_VERIFY_ROUNDS}): Building verification prompt..."
                 )
-                applied, rejected = applier.apply(result.patches, workbook_path)
-                result.patches_applied = applied
+                prompt = prompt_builder.build(context)
 
-                if rejected:
-                    logger.warning(f"[AI Verify] {len(rejected)} patches rejected")
-                    for rej in rejected:
-                        logger.warning(f"  Rejected: row {rej.get('row')}, reason: {rej.get('rejection_reason')}")
+                if 'bdo_copy_verification' in context:
+                    prompt += "\n\nBDO COPY VERIFICATION CONTEXT:\n"
+                    prompt += json.dumps(context['bdo_copy_verification'], indent=2)
 
-                # Phase D++: Verify formula chain integrity (rows 19, 68, interest)
-                self._verify_formula_chain(workbook_path, self.config)
+                logger.info(
+                    f"[AI Verify] Round {round_num} prompt size: {len(prompt)} chars"
+                )
 
-                # Phase D+: Re-validate
-                logger.info("[AI Verify] Phase D+: Re-validating patched workbook...")
-                result.revalidation_passed = self._revalidate(workbook_path, bdo_result, computed_values)
+                # Phase C: Send to Claude
+                logger.info(
+                    f"[AI Verify] Phase C (round {round_num}): "
+                    f"Sending to Claude for verification..."
+                )
+                claude_response = verifier.verify(prompt)
 
-            else:
-                result.revalidation_passed = True
-                logger.info("[AI Verify] No patches needed — workbook passed verification")
+                if claude_response.get('status') == 'ERROR':
+                    result.status = 'ERROR'
+                    result.error = claude_response.get('error', 'Unknown error')
+                    result.notes = f"Claude API error: {result.error}"
+                    logger.warning(
+                        f"[AI Verify] Claude error in round {round_num} — "
+                        f"original file unchanged: {result.error}"
+                    )
+                    return result
+
+                last_claude_status = claude_response.get('status', 'PASS')
+                last_issues = claude_response.get('issues', []) or []
+                last_patches = claude_response.get('patches', []) or []
+                last_validation_summary = (
+                    claude_response.get('validation_summary', {}) or {}
+                )
+                last_notes = claude_response.get('notes', '') or ''
+
+                # Phase D: Apply patches (and run deterministic post-patch
+                # formula-chain repair). Both must run BEFORE re-validation
+                # because _verify_formula_chain restores any cells that
+                # patches have left in an inconsistent state (e.g. rows
+                # 19/68 missing the YAML override formula).
+                if last_patches:
+                    logger.info(
+                        f"[AI Verify] Phase D (round {round_num}): "
+                        f"Applying {len(last_patches)} patches in-place..."
+                    )
+                    applier = applier_factory()
+                    applied, rejected = applier.apply(last_patches, workbook_path)
+                    cumulative_patches_applied += applied
+                    if rejected:
+                        logger.warning(
+                            f"[AI Verify] Round {round_num}: "
+                            f"{len(rejected)} patches rejected"
+                        )
+                        for rej in rejected:
+                            logger.warning(
+                                f"  Rejected: row {rej.get('row')}, "
+                                f"reason: {rej.get('rejection_reason')}"
+                            )
+                    self._verify_formula_chain(workbook_path, self.config)
+
+                # Phase D+: Re-validate (with structured failure report)
+                logger.info(
+                    f"[AI Verify] Phase D+ (round {round_num}): "
+                    f"Re-validating patched workbook..."
+                )
+                revalidation_report = self._revalidate_detailed(
+                    workbook_path, bdo_result, computed_values
+                )
+
+                if revalidation_report.get('passed'):
+                    logger.info(
+                        f"[AI Verify] Round {round_num} reconciled — "
+                        f"exiting verification loop"
+                    )
+                    break
+
+                if round_num >= self.MAX_VERIFY_ROUNDS:
+                    logger.warning(
+                        f"[AI Verify] Reached MAX_VERIFY_ROUNDS="
+                        f"{self.MAX_VERIFY_ROUNDS}; reconciliation still "
+                        f"failing. Workbook saved as-is for manual review."
+                    )
+                    break
+
+                # Re-extract context from the patched workbook so the next
+                # round sees the formulas that are actually in the file
+                # (the previous round's patches plus any deterministic
+                # repairs from _verify_formula_chain).
+                logger.info(
+                    f"[AI Verify] Round {round_num} reconciliation FAILED; "
+                    f"preparing round {round_num + 1} with feedback "
+                    f"({len(revalidation_report.get('failure_reasons', []))} "
+                    f"failure reason(s))"
+                )
+                extractor = WorkbookContextExtractor(
+                    workbook_path, self.config, self.formula_templates_path
+                )
+                context = extractor.extract()
+                if bdo_source_path:
+                    bdo_verifier = BDOCopyVerifier(
+                        workbook_path, bdo_source_path, self.config
+                    )
+                    context['bdo_copy_verification'] = (
+                        bdo_verifier.build_verification_context()
+                    )
+                if bdo_result:
+                    shadow_pl, shadow_bs = self._compute_shadow_models(
+                        workbook_path, bdo_result
+                    )
+                    if shadow_pl:
+                        context['shadow_pl'] = shadow_pl
+                    if shadow_bs:
+                        context['shadow_bs'] = shadow_bs
+                if computed_values:
+                    cv_snapshot = {}
+                    for (row, scope), val in sorted(computed_values.items()):
+                        key = f"row_{row}_{scope}"
+                        cv_snapshot[key] = (
+                            round(val, 2) if isinstance(val, float) else val
+                        )
+                    context['computed_values_snapshot'] = cv_snapshot
+
+                prior_round_failure = {
+                    'round': round_num,
+                    'failure_reasons': revalidation_report.get(
+                        'failure_reasons', []
+                    ),
+                    'auth_row_value': revalidation_report.get('auth_row_value'),
+                    'dep_row_value': revalidation_report.get('dep_row_value'),
+                    'bdo_ground_truth': revalidation_report.get('bdo_ground_truth'),
+                    'patches_applied_in_prior_rounds': cumulative_patches_applied,
+                    'last_claude_notes': last_notes,
+                }
+
+            # Persist the final round's outcome on the result object.
+            result.status = last_claude_status
+            result.issues = last_issues
+            result.patches = last_patches
+            result.validation_summary = last_validation_summary
+            result.notes = last_notes
+            result.patches_applied = cumulative_patches_applied
+            result.revalidation_passed = bool(
+                revalidation_report.get('passed')
+            ) if revalidation_report else (cumulative_patches_applied == 0)
+            if not last_patches and cumulative_patches_applied == 0:
+                logger.info(
+                    "[AI Verify] No patches needed — workbook passed verification"
+                )
 
             logger.info(
                 f"[AI Verify] Complete — status={result.status}, "
@@ -1918,10 +2227,26 @@ class AIVerificationOrchestrator:
         needs_save = False
         all_calcs = {**calc_formulas, **ltm_overrides}
 
+        # Resolve the BDO "Verschil balans en winst-en-verlies" row
+        # dynamically. Row 19's LTM override formula contains a
+        # {verschil_row} placeholder because the position varies between
+        # quarterly BDO files; never hardcode the row number.
+        bdo_sheet_for_verschil = wb[bdo_name] if bdo_name in wb.sheetnames else None
+        verschil_row = self._find_verschil_row_in_bdo(bdo_sheet_for_verschil)
+        verschil_token = str(verschil_row) if verschil_row is not None else ''
+
+        def _render_template(tmpl: str) -> str:
+            return (
+                tmpl.replace('{col}', ltm_letter)
+                    .replace('{COL}', ltm_letter)
+                    .replace('{bdo}', bdo_name)
+                    .replace('{verschil_row}', verschil_token)
+            )
+
         # Check 1: dep_row (68) must be a formula
         dep_template = all_calcs.get(dep_row) or all_calcs.get(str(dep_row))
         expected_dep = (
-            dep_template.replace('{col}', ltm_letter).replace('{bdo}', bdo_name)
+            _render_template(dep_template)
             if dep_template else
             f"={ltm_letter}{dep_row - 2}+{ltm_letter}{dep_row - 1}"
         )
@@ -1933,12 +2258,36 @@ class AIVerificationOrchestrator:
 
         # Check 2: auth_row (19) must be a formula
         auth_template = all_calcs.get(auth_row) or all_calcs.get(str(auth_row))
+        # NOTE: the historical fallback was f"={ltm_letter}{dep_row}" which
+        # collapsed row 19 into a direct reference to row 68 — defeating the
+        # whole point of BS-vs-PL reconciliation. We deliberately fall back
+        # to a SUM(3:18) - H<verschil> structure instead, only used when the
+        # YAML override is missing entirely.
         expected_auth = (
-            auth_template.replace('{col}', ltm_letter).replace('{bdo}', bdo_name)
-            if auth_template else f"={ltm_letter}{dep_row}"
+            _render_template(auth_template)
+            if auth_template else (
+                f"=SUM({ltm_letter}3:{ltm_letter}{auth_row - 1})"
+                f"-'{bdo_name}'!H{verschil_token}"
+                if verschil_token else
+                f"=SUM({ltm_letter}3:{ltm_letter}{auth_row - 1})"
+            )
         )
         cell_auth = sheet.cell(row=auth_row, column=ltm_col)
-        if not isinstance(cell_auth.value, str) or not cell_auth.value.startswith('='):
+        # Restore the formula not only when the cell is missing/non-formula,
+        # but also when it has collapsed to a direct reference to row
+        # {dep_row} (which an earlier Claude patch could insert). The
+        # SUM(3:18) - H<verschil> structure is the only valid form.
+        current_auth_val = cell_auth.value
+        is_direct_dep_ref = (
+            isinstance(current_auth_val, str)
+            and current_auth_val.replace(' ', '').upper()
+            == f"={ltm_letter}{dep_row}".upper()
+        )
+        if (
+            not isinstance(current_auth_val, str)
+            or not current_auth_val.startswith('=')
+            or is_direct_dep_ref
+        ):
             cell_auth.value = expected_auth
             needs_save = True
             logger.warning(f"[Post-patch] Row {auth_row} restored formula: {expected_auth}")
@@ -2039,6 +2388,31 @@ class AIVerificationOrchestrator:
                 pass
         return {}
 
+    def _find_verschil_row_in_bdo(self, bdo_sheet) -> Optional[int]:
+        """
+        Locate the row whose column A or B label contains "Verschil balans
+        en winst-en-verlies" in the given BDO sheet.
+
+        The position differs between quarterly BDO files, so the row number
+        must always be discovered dynamically and never hardcoded. Returns
+        None when the label cannot be found, in which case the caller
+        should treat the lookup as undefined rather than substitute a
+        bogus row number.
+        """
+        if bdo_sheet is None:
+            return None
+
+        rules = self._load_rules()
+        bdo_cfg = rules.get('bdo', {})
+        label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
+
+        for row_idx in range(1, min(bdo_sheet.max_row + 1, 200)):
+            for col in label_cols:
+                cell_val = bdo_sheet.cell(row=row_idx, column=col).value
+                if isinstance(cell_val, str) and 'verschil balans' in cell_val.lower():
+                    return row_idx
+        return None
+
     def _compute_shadow_models(
         self, workbook_path: str, bdo_result: BDOParseResult
     ) -> Tuple[Optional[Dict], Optional[Dict]]:
@@ -2097,10 +2471,43 @@ class AIVerificationOrchestrator:
         """
         Re-run validation on the patched workbook.
 
-        Checks:
-        1. Rows 19 and 68 in LTM column contain formulas (not hardcoded values).
-        2. Computed values match between PL68 and BS19 (within tolerance).
+        Thin wrapper over :py:meth:`_revalidate_detailed` that returns only
+        the boolean pass/fail flag. Callers that need the full report
+        (failure reasons, numeric values) should call
+        ``_revalidate_detailed`` directly.
         """
+        return self._revalidate_detailed(
+            workbook_path, bdo_result, computed_values
+        ).get('passed', False)
+
+    def _revalidate_detailed(
+        self,
+        workbook_path: str,
+        bdo_result: Optional[BDOParseResult],
+        computed_values: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """
+        Re-run validation on the patched workbook and return a structured
+        report so the orchestrator's retry loop can feed actionable
+        feedback back into the next Claude round.
+
+        Checks performed:
+        1. Rows 19 and 68 in LTM column contain formulas (not hardcoded
+           numeric values).
+        2. Row 19 must NOT be a direct reference to row 68 (the formulas
+           must derive independently from BS detail and P&L chain).
+        3. PL68 and BS19 reconcile against each other within tolerance.
+        4. PL68 / BS19 reconcile against the BDO Resultaat na belasting
+           ground truth (sign-adjusted) within tolerance.
+        """
+        report: Dict[str, Any] = {
+            'passed': False,
+            'failure_reasons': [],
+            'auth_row_value': None,
+            'dep_row_value': None,
+            'bdo_ground_truth': None,
+        }
+
         rules_path = Path("config/accounting_rules.yaml")
         rules = {}
         if rules_path.exists():
@@ -2116,52 +2523,179 @@ class AIVerificationOrchestrator:
 
         wb = openpyxl.load_workbook(workbook_path)
         formula_ok = True
-        for sn in wb.sheetnames:
-            if 'Management Cijfers' in sn:
-                sheet = wb[sn]
-                ltm_col = None
-                for col_idx in range(sheet.max_column, 0, -1):
-                    cell = sheet.cell(row=22, column=col_idx)
-                    if cell.value and 'LTM' in str(cell.value):
-                        ltm_col = col_idx
-                        break
-                if ltm_col:
-                    cell_19 = sheet.cell(row=auth_row, column=ltm_col)
-                    cell_68 = sheet.cell(row=dep_row, column=ltm_col)
-                    if not (isinstance(cell_19.value, str) and cell_19.value.startswith('=')):
-                        logger.error(
-                            f"REVALIDATION FAIL: Row {auth_row} LTM is not a formula: "
-                            f"{cell_19.value}"
-                        )
-                        formula_ok = False
-                    if not (isinstance(cell_68.value, str) and cell_68.value.startswith('=')):
-                        logger.error(
-                            f"REVALIDATION FAIL: Row {dep_row} LTM is not a formula: "
-                            f"{cell_68.value}"
-                        )
-                        formula_ok = False
-                break
-        wb.close()
+        try:
+            for sn in wb.sheetnames:
+                if 'Management Cijfers' in sn:
+                    sheet = wb[sn]
+                    ltm_col = None
+                    for col_idx in range(sheet.max_column, 0, -1):
+                        cell = sheet.cell(row=22, column=col_idx)
+                        if cell.value and 'LTM' in str(cell.value):
+                            ltm_col = col_idx
+                            break
+                    if ltm_col:
+                        ltm_letter = get_column_letter(ltm_col)
+                        cell_19 = sheet.cell(row=auth_row, column=ltm_col)
+                        cell_68 = sheet.cell(row=dep_row, column=ltm_col)
+                        if not (isinstance(cell_19.value, str) and cell_19.value.startswith('=')):
+                            msg = (
+                                f"Row {auth_row} LTM is not a formula: "
+                                f"{cell_19.value!r}"
+                            )
+                            logger.error(f"REVALIDATION FAIL: {msg}")
+                            report['failure_reasons'].append(msg)
+                            formula_ok = False
+                        if not (isinstance(cell_68.value, str) and cell_68.value.startswith('=')):
+                            msg = (
+                                f"Row {dep_row} LTM is not a formula: "
+                                f"{cell_68.value!r}"
+                            )
+                            logger.error(f"REVALIDATION FAIL: {msg}")
+                            report['failure_reasons'].append(msg)
+                            formula_ok = False
+
+                        # Independence check: row 19 must NOT directly
+                        # reference row 68 (and vice versa). A direct ref
+                        # turns the cross-check into a tautology.
+                        if isinstance(cell_19.value, str):
+                            stripped = cell_19.value.replace(' ', '').upper()
+                            if stripped == f"={ltm_letter}{dep_row}".upper():
+                                msg = (
+                                    f"Row {auth_row} LTM is a direct "
+                                    f"reference to row {dep_row} "
+                                    f"({cell_19.value!r}); the BS-vs-PL "
+                                    f"reconciliation requires independent "
+                                    f"derivation from rows {auth_row - 16}-"
+                                    f"{auth_row - 1}."
+                                )
+                                logger.error(f"REVALIDATION FAIL: {msg}")
+                                report['failure_reasons'].append(msg)
+                                formula_ok = False
+                        if isinstance(cell_68.value, str):
+                            stripped = cell_68.value.replace(' ', '').upper()
+                            if stripped == f"={ltm_letter}{auth_row}".upper():
+                                msg = (
+                                    f"Row {dep_row} LTM is a direct "
+                                    f"reference to row {auth_row} "
+                                    f"({cell_68.value!r}); the P&L chain "
+                                    f"must derive row {dep_row} from "
+                                    f"rows {dep_row - 2}+{dep_row - 1}."
+                                )
+                                logger.error(f"REVALIDATION FAIL: {msg}")
+                                report['failure_reasons'].append(msg)
+                                formula_ok = False
+                    break
+        finally:
+            wb.close()
 
         if not formula_ok:
-            return False
+            report['passed'] = False
+            return report
 
         tolerance = 1.0
 
+        # Try to read the BDO ground-truth value (Resultaat na belasting,
+        # sign-adjusted) so we can reconcile against it as well as
+        # checking PL68 vs BS19. The data_only re-read picks up the cached
+        # H value when present; if not (most common after openpyxl saves
+        # without a recalculation cycle) we fall back to summing the
+        # quarter columns C:G which always store numeric values.
+        bdo_ground_truth: Optional[float] = None
+        bdo_cfg = rules.get('bdo', {})
+        data_col = bdo_cfg.get('data_column', 8)
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
+        try:
+            wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
+            try:
+                bdo_sheet = None
+                for sn in wb_data.sheetnames:
+                    if sn == self.config.bdo_sheet_name:
+                        bdo_sheet = wb_data[sn]
+                        break
+                if bdo_sheet is not None:
+                    target_row = None
+                    for row_idx in range(1, min(bdo_sheet.max_row + 1, 200)):
+                        for col in label_cols:
+                            label = bdo_sheet.cell(row=row_idx, column=col).value
+                            if isinstance(label, str) and 'resultaat na belasting' in label.lower():
+                                target_row = row_idx
+                                break
+                        if target_row is not None:
+                            break
+
+                    if target_row is not None:
+                        # Preferred: the cached column H value (LTM total).
+                        h_val = bdo_sheet.cell(row=target_row, column=data_col).value
+                        if isinstance(h_val, (int, float)):
+                            bdo_ground_truth = -float(h_val)
+                        else:
+                            # Fallback: sum the quarter columns (and the
+                            # opening-balance column where present). For
+                            # Resultaat na belasting this matches column H
+                            # because H = SUM(C:G) for that row.
+                            running = 0.0
+                            cols_for_sum = list(range(3, q_cols[-1] + 1)) if q_cols else [3, 4, 5, 6, 7]
+                            saw_value = False
+                            for col_idx in cols_for_sum:
+                                v = bdo_sheet.cell(row=target_row, column=col_idx).value
+                                if isinstance(v, (int, float)):
+                                    running += float(v)
+                                    saw_value = True
+                            if saw_value:
+                                bdo_ground_truth = -running
+            finally:
+                wb_data.close()
+        except Exception as e:
+            logger.warning(f"[AI Verify] BDO ground-truth read failed: {e}")
+
+        report['bdo_ground_truth'] = bdo_ground_truth
+
+        # Prefer the cheap path: pre-computed values from the MA builder.
         if computed_values:
             pl68 = computed_values.get((dep_row, 'ltm'), 0.0)
             bs19 = computed_values.get((auth_row, 'ltm'), 0.0)
-            diff = abs(pl68 - bs19)
-            passed = diff <= tolerance
+            report['auth_row_value'] = bs19
+            report['dep_row_value'] = pl68
+            internal_diff = abs(pl68 - bs19)
+            internal_passed = internal_diff <= tolerance
+            ground_passed = True
+            ground_diff = None
+            if bdo_ground_truth is not None:
+                ground_diff = max(
+                    abs(pl68 - bdo_ground_truth),
+                    abs(bs19 - bdo_ground_truth),
+                )
+                ground_passed = ground_diff <= tolerance
+            passed = internal_passed and ground_passed
             logger.info(
                 f"[AI Verify] Re-validation (computed_values): "
-                f"PL68={pl68:,.2f}, BS19={bs19:,.2f}, diff={diff:,.2f}, passed={passed}"
+                f"PL68={pl68:,.2f}, BS19={bs19:,.2f}, "
+                f"internal_diff={internal_diff:,.2f}, "
+                f"bdo_ground_truth={bdo_ground_truth}, "
+                f"ground_diff={ground_diff}, passed={passed}"
             )
-            return passed
+            if not internal_passed:
+                report['failure_reasons'].append(
+                    f"PL{dep_row}={pl68:,.2f} and BS{auth_row}={bs19:,.2f} "
+                    f"differ by {internal_diff:,.2f} (> tolerance "
+                    f"{tolerance:.2f})"
+                )
+            if not ground_passed and bdo_ground_truth is not None:
+                report['failure_reasons'].append(
+                    f"Neither PL{dep_row} nor BS{auth_row} reconciles "
+                    f"with BDO Resultaat na belasting "
+                    f"(sign-adjusted={bdo_ground_truth:,.2f}); max "
+                    f"divergence {ground_diff:,.2f} > tolerance "
+                    f"{tolerance:.2f}"
+                )
+            report['passed'] = passed
+            return report
 
         if bdo_result is None:
             logger.warning("[AI Verify] No BDO result for re-validation, skipping")
-            return True
+            report['passed'] = True
+            return report
 
         try:
             from .management_accounts import ManagementAccountsBuilder, ManagementAccountsConfig
@@ -2202,17 +2736,47 @@ class AIVerificationOrchestrator:
 
             builder.workbook.close()
 
-            diff = abs(dr - em)
-            passed = diff <= tolerance
+            report['auth_row_value'] = em
+            report['dep_row_value'] = dr
+            internal_diff = abs(dr - em)
+            internal_passed = internal_diff <= tolerance
+            ground_passed = True
+            ground_diff = None
+            if bdo_ground_truth is not None:
+                ground_diff = max(
+                    abs(dr - bdo_ground_truth),
+                    abs(em - bdo_ground_truth),
+                )
+                ground_passed = ground_diff <= tolerance
+            passed = internal_passed and ground_passed
             logger.info(
-                f"[AI Verify] Re-validation (shadow): DR={dr:,.2f}, EM={em:,.2f}, "
-                f"diff={diff:,.2f}, passed={passed}"
+                f"[AI Verify] Re-validation (shadow): DR={dr:,.2f}, "
+                f"EM={em:,.2f}, internal_diff={internal_diff:,.2f}, "
+                f"bdo_ground_truth={bdo_ground_truth}, "
+                f"ground_diff={ground_diff}, passed={passed}"
             )
-            return passed
+            if not internal_passed:
+                report['failure_reasons'].append(
+                    f"Shadow PL{dep_row}={dr:,.2f} and BS{auth_row}={em:,.2f} "
+                    f"differ by {internal_diff:,.2f} (> tolerance "
+                    f"{tolerance:.2f})"
+                )
+            if not ground_passed and bdo_ground_truth is not None:
+                report['failure_reasons'].append(
+                    f"Neither shadow PL{dep_row} nor BS{auth_row} "
+                    f"reconciles with BDO Resultaat na belasting "
+                    f"(sign-adjusted={bdo_ground_truth:,.2f}); max "
+                    f"divergence {ground_diff:,.2f} > tolerance "
+                    f"{tolerance:.2f}"
+                )
+            report['passed'] = passed
+            return report
 
         except Exception as e:
             logger.error(f"[AI Verify] Re-validation error: {e}")
-            return False
+            report['failure_reasons'].append(f"Re-validation exception: {e}")
+            report['passed'] = False
+            return report
 
 
 def _parse_period_end(period_end_str: str):

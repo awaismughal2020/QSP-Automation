@@ -10,7 +10,12 @@ identity_alignment:
   dependent_row: 68            # PL total (Direct Result)
   scope: ltm_only              # ltm_only | quarter_and_ltm
   max_snap_units: 2            # snap PL68 to BS19 when diff <= this
-  enforce_in_workbook: true    # set PL68 LTM cell to ={COL}19
+  # MUST be false. When true, _enforce_identity_formula() rewrites row 68 LTM
+  # to ={COL}19, turning the BS-vs-PL cross-check into a tautology. The
+  # authoritative writer is _enforce_bdo_alignment() which sets row 19 from
+  # the LTM override (SUM(3:18) - H_verschil) and row 68 from =66+67 so that
+  # both totals derive independently and can be reconciled against BDO.
+  enforce_in_workbook: false
   # These rows must contain FORMULAS whose result matches BDO ground truth.
   formula_total_rows: [19, 68]
 
@@ -89,15 +94,21 @@ layout:
 
   # LTM-only calc formula overrides (overrides calc_formulas for LTM column only)
   # Placeholders:
-  #   {col}  → LTM column letter (e.g. AD)
-  #   {bdo}  → current BDO sheet name (no quotes; include single quotes in pattern)
+  #   {col}            → LTM column letter (e.g. AD)
+  #   {bdo}            → current BDO sheet name (no quotes; include single quotes in pattern)
+  #   {verschil_row}   → row number in the BDO sheet whose column A label is
+  #                      "Verschil balans en winst-en-verlies" (resolved at
+  #                      runtime by _find_verschil_row()). The position of this
+  #                      row varies between BDO files, so it MUST never be
+  #                      hardcoded — earlier versions baked in H134, which is
+  #                      "Afschrijving prepaid" in some quarterly BDO sheets.
   ltm_calc_overrides:
     # Row 19 = Total Equity Movement. The closing-balance section (rows 3-18)
-    # plus a small reconciliation term '<BDO>'!H134 ("Verschil balans en winst-
-    # en-verlies") which the client reference workbook subtracts. Without
-    # this term the totals diverge from BDO's Resultaat na belasting by the
-    # amount of that reconciliation row.
-    19: "=SUM({col}3:{col}18)-'{bdo}'!H134"
+    # plus a small reconciliation term '<BDO>'!H{verschil_row}
+    # ("Verschil balans en winst-en-verlies") which the client reference
+    # workbook subtracts. Without this term the totals diverge from BDO's
+    # Resultaat na belasting by the amount of that reconciliation row.
+    19: "=SUM({col}3:{col}18)-'{bdo}'!H{verschil_row}"
 
   # Intermediate P&L rows (net interest, derivatives, etc.)
   intermediate_rows: [60, 61, 64, 65, 67]
