@@ -245,8 +245,12 @@ class TestProtectedRowPatch:
 
 class TestVerifyAndRefresh:
 
-    def test_refresh_snaps_values(self, tmp_path):
-        """After AI, computed_values should reflect the file's row-19 value."""
+    def test_refresh_reads_independent_row_values(self, tmp_path):
+        """After AI, computed_values should reflect the file's row-19 and
+        row-68 values independently. Earlier versions blindly mirrored
+        row 68 to row 19 (a "snap") which masked LTM ground-truth bugs;
+        the new behaviour returns the actual evaluated/cached values for
+        each row so downstream consumers can detect mismatches."""
         ma_path = _make_mc_workbook(tmp_path, bs19_val=5000, pl68_val=5001)
 
         cv = {(19, 'ltm'): 4999.0, (68, 'ltm'): 4998.0}
@@ -255,7 +259,7 @@ class TestVerifyAndRefresh:
             ma_path, cv, results)
 
         assert refreshed[(19, 'ltm')] == 5000.0
-        assert refreshed[(68, 'ltm')] == 5000.0
+        assert refreshed[(68, 'ltm')] == 5001.0
 
     def test_mismatch_over_tolerance_warns(self, tmp_path):
         """Large diff should generate a warning."""

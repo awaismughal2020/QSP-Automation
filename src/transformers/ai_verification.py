@@ -704,6 +704,30 @@ class VerificationPromptBuilder:
         else:
             ltm_mismatch_block = "  - (no per-row LTM mismatches captured)"
 
+        # Render evaluator output (per-row evaluated values) so Claude
+        # has a deterministic, formula-aware reference for what each AC
+        # and AD row currently resolves to. This is fed in *addition* to
+        # the row-mismatch block so Claude can see both "this row's BDO
+        # reference is wrong" and "this row's evaluated number is X but
+        # should be Y".
+        eval_ltm = prior.get('evaluated_ltm') or {}
+        eval_q = prior.get('evaluated_quarter') or {}
+
+        def _format_eval_block(values: Dict[str, Any], col_letter: str) -> str:
+            if not values:
+                return f"  - (no evaluated values for column {col_letter})"
+            sample = sorted(values.items())[:30]
+            extra = ""
+            if len(values) > 30:
+                extra = f"\n  - … and {len(values) - 30} more rows"
+            lines = [
+                f"  - {col_letter}{r}: {v}" for r, v in sample
+            ]
+            return "\n".join(lines) + extra
+
+        eval_ltm_block = _format_eval_block(eval_ltm, ltm)
+        eval_q_block = _format_eval_block(eval_q, quarter)
+
         return (
             f"PRIOR_ROUND_FAILURE — RECONCILIATION DID NOT PASS\n"
             f"=================================================\n"
@@ -714,8 +738,10 @@ class VerificationPromptBuilder:
             f"{prior.get('auth_row_value')}\n"
             f"  - {ltm}{dep_row} (Direct Result) = "
             f"{prior.get('dep_row_value')}\n"
-            f"  - BDO ground truth (sign-adjusted Resultaat na belasting) = "
+            f"  - BDO ground truth LTM (sign-adjusted Resultaat na belasting) = "
             f"{prior.get('bdo_ground_truth')}\n"
+            f"  - BDO ground truth quarter (sign-adjusted) = "
+            f"{prior.get('bdo_ground_truth_quarter')}\n"
             f"\n"
             f"Failure reasons reported by the deterministic re-validator:\n"
             f"{reasons_block}\n"
@@ -723,6 +749,16 @@ class VerificationPromptBuilder:
             f"LTM COLUMN ROW-BY-ROW MISMATCHES (column {ltm}, comparing "
             f"actual formula vs. expected derived from previous-quarter):\n"
             f"{ltm_mismatch_block}\n"
+            f"\n"
+            f"EVALUATED LTM COLUMN VALUES (column {ltm}, evaluated by "
+            f"the deterministic formula evaluator from the saved workbook "
+            f"against BDO column H):\n"
+            f"{eval_ltm_block}\n"
+            f"\n"
+            f"EVALUATED QUARTER COLUMN VALUES (column {quarter}, "
+            f"evaluated against BDO column G — for symmetry, the AC68 "
+            f"value here MUST equal sign_adjusted_quarter):\n"
+            f"{eval_q_block}\n"
             f"\n"
             f"Total patches applied across all prior rounds: "
             f"{prior.get('patches_applied_in_prior_rounds', 0)}\n"
@@ -1203,6 +1239,13 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
         bold_rows = layout.get('bold_total_rows', [19, 25, 30, 44, 45, 48, 55, 57, 66, 68])
         intermediate = layout.get('intermediate_rows', [60, 61, 64, 65, 67])
         bdo_col_letter = get_column_letter(rules.get('bdo', {}).get('data_column', 8))
+        # BDO quarter (mutation) column letter — used in Check 3a so the
+        # AC-symmetry block can reference 'BDO'!G<row> just like AD
+        # references 'BDO'!H<row>.
+        bdo_q_cols_cfg = rules.get('bdo', {}).get('quarter_columns', [4, 5, 6, 7])
+        q_bdo_letter = get_column_letter(
+            bdo_q_cols_cfg[-1] if bdo_q_cols_cfg else 7
+        )
 
         bank_map = rules.get('bank_bdo_row_map', {})
         bank_lines = "\n".join(
@@ -1335,7 +1378,25 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
    LTM column ({ltm}, index {ltm_idx}):
 {ltm_calc_block}
 
-3. TOTAL ROW FORMULA INTEGRITY (MOST IMPORTANT RULE):
+3a. QUARTER COLUMN GROUND TRUTH (AC ground truth — column {q}):
+   Row {dep_row} in the QUARTER column ({q}) MUST contain a formula
+   (NOT a hardcoded number) and that formula's evaluated value MUST
+   equal sign_adjusted_quarter = {gt_qtr}, which is the negated value
+   of BDO column {q_bdo_letter} on Resultaat na belasting (single
+   quarter actuals).
+
+   Expected quarter-column structural formula:
+   - {q}{dep_row} (Direct result, quarter): ={q}{dep_row - 1}+{q}{dep_row - 2}
+
+   To make this reconcile, every detail row in {q} (BS rows
+   {bs_range[0]}-{auth_row_minus_1} and P&L rows {pl_range[0]}-{dep_row_minus_1})
+   MUST reference '{bdo_name}'!{q_bdo_letter}<row> using the row
+   number from the BDO account map. If {q}{dep_row} differs from
+   {gt_qtr}, fix the upstream detail row that has the wrong BDO row
+   reference — DO NOT touch {q}{dep_row} itself.
+
+3b. LTM COLUMN GROUND TRUTH (AD ground truth — column {ltm}, MOST
+   IMPORTANT RULE):
    Rows {auth_row} and {dep_row} in the LTM column ({ltm}) MUST contain
    FORMULAS — never hardcoded numeric values. A hardcoded number breaks the
    dynamic spreadsheet and makes SUM({ltm}{bs_range[0]}:{ltm}{auth_row_minus_1}) != {ltm}{auth_row}.
@@ -1354,30 +1415,29 @@ ROWS sections for missing references. NEVER fix totals by hardcoding a number.""
    reconcile at the same value via the BDO ground truth — that
    independent reconciliation is the whole point of the check.
 
-   If either cell contains a hardcoded numeric value or the wrong
-   structural formula, emit a formula patch to restore the correct
-   formula above.
-
    BDO GROUND TRUTH VALUES (sign-adjusted, from Resultaat na belasting):
-   - LTM target (sign_adjusted_ltm): {gt_ltm}
-   - Quarter target (sign_adjusted_quarter): {gt_qtr}
+   - LTM target (sign_adjusted_ltm = -BDO {bdo_col_letter}<row>): {gt_ltm}
+   - Quarter target (sign_adjusted_quarter = -BDO {q_bdo_letter}<row>): {gt_qtr}
    - BDO reference cell: {bdo_result_cell_ref} (multiply by -1 for MA convention)
    - Reporting period: {report_quarter}, year {report_year}
 
-   After formulas are in place, verify their calculated result equals {gt_ltm}.
-   If NOT, the problem is in upstream detail rows. Find and fix those:
+   After formulas are in place, verify the LTM calculated result
+   equals {gt_ltm}. If NOT, the problem is in upstream LTM detail
+   rows. Find and fix those:
 
    - Balance sheet detail rows {bs_range[0]}–{auth_row_minus_1}: verify every
-     bdo_ref/bdo_sum_range uses the correct BDO row per the account map and
-     nothing is skipped.
-   - P&L detail rows {pl_range[0]}–{dep_row_minus_1}: same verification. Trace
-     the formula chain ({dep_row} <- {dep_row - 1}+{dep_row - 2} <- ...) back to
-     bdo_ref detail rows and fix any wrong references.
-   - SUM({ltm}{bs_range[0]}:{ltm}{auth_row_minus_1}) MUST equal {gt_ltm}.
+     bdo_ref/bdo_sum_range in {ltm} uses '{bdo_name}'!{bdo_col_letter}<row>
+     with the correct BDO row per the account map.
+   - P&L detail rows {pl_range[0]}–{dep_row_minus_1}: same verification, also
+     in column {bdo_col_letter}.
+   - SUM({ltm}{bs_range[0]}:{ltm}{auth_row_minus_1}) - '{bdo_name}'!{bdo_col_letter}<verschil>
+     MUST equal {gt_ltm}.
    - The P&L calc chain ending at {ltm}{dep_row} MUST resolve to {gt_ltm}.
 
-   Row {dep_row} quarter column ({q}) should have the formula:
-   ={q}{dep_row - 1}+{q}{dep_row - 2}
+   The same logic applies symmetrically to the QUARTER column ({q})
+   with the only difference being BDO column letter
+   {q_bdo_letter} (latest mutation) instead of {bdo_col_letter}
+   (LTM closing total).
 
    PROTECTED ROWS (from config): {protected_rows}
    Do NOT emit value patches for these rows — they are computed totals.
@@ -2195,6 +2255,31 @@ class AIVerificationOrchestrator:
                     f"[AI Verify] Round {round_num} prompt size: {len(prompt)} chars"
                 )
 
+                # Persist the prompt for client debugging. Each round's
+                # prompt lands at outputs/ai_verify_prompt_{quarter}_round{N}.txt
+                # so the client can compare what we asked Claude to verify
+                # against what it actually returned. Failure to write this
+                # file is non-fatal — the verification round still runs.
+                try:
+                    quarter_slug = (
+                        (self.config.quarter or 'unknown')
+                        .replace(' ', '_').replace('/', '-')
+                    )
+                    out_dir = Path('outputs')
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    prompt_path = out_dir / (
+                        f"ai_verify_prompt_{quarter_slug}_round{round_num}.txt"
+                    )
+                    prompt_path.write_text(prompt, encoding='utf-8')
+                    logger.info(
+                        f"[AI Verify] Round {round_num} prompt exported to "
+                        f"{prompt_path}"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[AI Verify] Prompt export failed (non-fatal): {exc}"
+                    )
+
                 # Phase C: Send to Claude
                 logger.info(
                     f"[AI Verify] Phase C (round {round_num}): "
@@ -2315,6 +2400,13 @@ class AIVerificationOrchestrator:
                     'auth_row_value': revalidation_report.get('auth_row_value'),
                     'dep_row_value': revalidation_report.get('dep_row_value'),
                     'bdo_ground_truth': revalidation_report.get('bdo_ground_truth'),
+                    'bdo_ground_truth_quarter': revalidation_report.get(
+                        'bdo_ground_truth_quarter'
+                    ),
+                    'evaluated_ltm': revalidation_report.get('evaluated_ltm'),
+                    'evaluated_quarter': revalidation_report.get(
+                        'evaluated_quarter'
+                    ),
                     'ltm_row_mismatches': revalidation_report.get(
                         'ltm_row_mismatches', []
                     ),
@@ -2543,6 +2635,72 @@ class AIVerificationOrchestrator:
                                 f"{bdo_row} to catch-all row {catch_all_row}"
                             )
 
+        # Deterministic AC -> AD mirror after Claude's quarter-column
+        # patches so the LTM column always tracks the freshly-corrected
+        # quarter column. This is the belt-and-suspenders for the prompt
+        # check that Claude must emit paired patches: even if Claude
+        # forgets, the mirror restores the G->H, AC->AD invariant.
+        try:
+            from .formula_mirror import mirror_quarter_column_to_ltm
+
+            layout_cfg = rules.get('layout', {})
+            bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+            pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+            bank_range = layout_cfg.get('bank_rows', [107, 114])
+            identity = rules.get('identity_alignment', {})
+            auth = identity.get('authoritative_row', 19)
+            dep = identity.get('dependent_row', 68)
+            cash_row = layout_cfg.get('cash_proceeds_row', 50)
+            bank_total = rules.get('bank_total_row', bank_range[1])
+            inter = rules.get('interest_section', {})
+            skip_rows = {auth, dep, cash_row, bank_total,
+                         inter.get('management_row', 60)}
+            skip_rows.update(inter.get('absorbed_rows', []) or [])
+
+            rows = (
+                list(range(bs_range[0], bs_range[1] + 1))
+                + list(range(pl_range[0], pl_range[1] + 1))
+                + list(range(bank_range[0], bank_range[1] + 1))
+            )
+
+            header_row = layout_cfg.get('header_row', 22)
+            quarter_col = None
+            quarter_label = (config.quarter or '').strip().upper()
+            if quarter_label:
+                for c in range(2, ltm_col):
+                    raw = sheet.cell(row=header_row, column=c).value
+                    if raw and str(raw).strip().upper() == quarter_label:
+                        quarter_col = c
+                        break
+            if quarter_col is None:
+                quarter_col = ltm_col - 1
+
+            bdo_cfg_ = rules.get('bdo', {})
+            q_cols_ = bdo_cfg_.get('quarter_columns', [4, 5, 6, 7])
+            last_q_col_ = q_cols_[-1] if q_cols_ else 7
+            mirror_rewrites = mirror_quarter_column_to_ltm(
+                sheet,
+                quarter_col=quarter_col,
+                ltm_col=ltm_col,
+                bdo_sheet_name=bdo_name,
+                bdo_quarter_letter=get_column_letter(last_q_col_),
+                bdo_data_letter=get_column_letter(
+                    bdo_cfg_.get('data_column', 8)
+                ),
+                rows=rows,
+                skip_rows=skip_rows,
+            )
+            if mirror_rewrites:
+                needs_save = True
+                logger.info(
+                    f"[Post-patch] Mirrored {len(mirror_rewrites)} "
+                    f"row(s) from quarter to LTM column after AI patches"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[Post-patch] Quarter->LTM mirror failed (non-fatal): {exc}"
+            )
+
         if needs_save:
             wb.save(workbook_path)
             logger.info("[Post-patch] Formula chain verified and corrected")
@@ -2558,6 +2716,91 @@ class AIVerificationOrchestrator:
             except Exception:
                 pass
         return {}
+
+    def _read_bdo_ground_truth(
+        self,
+        workbook_path: str,
+        rules: Dict[str, Any],
+        use_ltm: bool = True,
+    ) -> Optional[float]:
+        """
+        Read the sign-adjusted "Resultaat na belasting" total from the BDO
+        sheet of the saved workbook.
+
+        Args:
+            use_ltm: when True, read column H (closing/LTM total). When
+                False, sum the quarter mutation columns (C through G by
+                default) for the latest-quarter actuals total.
+
+        Returns the negated value (BDO stores profits as negative; MA uses
+        positive-for-profit). Falls back to a manual sum of C:G when the
+        cached H value is missing — common right after openpyxl saves the
+        workbook without a recalculation cycle.
+        """
+        bdo_cfg = rules.get('bdo', {})
+        data_col = bdo_cfg.get('data_column', 8)
+        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
+
+        try:
+            wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
+        except Exception as exc:
+            logger.warning(f"[AI Verify] BDO ground-truth open failed: {exc}")
+            return None
+
+        try:
+            bdo_sheet = None
+            for sn in wb_data.sheetnames:
+                if sn == self.config.bdo_sheet_name:
+                    bdo_sheet = wb_data[sn]
+                    break
+            if bdo_sheet is None:
+                return None
+
+            target_row = None
+            for row_idx in range(1, min(bdo_sheet.max_row + 1, 200)):
+                for col in label_cols:
+                    label = bdo_sheet.cell(row=row_idx, column=col).value
+                    if (
+                        isinstance(label, str)
+                        and 'resultaat na belasting' in label.lower()
+                    ):
+                        target_row = row_idx
+                        break
+                if target_row is not None:
+                    break
+
+            if target_row is None:
+                return None
+
+            if use_ltm:
+                h_val = bdo_sheet.cell(row=target_row, column=data_col).value
+                if isinstance(h_val, (int, float)):
+                    return -float(h_val)
+                running = 0.0
+                cols_for_sum = (
+                    list(range(3, q_cols[-1] + 1)) if q_cols
+                    else [3, 4, 5, 6, 7]
+                )
+                saw_value = False
+                for col_idx in cols_for_sum:
+                    v = bdo_sheet.cell(row=target_row, column=col_idx).value
+                    if isinstance(v, (int, float)):
+                        running += float(v)
+                        saw_value = True
+                return -running if saw_value else None
+
+            # Quarter actuals: sum of mutation columns only (D:G).
+            running = 0.0
+            saw_value = False
+            for col_idx in q_cols:
+                v = bdo_sheet.cell(row=target_row, column=col_idx).value
+                if isinstance(v, (int, float)):
+                    running += float(v)
+                    saw_value = True
+            return -running if saw_value else None
+        finally:
+            wb_data.close()
 
     def _find_verschil_row_in_bdo(self, bdo_sheet) -> Optional[int]:
         """
@@ -2958,103 +3201,135 @@ class AIVerificationOrchestrator:
 
         tolerance = 1.0
 
-        # Try to read the BDO ground-truth value (Resultaat na belasting,
+        # Read the BDO ground-truth value (Resultaat na belasting,
         # sign-adjusted) so we can reconcile against it as well as
-        # checking PL68 vs BS19. The data_only re-read picks up the cached
-        # H value when present; if not (most common after openpyxl saves
-        # without a recalculation cycle) we fall back to summing the
-        # quarter columns C:G which always store numeric values.
-        bdo_ground_truth: Optional[float] = None
-        bdo_cfg = rules.get('bdo', {})
-        data_col = bdo_cfg.get('data_column', 8)
-        q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
-        label_cols = bdo_cfg.get('label_scan_columns', [1, 2])
-        try:
-            wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
-            try:
-                bdo_sheet = None
-                for sn in wb_data.sheetnames:
-                    if sn == self.config.bdo_sheet_name:
-                        bdo_sheet = wb_data[sn]
-                        break
-                if bdo_sheet is not None:
-                    target_row = None
-                    for row_idx in range(1, min(bdo_sheet.max_row + 1, 200)):
-                        for col in label_cols:
-                            label = bdo_sheet.cell(row=row_idx, column=col).value
-                            if isinstance(label, str) and 'resultaat na belasting' in label.lower():
-                                target_row = row_idx
-                                break
-                        if target_row is not None:
-                            break
-
-                    if target_row is not None:
-                        # Preferred: the cached column H value (LTM total).
-                        h_val = bdo_sheet.cell(row=target_row, column=data_col).value
-                        if isinstance(h_val, (int, float)):
-                            bdo_ground_truth = -float(h_val)
-                        else:
-                            # Fallback: sum the quarter columns (and the
-                            # opening-balance column where present). For
-                            # Resultaat na belasting this matches column H
-                            # because H = SUM(C:G) for that row.
-                            running = 0.0
-                            cols_for_sum = list(range(3, q_cols[-1] + 1)) if q_cols else [3, 4, 5, 6, 7]
-                            saw_value = False
-                            for col_idx in cols_for_sum:
-                                v = bdo_sheet.cell(row=target_row, column=col_idx).value
-                                if isinstance(v, (int, float)):
-                                    running += float(v)
-                                    saw_value = True
-                            if saw_value:
-                                bdo_ground_truth = -running
-            finally:
-                wb_data.close()
-        except Exception as e:
-            logger.warning(f"[AI Verify] BDO ground-truth read failed: {e}")
-
+        # checking PL68 vs BS19. ``_read_bdo_ground_truth`` handles the
+        # data_only cache-miss fallback (sum of C:G when H is not cached).
+        bdo_ground_truth = self._read_bdo_ground_truth(
+            workbook_path, rules, use_ltm=True
+        )
         report['bdo_ground_truth'] = bdo_ground_truth
 
-        # Prefer the cheap path: pre-computed values from the MA builder.
-        if computed_values:
-            pl68 = computed_values.get((dep_row, 'ltm'), 0.0)
-            bs19 = computed_values.get((auth_row, 'ltm'), 0.0)
-            report['auth_row_value'] = bs19
-            report['dep_row_value'] = pl68
-            internal_diff = abs(pl68 - bs19)
-            internal_passed = internal_diff <= tolerance
+        # Primary path: evaluate the actual workbook formulas in column AD
+        # against BDO column H (and AC against G for symmetry). This used
+        # to short-circuit on the pre-computed `computed_values` cache,
+        # but that cache was being overwritten by `_enforce_bdo_alignment`
+        # to BDO H itself, which turned the comparison into a tautology
+        # (the cache and the ground-truth were the same number, so the
+        # check passed regardless of what formulas were actually in the
+        # workbook). The only authoritative answer is what the LTM column
+        # formulas in the saved workbook evaluate to.
+        try:
+            from .management_accounts import ManagementAccountsBuilder
+            eval_quarter = ManagementAccountsBuilder.evaluate_ma_column_from_formulas(
+                workbook_path,
+                self.config.summary_sheet_name,
+                self.config.bdo_sheet_name,
+                column_scope='quarter',
+                rules=rules,
+            )
+            eval_ltm = ManagementAccountsBuilder.evaluate_ma_column_from_formulas(
+                workbook_path,
+                self.config.summary_sheet_name,
+                self.config.bdo_sheet_name,
+                column_scope='ltm',
+                rules=rules,
+            )
+        except Exception as exc:
+            logger.warning(f"[AI Verify] Formula evaluator failed: {exc}")
+            eval_quarter = None
+            eval_ltm = None
+
+        if eval_ltm is not None:
+            ltm_values = eval_ltm.get('values') or {}
+            ltm_pl68 = ltm_values.get(dep_row)
+            ltm_bs19 = ltm_values.get(auth_row)
+            report['evaluated_ltm'] = ltm_values
+            report['evaluated_quarter'] = (
+                eval_quarter.get('values') if eval_quarter else None
+            )
+            report['auth_row_value'] = ltm_bs19
+            report['dep_row_value'] = ltm_pl68
+
+            internal_passed = True
+            internal_diff = None
+            if isinstance(ltm_pl68, (int, float)) and isinstance(ltm_bs19, (int, float)):
+                internal_diff = abs(float(ltm_pl68) - float(ltm_bs19))
+                internal_passed = internal_diff <= tolerance
+
             ground_passed = True
             ground_diff = None
-            if bdo_ground_truth is not None:
+            if bdo_ground_truth is not None and isinstance(ltm_pl68, (int, float)) \
+                    and isinstance(ltm_bs19, (int, float)):
                 ground_diff = max(
-                    abs(pl68 - bdo_ground_truth),
-                    abs(bs19 - bdo_ground_truth),
+                    abs(float(ltm_pl68) - bdo_ground_truth),
+                    abs(float(ltm_bs19) - bdo_ground_truth),
                 )
                 ground_passed = ground_diff <= tolerance
+
+            # Symmetric quarter cross-check: AC68 must equal -BDO G on
+            # Resultaat na belasting (negation handled by report-level
+            # `bdo_ground_truth_quarter`). We log it but only fail the
+            # round on quarter mismatches when we actually have a number.
+            quarter_diff = None
+            quarter_passed = True
+            bdo_ground_truth_quarter = self._read_bdo_ground_truth(
+                workbook_path, rules, use_ltm=False
+            )
+            report['bdo_ground_truth_quarter'] = bdo_ground_truth_quarter
+            if (
+                eval_quarter is not None
+                and bdo_ground_truth_quarter is not None
+            ):
+                q_pl68 = (eval_quarter.get('values') or {}).get(dep_row)
+                if isinstance(q_pl68, (int, float)):
+                    quarter_diff = abs(float(q_pl68) - bdo_ground_truth_quarter)
+                    quarter_passed = quarter_diff <= tolerance
+
             ltm_parity_passed = not bool(report.get('ltm_row_mismatches'))
-            passed = internal_passed and ground_passed and ltm_parity_passed
+            passed = (
+                internal_passed
+                and ground_passed
+                and ltm_parity_passed
+                and quarter_passed
+            )
             logger.info(
-                f"[AI Verify] Re-validation (computed_values): "
-                f"PL68={pl68:,.2f}, BS19={bs19:,.2f}, "
-                f"internal_diff={internal_diff:,.2f}, "
-                f"bdo_ground_truth={bdo_ground_truth}, "
+                f"[AI Verify] Re-validation (formula eval): "
+                f"AD{auth_row}={ltm_bs19}, AD{dep_row}={ltm_pl68}, "
+                f"internal_diff={internal_diff}, "
+                f"bdo_gt_ltm={bdo_ground_truth}, "
                 f"ground_diff={ground_diff}, "
+                f"bdo_gt_qtr={bdo_ground_truth_quarter}, "
+                f"quarter_diff={quarter_diff}, "
                 f"ltm_parity_passed={ltm_parity_passed}, "
                 f"passed={passed}"
             )
-            if not internal_passed:
+            if not internal_passed and internal_diff is not None:
                 report['failure_reasons'].append(
-                    f"PL{dep_row}={pl68:,.2f} and BS{auth_row}={bs19:,.2f} "
-                    f"differ by {internal_diff:,.2f} (> tolerance "
-                    f"{tolerance:.2f})"
+                    f"AD{dep_row}={ltm_pl68:,.2f} and AD{auth_row}="
+                    f"{ltm_bs19:,.2f} differ by {internal_diff:,.2f} "
+                    f"(> tolerance {tolerance:.2f}) when the LTM "
+                    f"formulas are evaluated against BDO column H."
                 )
             if not ground_passed and bdo_ground_truth is not None:
                 report['failure_reasons'].append(
-                    f"Neither PL{dep_row} nor BS{auth_row} reconciles "
-                    f"with BDO Resultaat na belasting "
-                    f"(sign-adjusted={bdo_ground_truth:,.2f}); max "
-                    f"divergence {ground_diff:,.2f} > tolerance "
-                    f"{tolerance:.2f}"
+                    f"Evaluated LTM column does not reconcile with BDO "
+                    f"Resultaat na belasting (sign-adjusted="
+                    f"{bdo_ground_truth:,.2f}); max divergence "
+                    f"{ground_diff:,.2f} > tolerance {tolerance:.2f}. "
+                    f"Verify each AD row uses the correct BDO H row."
+                )
+            if (
+                not quarter_passed
+                and bdo_ground_truth_quarter is not None
+                and quarter_diff is not None
+            ):
+                report['failure_reasons'].append(
+                    f"Evaluated quarter column AC{dep_row} does not "
+                    f"reconcile with BDO Resultaat na belasting "
+                    f"(sign-adjusted={bdo_ground_truth_quarter:,.2f}); "
+                    f"diff={quarter_diff:,.2f} > tolerance "
+                    f"{tolerance:.2f}."
                 )
             report['passed'] = passed
             return report

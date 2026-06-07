@@ -346,6 +346,18 @@ class ManagementAccountsBuilder:
         # can read values without evaluating Excel formulas.
         # Structure: {(row, 'quarter'): float, (row, 'ltm'): float}
         self.computed_values: Dict[Tuple[int, str], float] = {}
+
+        # BDO Resultaat na belasting ground-truth values (sign-adjusted).
+        # Populated by _enforce_bdo_alignment for use by validators and the
+        # AI verification revalidator. NEVER substituted into computed_values
+        # (rows 19/68) — those must stay formula-derived so the
+        # downstream pass/fail check actually validates the workbook
+        # formulas rather than tautologically comparing the cache to itself.
+        # Structure: {'ltm': float | None, 'quarter': float | None}
+        self.bdo_ground_truth: Dict[str, Optional[float]] = {
+            'ltm': None,
+            'quarter': None,
+        }
         
         # Sheets that must never be modified (existing BDO/kwartaal sheets)
         self._protected_sheets: set = set()
@@ -1807,6 +1819,78 @@ class ManagementAccountsBuilder:
         self._update_bank_account_overview_section(sheet, ltm_col)
         self._enforce_identity_formula(sheet, ltm_col)
         self._apply_interest_section_overrides(sheet, new_quarter_col, ltm_col)
+
+        # 7) Deterministic AC -> AD mirror. After step 2 wrote LTM
+        #    formulas from templates, this re-syncs every BS / P&L / bank
+        #    upstream row to whatever is in the freshly-built quarter
+        #    column, with G -> H swapped. Rows owned by other writers
+        #    (totals, identity row, interest section, cash proceeds) are
+        #    skipped. This guarantees that any row Claude later patches
+        #    in AC will also be reflected in AD even if Claude forgets
+        #    to emit the paired patch — see formula_mirror.py for the
+        #    shared transformation logic.
+        self._mirror_quarter_to_ltm(sheet, new_quarter_col, ltm_col)
+
+    def _mirror_quarter_to_ltm(self, sheet, quarter_col: int, ltm_col: int) -> None:
+        """
+        Deterministically derive every LTM-column upstream formula from
+        the quarter-column formula by swapping BDO column G -> H and
+        in-sheet column AC -> AD (or whatever the actual letters are).
+
+        Skipped rows are owned by other writers and must keep their own
+        formula:
+        - identity totals (rows 19, 68)
+        - interest consolidation row + absorbed sub-rows (60, 61, 64)
+        - cash proceeds (row 50) — manual_with_ltm has asymmetric LTM
+          structure (rolling 4-quarter SUM)
+        - bank total row (114) — LTM is a SUM of bank rows, not a BDO ref
+        """
+        from .formula_mirror import mirror_quarter_column_to_ltm
+
+        layout = self._rules.get('layout', {})
+        bs_range = layout.get('balance_sheet_rows', [3, 19])
+        pl_range = layout.get('profit_loss_rows', [23, 68])
+        bank_range = layout.get('bank_rows', [107, 114])
+        identity = self._rules.get('identity_alignment', {})
+        auth_row = identity.get('authoritative_row', 19)
+        dep_row = identity.get('dependent_row', 68)
+        interest = self._rules.get('interest_section', {})
+        skip_rows: set = {
+            auth_row,
+            dep_row,
+            layout.get('cash_proceeds_row', 50),
+            self._rules.get('bank_total_row', bank_range[1]),
+            interest.get('management_row', 60),
+        }
+        skip_rows.update(interest.get('absorbed_rows', []) or [])
+
+        rows = (
+            list(range(bs_range[0], bs_range[1] + 1))
+            + list(range(pl_range[0], pl_range[1] + 1))
+            + list(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        bdo_cfg = self._rules.get('bdo', {})
+        q_cols_cfg = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
+        last_q_col = q_cols_cfg[-1] if q_cols_cfg else 7
+        bdo_qtr_letter = get_column_letter(last_q_col)
+        bdo_h_letter = get_column_letter(bdo_cfg.get('data_column', 8))
+
+        rewrites = mirror_quarter_column_to_ltm(
+            sheet,
+            quarter_col=quarter_col,
+            ltm_col=ltm_col,
+            bdo_sheet_name=self.config.bdo_sheet_name,
+            bdo_quarter_letter=bdo_qtr_letter,
+            bdo_data_letter=bdo_h_letter,
+            rows=rows,
+            skip_rows=skip_rows,
+        )
+        if rewrites:
+            logger.info(
+                f"[LTM mirror] Re-mirrored {len(rewrites)} row(s) from "
+                f"quarter column to LTM (G->H, AC->AD swap)"
+            )
 
     def _validate_ltm_column_formulas(self, sheet) -> Dict[str, Any]:
         """
@@ -3789,15 +3873,27 @@ class ManagementAccountsBuilder:
             effective_raw = None
             source = "none"
 
+        # Persist sign-adjusted BDO totals separately for revalidation /
+        # logging. Earlier versions wrote these straight into
+        # `computed_values[(19,'ltm')]` and `[(68,'ltm')]`, which silently
+        # turned the downstream pass/fail check into a tautology: the AI
+        # revalidator was comparing those cached numbers against the same
+        # BDO H value they had been derived from, so the loop could PASS
+        # even when the actual Excel formulas in column AD did not
+        # evaluate to the BDO ground truth. Keep the cache derived from
+        # the formula templates (set by _populate_computed_values) so the
+        # cross-check stays meaningful.
         if effective_raw is not None:
             bdo_ltm = round(-effective_raw, 2)
             logger.info(
                 f"[BDO Align] LTM ground truth={bdo_ltm:,.2f} (source: {source})"
             )
-            self.computed_values[(auth_row, 'ltm')] = bdo_ltm
-            self.computed_values[(dep_row, 'ltm')] = bdo_ltm
+            self.bdo_ground_truth['ltm'] = bdo_ltm
         else:
             logger.warning("[BDO Align] Cannot determine LTM ground truth")
+
+        if bdo_qtr_raw is not None:
+            self.bdo_ground_truth['quarter'] = round(-bdo_qtr_raw, 2)
 
         summary_name = self.config.summary_sheet_name
         if summary_name not in self.workbook.sheetnames:
@@ -4191,6 +4287,58 @@ class ManagementAccountsBuilder:
                 "BDO ground truth: Could not locate 'Resultaat na belasting' row in BDO sheet"
             )
         
+        # --- Pass 1c: LTM shadow vs BDO column H ---
+        # The quarter-style shadow_pl above uses use_closing=False (D-G
+        # mutation values). Run a second shadow pass with use_closing=True
+        # so we can compare the LTM-side P&L total against BDO column H
+        # on Resultaat na belasting at build time. Without this any LTM
+        # row-mapping error stays invisible until the AI verifier runs —
+        # surfacing it here gives an early signal for the deterministic
+        # LTM mirror to repair.
+        try:
+            shadow_pl_ltm = self._compute_shadow_pl(bdo_result, use_closing=True)
+            shadow_bs_ltm = self._compute_shadow_bs(bdo_result)
+            ltm_dr = shadow_pl_ltm.get(68, {}).get('value', 0.0)
+            ltm_em = shadow_bs_ltm.get(19, {}).get('value', 0.0)
+            validation['shadow_pl_ltm'] = shadow_pl_ltm
+            validation['ltm_direct_result_shadow'] = ltm_dr
+            validation['ltm_equity_movement_shadow'] = ltm_em
+
+            bdo_resultaat_h_raw = self._read_bdo_resultaat_na_belasting(use_ltm=True)
+            if bdo_resultaat_h_raw is not None:
+                bdo_h = -bdo_resultaat_h_raw
+                validation['bdo_resultaat_h'] = bdo_h
+                ltm_diff_dr = abs(bdo_h - ltm_dr)
+                ltm_diff_em = abs(bdo_h - ltm_em)
+                if ltm_diff_dr > tolerance or ltm_diff_em > tolerance:
+                    validation['is_aligned'] = False
+                    msg = (
+                        f"LTM shadow check: BDO column H (Resultaat na "
+                        f"belasting) sign-adjusted = {bdo_h:,.2f}; "
+                        f"shadow PL68 (use_closing=True) = {ltm_dr:,.2f} "
+                        f"(Δ={ltm_diff_dr:,.2f}); shadow BS19 = "
+                        f"{ltm_em:,.2f} (Δ={ltm_diff_em:,.2f})"
+                    )
+                    validation['messages'].append(msg)
+                    logger.warning(f"VALIDATION WARNING: {msg}")
+                    for r in sorted(shadow_pl_ltm.keys()):
+                        if r in (66, 68):
+                            continue
+                        codes = shadow_pl_ltm[r].get('missing_codes') or []
+                        if codes:
+                            validation['messages'].append(
+                                f"LTM shadow row {r} "
+                                f"({shadow_pl_ltm[r].get('label')}): "
+                                f"missing accounts {', '.join(codes)}"
+                            )
+                else:
+                    logger.info(
+                        f"LTM shadow check passed: BDO H={bdo_h:,.2f} ≈ "
+                        f"DR_LTM={ltm_dr:,.2f} ≈ EM_LTM={ltm_em:,.2f}"
+                    )
+        except Exception as exc:
+            logger.warning(f"LTM shadow check failed (non-fatal): {exc}")
+
         # --- Pass 2: Structural formula check ---
         formula_ok = self._validate_structural_formulas(validation)
         
@@ -4446,6 +4594,156 @@ class ManagementAccountsBuilder:
         
         return all_ok
     
+    @staticmethod
+    def _read_bdo_resultaat_h(
+        workbook_path: str,
+        bdo_sheet_name: str,
+    ) -> Optional[float]:
+        """
+        Read the sign-adjusted "Resultaat na belasting" total from BDO
+        column H in the saved workbook. Returns None when the row or H
+        value cannot be resolved.
+
+        Used by the post-AI orchestrator refresh to compare the
+        evaluator's LTM totals against the authoritative BDO ground
+        truth before snapping ``computed_values``.
+        """
+        wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
+        try:
+            if bdo_sheet_name not in wb_data.sheetnames:
+                return None
+            sheet = wb_data[bdo_sheet_name]
+            target_row = None
+            for row_idx in range(1, min(sheet.max_row + 1, 200)):
+                for col in (1, 2):
+                    label = sheet.cell(row=row_idx, column=col).value
+                    if (
+                        isinstance(label, str)
+                        and 'resultaat na belasting' in label.lower()
+                    ):
+                        target_row = row_idx
+                        break
+                if target_row is not None:
+                    break
+            if target_row is None:
+                return None
+            h_val = sheet.cell(row=target_row, column=8).value
+            if isinstance(h_val, (int, float)):
+                return -float(h_val)
+            running = 0.0
+            saw = False
+            for col_idx in range(3, 8):
+                v = sheet.cell(row=target_row, column=col_idx).value
+                if isinstance(v, (int, float)):
+                    running += float(v)
+                    saw = True
+            return -running if saw else None
+        finally:
+            wb_data.close()
+
+    @staticmethod
+    def evaluate_ma_column_from_formulas(
+        workbook_path: str,
+        summary_sheet_name: str,
+        bdo_sheet_name: str,
+        column_scope: str = 'ltm',
+        rules: Optional[dict] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Evaluate the actual formulas in the Management Cijfers quarter or
+        LTM column against BDO column G/H respectively.
+
+        This is the authoritative pass/fail signal for the AI verification
+        loop and the post-AI orchestrator refresh — earlier versions
+        compared a pre-computed cache that had been overwritten with the
+        BDO ground truth itself, which made the check tautological.
+
+        Args:
+            workbook_path: path to the saved .xlsx file.
+            summary_sheet_name: e.g. ``"Management Cijfers - Q1 2026"``.
+            bdo_sheet_name: current BDO sheet (e.g. ``"BDO - Q1-26"``).
+            column_scope: ``"ltm"`` or ``"quarter"``.
+            rules: pre-loaded accounting rules (optional; loaded from
+                ``config/accounting_rules.yaml`` when omitted).
+
+        Returns ``{"values": {row: float}, "unresolved": [...],
+        "column": int, "scope": "ltm"|"quarter"}`` or ``None`` when the
+        target column cannot be resolved.
+        """
+        from .formula_mirror import evaluate_ma_column
+
+        if rules is None:
+            rules_path = Path("config/accounting_rules.yaml")
+            if rules_path.exists():
+                try:
+                    with open(rules_path, 'r', encoding='utf-8') as f:
+                        rules = yaml.safe_load(f) or {}
+                except Exception:
+                    rules = {}
+            else:
+                rules = {}
+
+        layout_cfg = rules.get('layout', {})
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_range = layout_cfg.get('bank_rows', [107, 114])
+        header_row = layout_cfg.get('header_row', 22)
+
+        rows_of_interest = (
+            list(range(bs_range[0], bs_range[1] + 1))
+            + list(range(pl_range[0], pl_range[1] + 1))
+            + list(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        wb = openpyxl.load_workbook(workbook_path, data_only=False)
+        try:
+            sheet = (
+                wb[summary_sheet_name]
+                if summary_sheet_name in wb.sheetnames else None
+            )
+            if sheet is None:
+                for sn in wb.sheetnames:
+                    if 'Management Cijfers' in sn:
+                        sheet = wb[sn]
+                        break
+            if sheet is None:
+                return None
+
+            layout = scan_summary_column_layout(sheet, header_row)
+            ltm_col = layout.ltm_column
+            quarter_col = layout.last_quarter_column
+
+            # Try to align with the active quarter from the sheet name
+            # (``Management Cijfers - Q1 2026`` -> ``Q1 2026``) when the
+            # sheet has multiple quarter headers.
+            if sheet.title and ' - ' in sheet.title:
+                quarter_label = sheet.title.split(' - ', 1)[1].strip()
+                aligned = find_column_by_header_label(
+                    sheet, quarter_label, header_row
+                )
+                if aligned:
+                    quarter_col = aligned
+                    ltm_col = find_ltm_column_near_quarter(
+                        sheet, quarter_col, header_row
+                    ) or ltm_col
+
+            target_col = ltm_col if column_scope == 'ltm' else quarter_col
+            if not target_col:
+                return None
+        finally:
+            wb.close()
+
+        result = evaluate_ma_column(
+            workbook_path,
+            summary_sheet_name=summary_sheet_name,
+            bdo_sheet_name=bdo_sheet_name,
+            target_col=target_col,
+            rows_of_interest=rows_of_interest,
+        )
+        result['column'] = target_col
+        result['scope'] = column_scope
+        return result
+
     def _add_validation_warning_to_sheet(self, messages: list):
         """Write visible red warning rows in Management Cijfers if validation fails."""
         summary_sheets = [name for name in self.workbook.sheetnames

@@ -319,20 +319,76 @@ class QuarterlyReportOrchestrator:
                 wb.close()
                 return computed_values
 
-            auth_val = mc_sheet.cell(row=auth_row, column=ltm_col).value
-            dep_val = mc_sheet.cell(row=dep_row, column=ltm_col).value
+            mc_sheet_name = mc_sheet.title
             wb.close()
 
-            def _to_num(v):
-                if v is None:
-                    return None
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    return None
+            # Resolve the BDO sheet name from the workbook (the LTM
+            # ground-truth lives in BDO column H of "Resultaat na
+            # belasting"). Without this we cannot trust the on-disk cache
+            # alone — earlier versions blindly snapped both totals to
+            # whatever data_only returned even when those numbers did
+            # not reconcile with BDO H, masking the very LTM bug we are
+            # trying to surface.
+            wb_meta = _openpyxl.load_workbook(str(ma_path), data_only=False)
+            bdo_sheet_name = None
+            for sn in wb_meta.sheetnames:
+                if sn.startswith('BDO'):
+                    bdo_sheet_name = sn
+                    break
+            wb_meta.close()
 
-            auth_num = _to_num(auth_val)
-            dep_num = _to_num(dep_val)
+            from .transformers.management_accounts import (
+                ManagementAccountsBuilder,
+            )
+
+            eval_ltm: dict = {}
+            if bdo_sheet_name:
+                try:
+                    eval_result = (
+                        ManagementAccountsBuilder
+                        .evaluate_ma_column_from_formulas(
+                            str(ma_path),
+                            mc_sheet_name,
+                            bdo_sheet_name,
+                            column_scope='ltm',
+                        )
+                    )
+                    if eval_result and eval_result.get('values'):
+                        eval_ltm = eval_result['values']
+                except Exception as exc:
+                    logger.warning(
+                        f"Post-AI refresh: LTM formula evaluator failed "
+                        f"({exc}); falling back to data_only cache"
+                    )
+
+            auth_num = eval_ltm.get(auth_row)
+            dep_num = eval_ltm.get(dep_row)
+
+            if auth_num is None or dep_num is None:
+                wb_data = _openpyxl.load_workbook(str(ma_path), data_only=True)
+                fallback_sheet = None
+                for sn in wb_data.sheetnames:
+                    if sn == mc_sheet_name:
+                        fallback_sheet = wb_data[sn]
+                        break
+                if fallback_sheet is not None:
+                    if auth_num is None:
+                        v = fallback_sheet.cell(
+                            row=auth_row, column=ltm_col
+                        ).value
+                        try:
+                            auth_num = float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            auth_num = None
+                    if dep_num is None:
+                        v = fallback_sheet.cell(
+                            row=dep_row, column=ltm_col
+                        ).value
+                        try:
+                            dep_num = float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            dep_num = None
+                wb_data.close()
 
             if auth_num is not None and dep_num is not None:
                 diff = abs(auth_num - dep_num)
@@ -344,28 +400,55 @@ class QuarterlyReportOrchestrator:
                     logger.warning(msg)
                     results.setdefault('warnings', []).append(msg)
 
+                # Compare against BDO Resultaat na belasting (column H,
+                # sign-adjusted) as the authoritative LTM target. Warn
+                # but still pass the evaluated values back so downstream
+                # consumers see the numbers that actually live in the
+                # saved workbook.
+                if bdo_sheet_name:
+                    try:
+                        bdo_gt = ManagementAccountsBuilder._read_bdo_resultaat_h(
+                            str(ma_path), bdo_sheet_name
+                        )
+                    except Exception:
+                        bdo_gt = None
+                    if bdo_gt is not None:
+                        gt_diff = max(
+                            abs(auth_num - bdo_gt),
+                            abs(dep_num - bdo_gt),
+                        )
+                        if gt_diff > max(max_snap, 1.0):
+                            msg = (
+                                f"Post-AI check: LTM totals "
+                                f"{auth_num}/{dep_num} do not match BDO "
+                                f"Resultaat na belasting "
+                                f"(sign-adjusted={bdo_gt}); "
+                                f"diff={gt_diff}"
+                            )
+                            logger.warning(msg)
+                            results.setdefault('warnings', []).append(msg)
+
                 computed_values[(auth_row, 'ltm')] = auth_num
-                computed_values[(dep_row, 'ltm')] = auth_num
+                computed_values[(dep_row, 'ltm')] = dep_num
 
             elif auth_num is not None:
-                # dep_row was a formula (=COLauth_row) that data_only
-                # couldn't resolve — mirror the authoritative value
                 logger.info(
-                    f"Post-AI refresh: row {dep_row} returned None "
-                    f"(formula cell); setting to row {auth_row}={auth_num}")
+                    f"Post-AI refresh: row {dep_row} could not be "
+                    f"evaluated; using row {auth_row}={auth_num} for both"
+                )
                 computed_values[(auth_row, 'ltm')] = auth_num
                 computed_values[(dep_row, 'ltm')] = auth_num
 
             else:
-                # Both None — openpyxl couldn't read cached values.
-                # Fall back to computed_values and enforce identity.
                 enforce_wb = align.get('enforce_in_workbook', False)
                 cv_auth = computed_values.get((auth_row, 'ltm'))
                 if enforce_wb and cv_auth is not None:
                     logger.info(
-                        f"Post-AI refresh: file values unavailable; "
-                        f"enforcing identity from cache: "
-                        f"row {dep_row} LTM = row {auth_row} LTM = {cv_auth}")
+                        f"Post-AI refresh: evaluator and cache both "
+                        f"unavailable; enforcing identity from prior "
+                        f"computed_values: row {dep_row} LTM = "
+                        f"row {auth_row} LTM = {cv_auth}"
+                    )
                     computed_values[(dep_row, 'ltm')] = cv_auth
 
         except Exception as e:
