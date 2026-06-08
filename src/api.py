@@ -94,8 +94,32 @@ class AIVerificationStatus(BaseModel):
     status: str = "skipped"
     patches_applied: int = 0
     revalidation_passed: bool = False
+    preflight_passed: bool = False
+    postflight_passed: bool = False
+    claude_rounds: int = 0
     issues_found: int = 0
     notes: str = ""
+    timing: Optional[dict] = None
+    evaluated_ad19: Optional[float] = None
+    evaluated_ad68: Optional[float] = None
+    bdo_ground_truth_ltm: Optional[float] = None
+    bdo_ground_truth_quarter: Optional[float] = None
+    ltm_row_mismatch_count: int = 0
+    ltm_col_letter: Optional[str] = None
+    quarter_col_letter: Optional[str] = None
+
+
+class PostAIReconciliationStatus(BaseModel):
+    """Formula-evaluator reconciliation on the final saved workbook."""
+    passed: bool = False
+    auth_row_value: Optional[float] = None
+    dep_row_value: Optional[float] = None
+    bdo_ground_truth_ltm: Optional[float] = None
+    bdo_ground_truth_quarter: Optional[float] = None
+    ltm_col_letter: Optional[str] = None
+    quarter_col_letter: Optional[str] = None
+    ltm_row_mismatch_count: int = 0
+    ltm_row_mismatches: Optional[List[dict]] = None
 
 
 class GenerateResponse(BaseModel):
@@ -110,6 +134,7 @@ class GenerateResponse(BaseModel):
     errors: Optional[List[str]] = None
     execution_time_seconds: Optional[float] = None
     ai_verification: Optional[AIVerificationStatus] = None
+    post_ai_reconciliation: Optional[PostAIReconciliationStatus] = None
 
 
 class GenerateAccountsRequest(BaseModel):
@@ -235,14 +260,46 @@ def _extract_ai_verification(result: dict) -> Optional[AIVerificationStatus]:
     """Extract AI verification status from orchestrator results."""
     ai_step = result.get('steps', {}).get('ai_verification')
     if ai_step:
+        pf = ai_step.get('postflight_report') or {}
         return AIVerificationStatus(
             status=ai_step.get('status', 'skipped'),
             patches_applied=ai_step.get('patches_applied', 0),
             revalidation_passed=ai_step.get('revalidation_passed', False),
+            preflight_passed=ai_step.get('preflight_passed', False),
+            postflight_passed=ai_step.get('postflight_passed', False),
+            claude_rounds=ai_step.get('claude_rounds', 0),
             issues_found=ai_step.get('issues_found', 0),
             notes=ai_step.get('notes', ''),
+            timing=ai_step.get('timing'),
+            evaluated_ad19=pf.get('auth_row_value'),
+            evaluated_ad68=pf.get('dep_row_value'),
+            bdo_ground_truth_ltm=pf.get('bdo_ground_truth'),
+            bdo_ground_truth_quarter=pf.get('bdo_ground_truth_quarter'),
+            ltm_row_mismatch_count=len(pf.get('ltm_row_mismatches') or []),
+            ltm_col_letter=pf.get('ltm_col_letter'),
+            quarter_col_letter=pf.get('quarter_col_letter'),
         )
     return None
+
+
+def _extract_post_ai_reconciliation(
+    result: dict,
+) -> Optional[PostAIReconciliationStatus]:
+    """Extract post-AI formula-evaluator reconciliation from orchestrator results."""
+    step = result.get('steps', {}).get('post_ai_reconciliation')
+    if not step:
+        return None
+    return PostAIReconciliationStatus(
+        passed=bool(step.get('passed')),
+        auth_row_value=step.get('auth_row_value'),
+        dep_row_value=step.get('dep_row_value'),
+        bdo_ground_truth_ltm=step.get('bdo_ground_truth_ltm'),
+        bdo_ground_truth_quarter=step.get('bdo_ground_truth_quarter'),
+        ltm_col_letter=step.get('ltm_col_letter'),
+        quarter_col_letter=step.get('quarter_col_letter'),
+        ltm_row_mismatch_count=step.get('ltm_row_mismatch_count', 0),
+        ltm_row_mismatches=step.get('ltm_row_mismatches'),
+    )
 
 
 def _extract_named_paths(result: dict) -> dict:
@@ -356,6 +413,7 @@ async def generate_report(request: GenerateRequest):
         
         # Build response
         ai_verification = _extract_ai_verification(result)
+        post_ai_reconciliation = _extract_post_ai_reconciliation(result)
         named = _extract_named_paths(result)
 
         if result.get('status') == 'success':
@@ -370,6 +428,7 @@ async def generate_report(request: GenerateRequest):
                 errors=[],
                 execution_time_seconds=execution_time,
                 ai_verification=ai_verification,
+                post_ai_reconciliation=post_ai_reconciliation,
             )
         else:
             return GenerateResponse(
@@ -381,6 +440,7 @@ async def generate_report(request: GenerateRequest):
                 errors=result.get('errors', []),
                 execution_time_seconds=execution_time,
                 ai_verification=ai_verification,
+                post_ai_reconciliation=post_ai_reconciliation,
             )
             
     except HTTPException:
@@ -506,6 +566,7 @@ async def generate_accounts(request: GenerateAccountsRequest):
         execution_time = (datetime.now() - start_time).total_seconds()
         
         ai_verification = _extract_ai_verification(result)
+        post_ai_reconciliation = _extract_post_ai_reconciliation(result)
         named = _extract_named_paths(result)
 
         if result.get('status') == 'success':
@@ -520,6 +581,7 @@ async def generate_accounts(request: GenerateAccountsRequest):
                 errors=[],
                 execution_time_seconds=execution_time,
                 ai_verification=ai_verification,
+                post_ai_reconciliation=post_ai_reconciliation,
             )
         else:
             return GenerateResponse(
@@ -531,6 +593,7 @@ async def generate_accounts(request: GenerateAccountsRequest):
                 errors=result.get('errors', []),
                 execution_time_seconds=execution_time,
                 ai_verification=ai_verification,
+                post_ai_reconciliation=post_ai_reconciliation,
             )
             
     except HTTPException:

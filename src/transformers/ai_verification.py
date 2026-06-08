@@ -73,6 +73,8 @@ class VerificationResult:
     postflight_passed: bool = False
     claude_rounds: int = 0
     timing: Dict[str, float] = field(default_factory=dict)
+    # Structured post-flight re-validator output (formula evaluator).
+    postflight_report: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -2515,6 +2517,7 @@ class AIVerificationOrchestrator:
                 revalidation_report.get('passed')
             ) if revalidation_report else (cumulative_patches_applied == 0)
             result.postflight_passed = result.revalidation_passed
+            result.postflight_report = revalidation_report if revalidation_report else {}
             result.claude_rounds = claude_rounds
             result.timing = timings
             if not last_patches and cumulative_patches_applied == 0:

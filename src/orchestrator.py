@@ -223,6 +223,7 @@ class QuarterlyReportOrchestrator:
                 'timing': verification.timing,
                 'issues_found': len(verification.issues),
                 'notes': verification.notes,
+                'postflight_report': verification.postflight_report,
             }
 
             if verification.error:
@@ -249,28 +250,144 @@ class QuarterlyReportOrchestrator:
 
     @staticmethod
     def _verify_and_refresh(ma_path: Path, computed_values: dict,
-                            results: dict) -> dict:
+                            results: dict,
+                            summary_sheet_name: Optional[str] = None,
+                            bdo_sheet_name: Optional[str] = None) -> dict:
         """
-        Post-AI verification: open the final xlsx, read BS19 and PL68 from
-        the LTM column, warn on mismatch, and refresh computed_values so
-        Compliance receives the numbers actually in the file.
+        Post-AI reconciliation: evaluate the final workbook formulas (all
+        rows), emit user-facing warnings, refresh computed_values for
+        Compliance, and store a structured report on ``results``.
         """
-        import openpyxl as _openpyxl
-        from openpyxl.utils import column_index_from_string as _cis
+        from .transformers.reconciliation_report import (
+            build_reconciliation_report,
+        )
 
-        rules_path = Path("config/accounting_rules.yaml")
-        align = {'authoritative_row': 19, 'dependent_row': 68, 'max_snap_units': 2}
+        rules_path = Path('config/accounting_rules.yaml')
+        rules = {}
         if rules_path.exists():
             try:
                 with open(rules_path, 'r', encoding='utf-8') as f:
                     rules = yaml.safe_load(f) or {}
-                align.update(rules.get('identity_alignment', {}))
             except Exception:
                 pass
 
-        auth_row = align['authoritative_row']
-        dep_row = align['dependent_row']
-        max_snap = align['max_snap_units']
+        align = rules.get('identity_alignment', {})
+        auth_row = align.get('authoritative_row', 19)
+        dep_row = align.get('dependent_row', 68)
+
+        try:
+            import openpyxl as _openpyxl
+
+            if not bdo_sheet_name or not summary_sheet_name:
+                wb_meta = _openpyxl.load_workbook(str(ma_path), data_only=False)
+                if not summary_sheet_name:
+                    for sn in wb_meta.sheetnames:
+                        if 'Management Cijfers' in sn:
+                            summary_sheet_name = sn
+                            break
+                if not bdo_sheet_name:
+                    for sn in wb_meta.sheetnames:
+                        if sn.startswith('BDO'):
+                            bdo_sheet_name = sn
+                            break
+                wb_meta.close()
+
+            if not bdo_sheet_name or not summary_sheet_name:
+                logger.warning(
+                    'Post-AI reconciliation skipped: could not resolve '
+                    'Management Cijfers or BDO sheet name'
+                )
+                return QuarterlyReportOrchestrator._verify_and_refresh_fallback(
+                    ma_path, computed_values, results, rules=rules,
+                )
+
+            report = build_reconciliation_report(
+                str(ma_path),
+                summary_sheet_name,
+                bdo_sheet_name,
+                rules=rules,
+            )
+            results['steps']['post_ai_reconciliation'] = {
+                'passed': report.get('passed'),
+                'auth_row_value': report.get('auth_row_value'),
+                'dep_row_value': report.get('dep_row_value'),
+                'bdo_ground_truth_ltm': report.get('bdo_ground_truth_ltm'),
+                'bdo_ground_truth_quarter': report.get(
+                    'bdo_ground_truth_quarter'
+                ),
+                'ltm_col_letter': report.get('ltm_col_letter'),
+                'quarter_col_letter': report.get('quarter_col_letter'),
+                'ltm_row_mismatch_count': len(
+                    report.get('ltm_row_mismatches') or []
+                ),
+                'ltm_row_mismatches': (
+                    report.get('ltm_row_mismatches') or []
+                )[:25],
+            }
+
+            if not report.get('passed'):
+                for msg in report.get('messages') or []:
+                    results.setdefault('warnings', []).append(msg)
+            else:
+                logger.info(
+                    '[Reconcile] Post-AI formula evaluation passed '
+                    f"({report.get('ltm_col_letter')}{auth_row}="
+                    f"{report.get('auth_row_value')}, "
+                    f"{report.get('ltm_col_letter')}{dep_row}="
+                    f"{report.get('dep_row_value')})"
+                )
+
+            auth_num = report.get('auth_row_value')
+            dep_num = report.get('dep_row_value')
+            if isinstance(auth_num, (int, float)):
+                computed_values[(auth_row, 'ltm')] = float(auth_num)
+            if isinstance(dep_num, (int, float)):
+                computed_values[(dep_row, 'ltm')] = float(dep_num)
+            elif isinstance(auth_num, (int, float)):
+                computed_values[(dep_row, 'ltm')] = float(auth_num)
+            elif auth_num is None and dep_num is None:
+                return QuarterlyReportOrchestrator._verify_and_refresh_fallback(
+                    ma_path, computed_values, results, rules=rules,
+                )
+
+        except Exception as e:
+            logger.warning(f'Post-AI reconciliation failed (non-fatal): {e}')
+
+        return computed_values
+
+    @staticmethod
+    def _verify_and_refresh_fallback(
+        ma_path: Path,
+        computed_values: dict,
+        results: dict,
+        rules: Optional[dict] = None,
+    ) -> dict:
+        """
+        Legacy fallback when the full formula-evaluator report cannot run
+        (e.g. test workbooks without a BDO sheet). Reads static cached
+        values from the LTM column via data_only.
+        """
+        import openpyxl as _openpyxl
+        from .transformers.management_accounts import (
+            find_ltm_column_near_quarter,
+            find_column_by_header_label,
+            scan_summary_column_layout,
+        )
+
+        if rules is None:
+            rules_path = Path('config/accounting_rules.yaml')
+            rules = {}
+            if rules_path.exists():
+                try:
+                    with open(rules_path, 'r', encoding='utf-8') as f:
+                        rules = yaml.safe_load(f) or {}
+                except Exception:
+                    pass
+
+        align = rules.get('identity_alignment', {})
+        auth_row = align.get('authoritative_row', 19)
+        dep_row = align.get('dependent_row', 68)
+        max_snap = align.get('max_snap_units', 2)
 
         try:
             wb = _openpyxl.load_workbook(str(ma_path), data_only=True)
@@ -283,29 +400,22 @@ class QuarterlyReportOrchestrator:
                 wb.close()
                 return computed_values
 
-            # Prefer LTM column lookup relative to the current quarter header
-            # (derived from the sheet name "Management Cijfers - Q1 2026")
-            # so we don't latch onto a stale "LTM Q4 2025" header.
-            from .transformers.management_accounts import (
-                find_ltm_column_near_quarter,
-                find_column_by_header_label,
-                scan_summary_column_layout,
-            )
-
-            ltm_col = None
             quarter_label = None
             if mc_sheet.title and ' - ' in mc_sheet.title:
                 quarter_label = mc_sheet.title.split(' - ', 1)[1].strip()
-
             quarter_col = None
             if quarter_label:
-                quarter_col = find_column_by_header_label(mc_sheet, quarter_label, 22)
+                quarter_col = find_column_by_header_label(
+                    mc_sheet, quarter_label, 22
+                )
             if not quarter_col:
                 layout = scan_summary_column_layout(mc_sheet, 22)
                 quarter_col = layout.last_quarter_column
+            ltm_col = None
             if quarter_col:
-                ltm_col = find_ltm_column_near_quarter(mc_sheet, quarter_col, 22)
-
+                ltm_col = find_ltm_column_near_quarter(
+                    mc_sheet, quarter_col, 22
+                )
             if ltm_col is None:
                 for col_idx in range(1, mc_sheet.max_column + 1):
                     hdr = mc_sheet.cell(row=22, column=col_idx).value
@@ -313,150 +423,38 @@ class QuarterlyReportOrchestrator:
                         ltm_col = col_idx
                         break
             if ltm_col is None:
-                for col_idx in range(mc_sheet.max_column, 0, -1):
-                    val = mc_sheet.cell(row=auth_row, column=col_idx).value
-                    if val is not None:
-                        ltm_col = col_idx
-                        break
+                ltm_col = 3
 
-            if ltm_col is None:
-                wb.close()
-                return computed_values
+            def _read(row: int):
+                v = mc_sheet.cell(row=row, column=ltm_col).value
+                try:
+                    return float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
 
-            mc_sheet_name = mc_sheet.title
+            auth_num = _read(auth_row)
+            dep_num = _read(dep_row)
             wb.close()
 
-            # Resolve the BDO sheet name from the workbook (the LTM
-            # ground-truth lives in BDO column H of "Resultaat na
-            # belasting"). Without this we cannot trust the on-disk cache
-            # alone — earlier versions blindly snapped both totals to
-            # whatever data_only returned even when those numbers did
-            # not reconcile with BDO H, masking the very LTM bug we are
-            # trying to surface.
-            wb_meta = _openpyxl.load_workbook(str(ma_path), data_only=False)
-            bdo_sheet_name = None
-            for sn in wb_meta.sheetnames:
-                if sn.startswith('BDO'):
-                    bdo_sheet_name = sn
-                    break
-            wb_meta.close()
-
-            from .transformers.management_accounts import (
-                ManagementAccountsBuilder,
-            )
-
-            eval_ltm: dict = {}
-            if bdo_sheet_name:
-                try:
-                    eval_result = (
-                        ManagementAccountsBuilder
-                        .evaluate_ma_column_from_formulas(
-                            str(ma_path),
-                            mc_sheet_name,
-                            bdo_sheet_name,
-                            column_scope='ltm',
-                        )
-                    )
-                    if eval_result and eval_result.get('values'):
-                        eval_ltm = eval_result['values']
-                except Exception as exc:
-                    logger.warning(
-                        f"Post-AI refresh: LTM formula evaluator failed "
-                        f"({exc}); falling back to data_only cache"
-                    )
-
-            auth_num = eval_ltm.get(auth_row)
-            dep_num = eval_ltm.get(dep_row)
-
-            if auth_num is None or dep_num is None:
-                wb_data = _openpyxl.load_workbook(str(ma_path), data_only=True)
-                fallback_sheet = None
-                for sn in wb_data.sheetnames:
-                    if sn == mc_sheet_name:
-                        fallback_sheet = wb_data[sn]
-                        break
-                if fallback_sheet is not None:
-                    if auth_num is None:
-                        v = fallback_sheet.cell(
-                            row=auth_row, column=ltm_col
-                        ).value
-                        try:
-                            auth_num = float(v) if v is not None else None
-                        except (TypeError, ValueError):
-                            auth_num = None
-                    if dep_num is None:
-                        v = fallback_sheet.cell(
-                            row=dep_row, column=ltm_col
-                        ).value
-                        try:
-                            dep_num = float(v) if v is not None else None
-                        except (TypeError, ValueError):
-                            dep_num = None
-                wb_data.close()
-
-            if auth_num is not None and dep_num is not None:
-                diff = abs(auth_num - dep_num)
-                if diff > max_snap:
-                    msg = (
-                        f"Post-AI check: row {auth_row} LTM={auth_num} vs "
-                        f"row {dep_row} LTM={dep_num} differ by {diff}"
-                    )
-                    logger.warning(msg)
-                    results.setdefault('warnings', []).append(msg)
-
-                # Compare against BDO Resultaat na belasting (column H,
-                # sign-adjusted) as the authoritative LTM target. Warn
-                # but still pass the evaluated values back so downstream
-                # consumers see the numbers that actually live in the
-                # saved workbook.
-                if bdo_sheet_name:
-                    try:
-                        bdo_gt = ManagementAccountsBuilder._read_bdo_resultaat_h(
-                            str(ma_path), bdo_sheet_name
-                        )
-                    except Exception:
-                        bdo_gt = None
-                    if bdo_gt is not None:
-                        gt_diff = max(
-                            abs(auth_num - bdo_gt),
-                            abs(dep_num - bdo_gt),
-                        )
-                        if gt_diff > max(max_snap, 1.0):
-                            msg = (
-                                f"Post-AI check: LTM totals "
-                                f"{auth_num}/{dep_num} do not match BDO "
-                                f"Resultaat na belasting "
-                                f"(sign-adjusted={bdo_gt}); "
-                                f"diff={gt_diff}"
-                            )
-                            logger.warning(msg)
-                            results.setdefault('warnings', []).append(msg)
-
+            if auth_num is not None:
                 computed_values[(auth_row, 'ltm')] = auth_num
+            if dep_num is not None:
                 computed_values[(dep_row, 'ltm')] = dep_num
 
-            elif auth_num is not None:
-                logger.info(
-                    f"Post-AI refresh: row {dep_row} could not be "
-                    f"evaluated; using row {auth_row}={auth_num} for both"
+            if (
+                auth_num is not None
+                and dep_num is not None
+                and abs(auth_num - dep_num) > max_snap
+            ):
+                msg = (
+                    f'Post-AI check (cached values): row {auth_row} LTM='
+                    f'{auth_num} vs row {dep_row} LTM={dep_num} differ by '
+                    f'{abs(auth_num - dep_num)}'
                 )
-                computed_values[(auth_row, 'ltm')] = auth_num
-                computed_values[(dep_row, 'ltm')] = auth_num
-
-            else:
-                enforce_wb = align.get('enforce_in_workbook', False)
-                cv_auth = computed_values.get((auth_row, 'ltm'))
-                if enforce_wb and cv_auth is not None:
-                    logger.info(
-                        f"Post-AI refresh: evaluator and cache both "
-                        f"unavailable; enforcing identity from prior "
-                        f"computed_values: row {dep_row} LTM = "
-                        f"row {auth_row} LTM = {cv_auth}"
-                    )
-                    computed_values[(dep_row, 'ltm')] = cv_auth
-
-        except Exception as e:
-            logger.warning(f"Post-AI verification failed (non-fatal): {e}")
+                logger.warning(msg)
+                results.setdefault('warnings', []).append(msg)
+        except Exception as exc:
+            logger.warning(f'Post-AI fallback read failed: {exc}')
 
         return computed_values
 
@@ -549,8 +547,13 @@ class QuarterlyReportOrchestrator:
             ma_ltm_col = getattr(ma_builder, '_new_ltm_col', None)
 
             ma_validation = getattr(ma_builder, 'validation_result', None)
+            # Build-time shadow warnings: internal only (see post-AI reconciliation).
             if ma_validation and not ma_validation.get('is_aligned', True):
-                results['warnings'].extend(ma_validation.get('messages', []))
+                logger.info(
+                    f"Build-time shadow validation noted "
+                    f"{len(ma_validation.get('messages', []))} message(s) "
+                    f"(internal only; see post-AI reconciliation)"
+                )
             
             results['steps']['management_accounts'] = {
                 'status': 'success',
@@ -573,7 +576,13 @@ class QuarterlyReportOrchestrator:
 
             # Step 4a.1: Post-AI verify BS19 vs PL68 and refresh computed_values
             logger.info("Step 4a.1: Post-AI identity check & computed_values refresh")
-            ma_computed_values = self._verify_and_refresh(ma_verified, ma_computed_values, results)
+            ma_computed_values = self._verify_and_refresh(
+                ma_verified,
+                ma_computed_values,
+                results,
+                summary_sheet_name=ma_config.summary_sheet_name,
+                bdo_sheet_name=ma_config.bdo_sheet_name,
+            )
             
             # Step 4b: Build Compliance Certificate
             logger.info("Step 4b: Building Compliance Certificate")
@@ -946,8 +955,13 @@ class QuarterlyReportOrchestrator:
             ma_ltm_col = getattr(ma_builder, '_new_ltm_col', None)
 
             ma_validation = getattr(ma_builder, 'validation_result', None)
+            # Build-time shadow warnings: internal only (see post-AI reconciliation).
             if ma_validation and not ma_validation.get('is_aligned', True):
-                results['warnings'].extend(ma_validation.get('messages', []))
+                logger.info(
+                    f"Build-time shadow validation noted "
+                    f"{len(ma_validation.get('messages', []))} message(s) "
+                    f"(internal only; see post-AI reconciliation)"
+                )
             
             results['steps']['management_accounts'] = {
                 'status': 'success',
@@ -970,7 +984,13 @@ class QuarterlyReportOrchestrator:
 
             # Step 4a.1: Post-AI verify BS19 vs PL68 and refresh computed_values
             logger.info("Step 4a.1: Post-AI identity check & computed_values refresh")
-            ma_computed_values = self._verify_and_refresh(ma_verified, ma_computed_values, results)
+            ma_computed_values = self._verify_and_refresh(
+                ma_verified,
+                ma_computed_values,
+                results,
+                summary_sheet_name=ma_config.summary_sheet_name,
+                bdo_sheet_name=ma_config.bdo_sheet_name,
+            )
             
             # Step 4b: Build Compliance Certificate
             logger.info("Step 4b: Building Compliance Certificate")

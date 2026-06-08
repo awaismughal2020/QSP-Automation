@@ -3582,6 +3582,29 @@ class ManagementAccountsBuilder:
 
             shadow[row_idx] = entry
 
+        # Row 19 shadow template is ``={COL}68`` (quarter-style identity)
+        # but the LTM Excel formula is ``SUM(3:18) - BDO!H_verschil``.
+        # Recompute row 19 from BS detail rows so internal validation is
+        # not stuck at 0 when row 68 is outside the BS shadow dict.
+        if 19 in shadow:
+            detail_sum = sum(
+                shadow.get(r, {}).get('value', 0.0)
+                for r in range(3, 19)
+            )
+            verschil_row = self._find_verschil_row(
+                self.workbook[self.config.bdo_sheet_name]
+                if self.config.bdo_sheet_name in self.workbook.sheetnames
+                else None
+            )
+            verschil_h = 0.0
+            if verschil_row and self.config.bdo_sheet_name in self.workbook.sheetnames:
+                bdo_sheet = self.workbook[self.config.bdo_sheet_name]
+                verschil_h = self._read_bdo_cell_value(
+                    bdo_sheet, verschil_row, 8
+                )
+            shadow[19]['value'] = detail_sum - verschil_h
+            shadow[19]['type'] = 'calc_ltm_override'
+
         logger.info(f"Shadow Balance Sheet computed for {len(shadow)} rows, "
                      f"row 19 = {shadow.get(19, {}).get('value', 'N/A')}")
         return shadow
@@ -4431,6 +4454,13 @@ class ManagementAccountsBuilder:
 
         if use_ltm:
             total = _read_cell(data_col)
+            if total == 0.0:
+                cols_for_sum = (
+                    list(range(3, q_cols[-1] + 1)) if q_cols else [3, 4, 5, 6, 7]
+                )
+                fallback = sum(_read_cell(c) for c in cols_for_sum)
+                if fallback != 0.0:
+                    total = fallback
             logger.info(
                 f"BDO ground truth (LTM): Resultaat na belasting "
                 f"(row {target_row}, col {get_column_letter(data_col)}) = {total:,.2f}")
