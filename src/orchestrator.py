@@ -217,6 +217,10 @@ class QuarterlyReportOrchestrator:
                 'status': verification.status,
                 'patches_applied': verification.patches_applied,
                 'revalidation_passed': verification.revalidation_passed,
+                'preflight_passed': verification.preflight_passed,
+                'postflight_passed': verification.postflight_passed,
+                'claude_rounds': verification.claude_rounds,
+                'timing': verification.timing,
                 'issues_found': len(verification.issues),
                 'notes': verification.notes,
             }

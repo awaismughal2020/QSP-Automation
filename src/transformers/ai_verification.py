@@ -62,6 +62,17 @@ class VerificationResult:
     validation_summary: Dict = field(default_factory=dict)
     notes: str = ""
     error: Optional[str] = None
+    # Single-Opus pipeline observability. ``preflight_passed`` is the
+    # deterministic re-validator result on the unpatched workbook (run
+    # before Claude); ``postflight_passed`` mirrors ``revalidation_passed``
+    # and is the same value evaluated after patches are applied.
+    # ``claude_rounds`` is the number of Claude calls made (1 in the
+    # default single-Opus mode; up to ``AI_VERIFY_MAX_ROUNDS`` in legacy
+    # mode). ``timing`` holds wall-clock seconds per phase for diagnostics.
+    preflight_passed: bool = False
+    postflight_passed: bool = False
+    claude_rounds: int = 0
+    timing: Dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -658,25 +669,43 @@ class VerificationPromptBuilder:
             self._executive_alignment_section(context),
             self._checks_section(context),
         ]
-        prior_failure_section = self._prior_round_failure_section(context)
-        if prior_failure_section:
-            prompt_parts.append(prior_failure_section)
+        preflight_section = self._preflight_evaluator_section(context)
+        if preflight_section:
+            prompt_parts.append(preflight_section)
         prompt_parts.append(self._response_format_section())
         return '\n\n'.join(prompt_parts)
 
-    def _prior_round_failure_section(
+    def _preflight_evaluator_section(
         self, context: Dict[str, Any]
     ) -> Optional[str]:
         """
-        Render a structured feedback block for retry rounds. Claude must
-        treat this as the most recent ground-truth signal: the previous
-        round's patches were applied but reconciliation still failed, so
-        the issue is in upstream BDO row mappings rather than the total
-        rows themselves.
+        Render the deterministic pre-flight evaluator block. The single
+        Claude call sees this *before* it runs, so it has the full
+        per-row evaluated AC/AD values, BDO ground-truth targets, and
+        the list of failing rows already laid out — the same context the
+        legacy 3-round retry loop produced on its final round.
+
+        Reads from ``context['preflight_report']`` (canonical key under
+        the single-Opus pipeline). Returns ``None`` when no pre-flight
+        data is available.
         """
-        prior = context.get('prior_round_failure')
+        prior = (
+            context.get('preflight_report')
+            or context.get('prior_round_failure')
+        )
         if not prior:
             return None
+
+        # When pre-flight has already passed there is nothing for Claude
+        # to fix from a numeric standpoint — but we still surface the
+        # evaluated values so the model can confirm its formatting and
+        # cosmetic checks against the same numbers the deterministic
+        # validator saw.
+        preflight_passed = bool(prior.get('passed'))
+        round_label = (
+            context.get('preflight_round')
+            or prior.get('round')
+        )
 
         meta = context.get('metadata', {})
         ltm = context.get('ltm_col_letter', 'AB')
@@ -728,26 +757,101 @@ class VerificationPromptBuilder:
         eval_ltm_block = _format_eval_block(eval_ltm, ltm)
         eval_q_block = _format_eval_block(eval_q, quarter)
 
+        if preflight_passed:
+            header = (
+                "PRE-FLIGHT EVALUATOR — RECONCILIATION ALREADY PASSES\n"
+                "===================================================\n"
+                "The deterministic re-validator has already evaluated "
+                "the unpatched workbook and the BDO ground-truth check "
+                "passes. Use the per-row evaluated values below as your "
+                "numeric reference; focus your remaining attention on "
+                "Check 8 (formatting) and any non-numeric anomalies. If "
+                "everything looks correct, return status \"PASS\" with "
+                "an empty issues array and an empty patches array.\n"
+            )
+            what_to_do = (
+                "WHAT TO DO NOW:\n"
+                "1. Do NOT patch any row whose evaluated value already "
+                "matches the BDO ground truth — emit a patch only when "
+                "the workbook's formula or formatting is wrong by "
+                "Checks 1–8.\n"
+                "2. The total-row formulas "
+                f"({ltm}{auth_row} and {ltm}{dep_row}) are "
+                "deterministically correct; do NOT patch them.\n"
+                "3. If you find a formatting issue (Check 8), emit a "
+                "format patch only — never a formula patch on a row "
+                "that already reconciles.\n"
+            )
+        else:
+            round_text = (
+                f" Round {round_label} feedback follows."
+                if round_label else ""
+            )
+            header = (
+                "PRE-FLIGHT EVALUATOR — RECONCILIATION FAILS\n"
+                "===========================================\n"
+                "The deterministic re-validator has already evaluated "
+                "the unpatched workbook and the BDO ground-truth check "
+                "FAILS. Treat the numbers below as authoritative — they "
+                "are computed directly from the saved workbook against "
+                "BDO columns G (quarter) and H (LTM)." + round_text + "\n"
+                f"  - {ltm}{auth_row} (Total Equity Movement) = "
+                f"{prior.get('auth_row_value')}\n"
+                f"  - {ltm}{dep_row} (Direct Result) = "
+                f"{prior.get('dep_row_value')}\n"
+                f"  - BDO ground truth LTM (sign-adjusted "
+                f"Resultaat na belasting) = "
+                f"{prior.get('bdo_ground_truth')}\n"
+                f"  - BDO ground truth quarter (sign-adjusted) = "
+                f"{prior.get('bdo_ground_truth_quarter')}\n"
+            )
+            what_to_do = (
+                "WHAT TO DO NOW:\n"
+                f"1. The total-row formulas ({ltm}{auth_row} and "
+                f"{ltm}{dep_row}) are deterministically correct; do NOT "
+                "patch them.\n"
+                f"2. The error is in upstream detail rows on the "
+                f"QUARTER column ({quarter}). Re-examine every "
+                f"bdo_ref / bdo_sum_range formula in rows "
+                f"{bs_range[0]}–{auth_row - 1} (Balance Sheet) and "
+                f"rows 23–{dep_row - 1} (P&L). For each row listed in "
+                "'LTM COLUMN ROW-BY-ROW MISMATCHES' above, emit a "
+                f"formula patch on the QUARTER column ({quarter}<row>) "
+                "with the corrected BDO reference.\n"
+                "3. AC->AD MIRROR: the LTM column is mirrored from the "
+                "quarter column automatically AFTER your patches are "
+                "applied (G->H, AC->AD). You do NOT need to emit "
+                f"separate {ltm}<row> patches — focus on fixing the "
+                f"upstream {quarter}<row> BDO mappings and the LTM "
+                "column will track. (You may still emit an LTM patch "
+                "if you spot a structural issue the mirror cannot fix.)\n"
+                "4. Search the BDO LABEL-TO-ROW MAP and BDO FULL ROW "
+                "INVENTORY for the correct row numbers — never rely on "
+                "a previously-assumed row position.\n"
+                "5. Pay special attention to the BDO VERSCHIL BALANS "
+                f"row in CONTEXT: row 19 references "
+                f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> "
+                "and the row number must be the dynamically-discovered "
+                "one, never a hardcoded value such as H134.\n"
+                "6. Emit the formula patches needed to make BOTH:\n"
+                f"   - SUM({quarter}{bs_range[0]}:{quarter}{auth_row - 1}) "
+                "reconcile with the quarter ground truth, AND\n"
+                f"   - SUM({ltm}{bs_range[0]}:{ltm}{auth_row - 1}) - "
+                f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> "
+                "equal the BDO LTM ground truth above (achieved via the "
+                "automatic mirror once the quarter column is right).\n"
+                "This is the only Claude call for this run — emit ALL "
+                "required patches in this single response."
+            )
+
         return (
-            f"PRIOR_ROUND_FAILURE — RECONCILIATION DID NOT PASS\n"
-            f"=================================================\n"
-            f"Round {prior.get('round')} of verification has just been "
-            f"applied to the workbook, but the patched output still fails "
-            f"the BDO reconciliation check. The current cell values:\n"
-            f"  - {ltm}{auth_row} (Total Equity Movement) = "
-            f"{prior.get('auth_row_value')}\n"
-            f"  - {ltm}{dep_row} (Direct Result) = "
-            f"{prior.get('dep_row_value')}\n"
-            f"  - BDO ground truth LTM (sign-adjusted Resultaat na belasting) = "
-            f"{prior.get('bdo_ground_truth')}\n"
-            f"  - BDO ground truth quarter (sign-adjusted) = "
-            f"{prior.get('bdo_ground_truth_quarter')}\n"
+            f"{header}"
             f"\n"
             f"Failure reasons reported by the deterministic re-validator:\n"
             f"{reasons_block}\n"
             f"\n"
             f"LTM COLUMN ROW-BY-ROW MISMATCHES (column {ltm}, comparing "
-            f"actual formula vs. expected derived from previous-quarter):\n"
+            f"actual formula vs. expected derived from quarter column):\n"
             f"{ltm_mismatch_block}\n"
             f"\n"
             f"EVALUATED LTM COLUMN VALUES (column {ltm}, evaluated by "
@@ -756,45 +860,27 @@ class VerificationPromptBuilder:
             f"{eval_ltm_block}\n"
             f"\n"
             f"EVALUATED QUARTER COLUMN VALUES (column {quarter}, "
-            f"evaluated against BDO column G — for symmetry, the AC68 "
-            f"value here MUST equal sign_adjusted_quarter):\n"
+            f"evaluated against BDO column G — for symmetry, the "
+            f"{quarter}{dep_row} value here MUST equal "
+            f"sign_adjusted_quarter):\n"
             f"{eval_q_block}\n"
             f"\n"
-            f"Total patches applied across all prior rounds: "
-            f"{prior.get('patches_applied_in_prior_rounds', 0)}\n"
-            f"Last-round notes from your previous response:\n"
-            f"  {prior.get('last_claude_notes') or '(none)'}\n"
+            f"Patches already applied to this workbook in earlier rounds "
+            f"(legacy retry mode only): "
+            f"{context.get('cumulative_patches_applied') or prior.get('patches_applied_in_prior_rounds', 0)}\n"
+            f"Notes from any previous Claude response (legacy retry "
+            f"mode only):\n"
+            f"  {context.get('last_claude_notes') or prior.get('last_claude_notes') or '(none)'}\n"
             f"\n"
-            f"WHAT TO DO NOW:\n"
-            f"1. The total-row formulas ({ltm}{auth_row} and {ltm}{dep_row}) "
-            f"are deterministically correct; do NOT patch them.\n"
-            f"2. The error is in upstream detail rows on BOTH the QUARTER "
-            f"column ({quarter}) AND the LTM column ({ltm}). Re-examine "
-            f"every bdo_ref / bdo_sum_range formula in rows "
-            f"{bs_range[0]}–{auth_row - 1} (Balance Sheet) and rows "
-            f"23–{dep_row - 1} (P&L) on BOTH columns. For each row "
-            f"listed in 'LTM COLUMN ROW-BY-ROW MISMATCHES' above, emit a "
-            f"formula patch on {ltm}<row> with the expected formula.\n"
-            f"3. PAIRED PATCH RULE: if you patch a quarter-column row "
-            f"({quarter}<row>) to fix a BDO reference (column G), ALSO "
-            f"patch the LTM-column row ({ltm}<row>) with the same BDO row "
-            f"number but column letter H. Search the BDO LABEL-TO-ROW MAP "
-            f"and BDO FULL ROW INVENTORY for the correct row numbers — "
-            f"never rely on a previously-assumed row position.\n"
-            f"4. Pay special attention to the BDO VERSCHIL BALANS row "
-            f"in CONTEXT: row 19 references "
-            f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> and the "
-            f"row number must be the dynamically-discovered one, never a "
-            f"hardcoded value such as H134.\n"
-            f"5. Emit the formula patches needed to make BOTH:\n"
-            f"   - SUM({quarter}{bs_range[0]}:{quarter}{auth_row - 1}) "
-            f"reconcile with the quarter ground truth, AND\n"
-            f"   - SUM({ltm}{bs_range[0]}:{ltm}{auth_row - 1}) - "
-            f"'{meta.get('bdo_sheet_name', 'BDO')}'!H<verschil_row> equal "
-            f"the BDO LTM ground truth above.\n"
-            f"Do not repeat the prior round's patches verbatim — they did "
-            f"not solve the problem."
+            f"{what_to_do}"
         )
+
+    # Backwards-compat shim: tests and historical callers may invoke the
+    # old method name. It now delegates to the canonical implementation.
+    def _prior_round_failure_section(
+        self, context: Dict[str, Any]
+    ) -> Optional[str]:
+        return self._preflight_evaluator_section(context)
 
     def _role_section(self) -> str:
         return """ROLE:
@@ -2136,15 +2222,32 @@ class AIVerificationOrchestrator:
     Main orchestrator for AI verification of Management Accounts.
     Always runs after MA build, applies patches, re-validates.
 
-    The verification loop runs up to ``MAX_VERIFY_ROUNDS`` times. After each
-    Claude round the workbook is re-validated against the BDO ground truth
-    (Resultaat na belasting); on failure the context is re-extracted from
-    the patched file and Claude is called again with a structured
-    ``prior_round_failure`` summary so it can correct upstream BDO row
-    mappings instead of repeating the same patch.
+    By default the orchestrator runs **exactly one** Claude round. Before
+    that round it executes the deterministic re-validator on the unpatched
+    workbook and injects the per-row evaluated values, BDO ground-truth
+    targets, and any LTM/quarter mismatches into the prompt so the single
+    Opus call has the same context the legacy 3-round retry loop produced
+    on its final round.
+
+    The legacy multi-round retry loop is preserved for backward
+    compatibility and can be re-enabled by setting the
+    ``AI_VERIFY_MAX_ROUNDS`` environment variable (or ``DEFAULT_MAX_ROUNDS``
+    on the class) to a value > 1. The default is ``1`` — see the
+    ``Single Opus Verification`` plan for the rationale (one informed
+    Claude pass + deterministic AC->AD mirror covers the same ground as
+    repeated Opus rounds without the wall-clock cost).
     """
 
-    MAX_VERIFY_ROUNDS = 3
+    # Default number of Claude rounds to run. The value may be overridden
+    # per-process via the ``AI_VERIFY_MAX_ROUNDS`` env var. Resolved at
+    # ``run()`` time (rather than at import) so tests can monkeypatch the
+    # environment before instantiating the orchestrator.
+    DEFAULT_MAX_ROUNDS = 1
+
+    # Class-level constant retained so existing callers / tests that read
+    # ``AIVerificationOrchestrator.MAX_VERIFY_ROUNDS`` keep working. The
+    # active per-run value lives on the instance (``self._max_rounds``).
+    MAX_VERIFY_ROUNDS = DEFAULT_MAX_ROUNDS
 
     def __init__(self, config: VerificationConfig,
                  api_key: Optional[str] = None,
@@ -2152,6 +2255,26 @@ class AIVerificationOrchestrator:
         self.config = config
         self.api_key = api_key
         self.formula_templates_path = formula_templates_path
+        self._max_rounds = self._resolve_max_rounds()
+
+    @classmethod
+    def _resolve_max_rounds(cls) -> int:
+        """
+        Read ``AI_VERIFY_MAX_ROUNDS`` from the environment, falling back to
+        ``DEFAULT_MAX_ROUNDS``. Values < 1 are clamped to 1.
+        """
+        raw = os.environ.get('AI_VERIFY_MAX_ROUNDS')
+        if raw is None or not str(raw).strip():
+            return cls.DEFAULT_MAX_ROUNDS
+        try:
+            n = int(str(raw).strip())
+        except ValueError:
+            logger.warning(
+                f"[AI Verify] Ignoring invalid AI_VERIFY_MAX_ROUNDS={raw!r}; "
+                f"defaulting to {cls.DEFAULT_MAX_ROUNDS}"
+            )
+            return cls.DEFAULT_MAX_ROUNDS
+        return max(1, n)
 
     def run(self, workbook_path: str,
             bdo_source_path: Optional[str] = None,
@@ -2169,7 +2292,11 @@ class AIVerificationOrchestrator:
         Returns:
             VerificationResult with status, patches applied, and file paths
         """
+        import time
+
         workbook_path = str(workbook_path)
+        max_rounds = self._max_rounds
+        timings: Dict[str, float] = {}
 
         result = VerificationResult(
             status='PASS',
@@ -2177,49 +2304,49 @@ class AIVerificationOrchestrator:
             verified_file=workbook_path,
         )
 
+        run_t0 = time.perf_counter()
+
         try:
             # Phase A: Extract workbook context
             logger.info("[AI Verify] Phase A: Extracting workbook context...")
-            extractor = WorkbookContextExtractor(
-                workbook_path, self.config, self.formula_templates_path
+            t0 = time.perf_counter()
+            context = self._build_full_context(
+                workbook_path,
+                bdo_source_path=bdo_source_path,
+                bdo_result=bdo_result,
+                computed_values=computed_values,
             )
-            context = extractor.extract()
+            timings['context_extract'] = time.perf_counter() - t0
+            logger.info(
+                f"[AI Verify] Phase A context extract: "
+                f"{timings['context_extract']:.1f}s"
+            )
 
-            # Phase A+: BDO copy verification context
-            if bdo_source_path:
-                logger.info("[AI Verify] Phase A+: Verifying BDO copy integrity...")
-                bdo_verifier = BDOCopyVerifier(workbook_path, bdo_source_path, self.config)
-                bdo_context = bdo_verifier.build_verification_context()
-                context['bdo_copy_verification'] = bdo_context
+            # Phase A-pre: deterministic pre-flight re-validation against
+            # the UNPATCHED workbook. This produces the per-row evaluated
+            # values, BDO ground-truth targets, and LTM/quarter mismatches
+            # that the prompt builder will inject so the single Claude
+            # call sees the same context the legacy 3-round loop produced
+            # on its final round.
+            logger.info(
+                "[AI Verify] Phase A-pre: Running deterministic pre-flight "
+                "re-validator..."
+            )
+            t0 = time.perf_counter()
+            preflight_report = self._revalidate_detailed(
+                workbook_path, bdo_result, computed_values
+            )
+            timings['preflight'] = time.perf_counter() - t0
+            preflight_passed = bool(preflight_report.get('passed'))
+            result.preflight_passed = preflight_passed
+            logger.info(
+                f"[AI Verify] Phase A-pre preflight: "
+                f"{timings['preflight']:.1f}s "
+                f"(passed={preflight_passed}, "
+                f"reasons={len(preflight_report.get('failure_reasons', []))})"
+            )
+            context['preflight_report'] = preflight_report
 
-            # Phase A++: Compute shadow P&L and shadow BS from raw BDO data
-            if bdo_result:
-                logger.info("[AI Verify] Phase A++: Computing shadow models...")
-                shadow_pl, shadow_bs = self._compute_shadow_models(
-                    workbook_path, bdo_result
-                )
-                if shadow_pl:
-                    context['shadow_pl'] = shadow_pl
-                if shadow_bs:
-                    context['shadow_bs'] = shadow_bs
-
-            # Phase A+++: Include pre-computed values from MA builder
-            if computed_values:
-                cv_snapshot = {}
-                for (row, scope), val in sorted(computed_values.items()):
-                    key = f"row_{row}_{scope}"
-                    cv_snapshot[key] = round(val, 2) if isinstance(val, float) else val
-                context['computed_values_snapshot'] = cv_snapshot
-                logger.info(f"[AI Verify] Added {len(cv_snapshot)} computed_values to context")
-
-            # Phase B–D loop. The first round runs the standard prompt; if
-            # the patched workbook fails reconciliation, subsequent rounds
-            # rebuild the context from the patched state and append a
-            # PRIOR_ROUND_FAILURE block instructing Claude to re-examine
-            # upstream BDO row mappings. The user-facing requirement: if
-            # SUM(LTM rows 3-18) does not equal H of "Resultaat na
-            # belasting" in BDO, Claude must loop back, re-check the
-            # mappings, and retry until the check passes.
             prompt_builder = VerificationPromptBuilder()
             verifier = ClaudeVerifier(api_key=self.api_key)
             applier_factory = lambda: PatchApplier(
@@ -2228,7 +2355,6 @@ class AIVerificationOrchestrator:
                 ltm_col=self.config.built_ltm_col,
             )
 
-            prior_round_failure: Optional[Dict[str, Any]] = None
             revalidation_report: Dict[str, Any] = {}
             cumulative_patches_applied = 0
             last_claude_status = 'PASS'
@@ -2236,14 +2362,16 @@ class AIVerificationOrchestrator:
             last_patches: List[Dict[str, Any]] = []
             last_validation_summary: Dict[str, Any] = {}
             last_notes = ''
+            claude_rounds = 0
+            claude_seconds = 0.0
+            postflight_seconds = 0.0
+            patch_seconds = 0.0
 
-            for round_num in range(1, self.MAX_VERIFY_ROUNDS + 1):
-                # Phase B: build prompt for this round
-                if prior_round_failure is not None:
-                    context['prior_round_failure'] = prior_round_failure
+            for round_num in range(1, max_rounds + 1):
+                # Phase B: build prompt
                 logger.info(
                     f"[AI Verify] Phase B (round {round_num}/"
-                    f"{self.MAX_VERIFY_ROUNDS}): Building verification prompt..."
+                    f"{max_rounds}): Building verification prompt..."
                 )
                 prompt = prompt_builder.build(context)
 
@@ -2252,40 +2380,21 @@ class AIVerificationOrchestrator:
                     prompt += json.dumps(context['bdo_copy_verification'], indent=2)
 
                 logger.info(
-                    f"[AI Verify] Round {round_num} prompt size: {len(prompt)} chars"
+                    f"[AI Verify] Round {round_num} prompt size: "
+                    f"{len(prompt)} chars"
                 )
 
-                # Persist the prompt for client debugging. Each round's
-                # prompt lands at outputs/ai_verify_prompt_{quarter}_round{N}.txt
-                # so the client can compare what we asked Claude to verify
-                # against what it actually returned. Failure to write this
-                # file is non-fatal — the verification round still runs.
-                try:
-                    quarter_slug = (
-                        (self.config.quarter or 'unknown')
-                        .replace(' ', '_').replace('/', '-')
-                    )
-                    out_dir = Path('outputs')
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    prompt_path = out_dir / (
-                        f"ai_verify_prompt_{quarter_slug}_round{round_num}.txt"
-                    )
-                    prompt_path.write_text(prompt, encoding='utf-8')
-                    logger.info(
-                        f"[AI Verify] Round {round_num} prompt exported to "
-                        f"{prompt_path}"
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"[AI Verify] Prompt export failed (non-fatal): {exc}"
-                    )
+                self._export_prompt(prompt, round_num)
 
                 # Phase C: Send to Claude
                 logger.info(
                     f"[AI Verify] Phase C (round {round_num}): "
                     f"Sending to Claude for verification..."
                 )
+                t0 = time.perf_counter()
                 claude_response = verifier.verify(prompt)
+                claude_seconds += time.perf_counter() - t0
+                claude_rounds += 1
 
                 if claude_response.get('status') == 'ERROR':
                     result.status = 'ERROR'
@@ -2295,6 +2404,10 @@ class AIVerificationOrchestrator:
                         f"[AI Verify] Claude error in round {round_num} — "
                         f"original file unchanged: {result.error}"
                     )
+                    timings['claude'] = claude_seconds
+                    timings['total'] = time.perf_counter() - run_t0
+                    result.timing = timings
+                    result.claude_rounds = claude_rounds
                     return result
 
                 last_claude_status = claude_response.get('status', 'PASS')
@@ -2305,18 +2418,18 @@ class AIVerificationOrchestrator:
                 )
                 last_notes = claude_response.get('notes', '') or ''
 
-                # Phase D: Apply patches (and run deterministic post-patch
-                # formula-chain repair). Both must run BEFORE re-validation
-                # because _verify_formula_chain restores any cells that
-                # patches have left in an inconsistent state (e.g. rows
-                # 19/68 missing the YAML override formula).
+                # Phase D: Apply patches and run deterministic post-patch
+                # formula-chain repair (mirrors AC->AD with G->H swap).
                 if last_patches:
                     logger.info(
                         f"[AI Verify] Phase D (round {round_num}): "
                         f"Applying {len(last_patches)} patches in-place..."
                     )
+                    t0 = time.perf_counter()
                     applier = applier_factory()
-                    applied, rejected = applier.apply(last_patches, workbook_path)
+                    applied, rejected = applier.apply(
+                        last_patches, workbook_path
+                    )
                     cumulative_patches_applied += applied
                     if rejected:
                         logger.warning(
@@ -2329,15 +2442,18 @@ class AIVerificationOrchestrator:
                                 f"reason: {rej.get('rejection_reason')}"
                             )
                     self._verify_formula_chain(workbook_path, self.config)
+                    patch_seconds += time.perf_counter() - t0
 
-                # Phase D+: Re-validate (with structured failure report)
+                # Phase D+: Re-validate the patched workbook.
                 logger.info(
                     f"[AI Verify] Phase D+ (round {round_num}): "
                     f"Re-validating patched workbook..."
                 )
+                t0 = time.perf_counter()
                 revalidation_report = self._revalidate_detailed(
                     workbook_path, bdo_result, computed_values
                 )
+                postflight_seconds += time.perf_counter() - t0
 
                 if revalidation_report.get('passed'):
                     logger.info(
@@ -2346,75 +2462,49 @@ class AIVerificationOrchestrator:
                     )
                     break
 
-                if round_num >= self.MAX_VERIFY_ROUNDS:
-                    logger.warning(
-                        f"[AI Verify] Reached MAX_VERIFY_ROUNDS="
-                        f"{self.MAX_VERIFY_ROUNDS}; reconciliation still "
-                        f"failing. Workbook saved as-is for manual review."
-                    )
+                if round_num >= max_rounds:
+                    if max_rounds == 1:
+                        logger.warning(
+                            "[AI Verify] Single-Opus round did not "
+                            "reconcile; workbook saved as-is for manual "
+                            "review. Set AI_VERIFY_MAX_ROUNDS>1 to enable "
+                            "the legacy retry loop for hard quarters."
+                        )
+                    else:
+                        logger.warning(
+                            f"[AI Verify] Reached AI_VERIFY_MAX_ROUNDS="
+                            f"{max_rounds}; reconciliation still failing. "
+                            f"Workbook saved as-is for manual review."
+                        )
                     break
 
-                # Re-extract context from the patched workbook so the next
-                # round sees the formulas that are actually in the file
-                # (the previous round's patches plus any deterministic
-                # repairs from _verify_formula_chain).
+                # Legacy retry mode only — refresh context for the next
+                # Claude call.
                 logger.info(
                     f"[AI Verify] Round {round_num} reconciliation FAILED; "
                     f"preparing round {round_num + 1} with feedback "
                     f"({len(revalidation_report.get('failure_reasons', []))} "
                     f"failure reason(s))"
                 )
-                extractor = WorkbookContextExtractor(
-                    workbook_path, self.config, self.formula_templates_path
+                context = self._build_full_context(
+                    workbook_path,
+                    bdo_source_path=bdo_source_path,
+                    bdo_result=bdo_result,
+                    computed_values=computed_values,
                 )
-                context = extractor.extract()
-                if bdo_source_path:
-                    bdo_verifier = BDOCopyVerifier(
-                        workbook_path, bdo_source_path, self.config
-                    )
-                    context['bdo_copy_verification'] = (
-                        bdo_verifier.build_verification_context()
-                    )
-                if bdo_result:
-                    shadow_pl, shadow_bs = self._compute_shadow_models(
-                        workbook_path, bdo_result
-                    )
-                    if shadow_pl:
-                        context['shadow_pl'] = shadow_pl
-                    if shadow_bs:
-                        context['shadow_bs'] = shadow_bs
-                if computed_values:
-                    cv_snapshot = {}
-                    for (row, scope), val in sorted(computed_values.items()):
-                        key = f"row_{row}_{scope}"
-                        cv_snapshot[key] = (
-                            round(val, 2) if isinstance(val, float) else val
-                        )
-                    context['computed_values_snapshot'] = cv_snapshot
+                context['preflight_report'] = revalidation_report
+                context['preflight_round'] = round_num
+                context['cumulative_patches_applied'] = (
+                    cumulative_patches_applied
+                )
+                context['last_claude_notes'] = last_notes
 
-                prior_round_failure = {
-                    'round': round_num,
-                    'failure_reasons': revalidation_report.get(
-                        'failure_reasons', []
-                    ),
-                    'auth_row_value': revalidation_report.get('auth_row_value'),
-                    'dep_row_value': revalidation_report.get('dep_row_value'),
-                    'bdo_ground_truth': revalidation_report.get('bdo_ground_truth'),
-                    'bdo_ground_truth_quarter': revalidation_report.get(
-                        'bdo_ground_truth_quarter'
-                    ),
-                    'evaluated_ltm': revalidation_report.get('evaluated_ltm'),
-                    'evaluated_quarter': revalidation_report.get(
-                        'evaluated_quarter'
-                    ),
-                    'ltm_row_mismatches': revalidation_report.get(
-                        'ltm_row_mismatches', []
-                    ),
-                    'patches_applied_in_prior_rounds': cumulative_patches_applied,
-                    'last_claude_notes': last_notes,
-                }
+            # Persist outcome.
+            timings['claude'] = claude_seconds
+            timings['patch_apply'] = patch_seconds
+            timings['postflight'] = postflight_seconds
+            timings['total'] = time.perf_counter() - run_t0
 
-            # Persist the final round's outcome on the result object.
             result.status = last_claude_status
             result.issues = last_issues
             result.patches = last_patches
@@ -2424,15 +2514,24 @@ class AIVerificationOrchestrator:
             result.revalidation_passed = bool(
                 revalidation_report.get('passed')
             ) if revalidation_report else (cumulative_patches_applied == 0)
+            result.postflight_passed = result.revalidation_passed
+            result.claude_rounds = claude_rounds
+            result.timing = timings
             if not last_patches and cumulative_patches_applied == 0:
                 logger.info(
-                    "[AI Verify] No patches needed — workbook passed verification"
+                    "[AI Verify] No patches needed — workbook passed "
+                    "verification"
                 )
 
             logger.info(
                 f"[AI Verify] Complete — status={result.status}, "
                 f"patches={result.patches_applied}, "
-                f"revalidation={'PASS' if result.revalidation_passed else 'FAIL'}"
+                f"claude_rounds={claude_rounds}, "
+                f"preflight={'PASS' if preflight_passed else 'FAIL'}, "
+                f"postflight={'PASS' if result.postflight_passed else 'FAIL'}, "
+                f"total={timings['total']:.1f}s "
+                f"(claude={claude_seconds:.1f}s, "
+                f"preflight={timings['preflight']:.1f}s)"
             )
 
         except Exception as e:
@@ -2440,8 +2539,89 @@ class AIVerificationOrchestrator:
             result.status = 'ERROR'
             result.error = str(e)
             result.verified_file = workbook_path
+            timings['total'] = time.perf_counter() - run_t0
+            result.timing = timings
 
         return result
+
+    # ------------------------------------------------------------------
+    # Helpers extracted from run() for the single-Opus pipeline
+    # ------------------------------------------------------------------
+
+    def _build_full_context(
+        self,
+        workbook_path: str,
+        *,
+        bdo_source_path: Optional[str],
+        bdo_result: Optional[BDOParseResult],
+        computed_values: Optional[Dict],
+    ) -> Dict[str, Any]:
+        """
+        Extract the full prompt context (workbook scan, BDO copy
+        verification, shadow models, computed-values snapshot) in one
+        place. Called once at the start of ``run()`` and again only when
+        the legacy retry loop needs to refresh context after a failed
+        round.
+        """
+        extractor = WorkbookContextExtractor(
+            workbook_path, self.config, self.formula_templates_path
+        )
+        context = extractor.extract()
+
+        if bdo_source_path:
+            logger.info("[AI Verify] BDO copy verification...")
+            bdo_verifier = BDOCopyVerifier(
+                workbook_path, bdo_source_path, self.config
+            )
+            context['bdo_copy_verification'] = (
+                bdo_verifier.build_verification_context()
+            )
+
+        if bdo_result:
+            shadow_pl, shadow_bs = self._compute_shadow_models(
+                workbook_path, bdo_result
+            )
+            if shadow_pl:
+                context['shadow_pl'] = shadow_pl
+            if shadow_bs:
+                context['shadow_bs'] = shadow_bs
+
+        if computed_values:
+            cv_snapshot: Dict[str, Any] = {}
+            for (row, scope), val in sorted(computed_values.items()):
+                key = f"row_{row}_{scope}"
+                cv_snapshot[key] = (
+                    round(val, 2) if isinstance(val, float) else val
+                )
+            context['computed_values_snapshot'] = cv_snapshot
+
+        return context
+
+    def _export_prompt(self, prompt: str, round_num: int) -> None:
+        """
+        Persist the prompt to ``outputs/ai_verify_prompt_{quarter}_round{N}.txt``
+        for client debugging. Failures here are non-fatal — the
+        verification still runs.
+        """
+        try:
+            quarter_slug = (
+                (self.config.quarter or 'unknown')
+                .replace(' ', '_').replace('/', '-')
+            )
+            out_dir = Path('outputs')
+            out_dir.mkdir(parents=True, exist_ok=True)
+            prompt_path = out_dir / (
+                f"ai_verify_prompt_{quarter_slug}_round{round_num}.txt"
+            )
+            prompt_path.write_text(prompt, encoding='utf-8')
+            logger.info(
+                f"[AI Verify] Round {round_num} prompt exported to "
+                f"{prompt_path}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[AI Verify] Prompt export failed (non-fatal): {exc}"
+            )
 
     def _verify_formula_chain(self, workbook_path: str, config: 'VerificationConfig'):
         """
@@ -2736,7 +2916,30 @@ class AIVerificationOrchestrator:
         positive-for-profit). Falls back to a manual sum of C:G when the
         cached H value is missing — common right after openpyxl saves the
         workbook without a recalculation cycle.
+
+        For callers that need both LTM and quarter values, use
+        :meth:`_read_bdo_ground_truth_pair` to avoid opening the workbook
+        twice.
         """
+        pair = self._read_bdo_ground_truth_pair(workbook_path, rules)
+        return pair['ltm'] if use_ltm else pair['quarter']
+
+    def _read_bdo_ground_truth_pair(
+        self,
+        workbook_path: str,
+        rules: Dict[str, Any],
+    ) -> Dict[str, Optional[float]]:
+        """
+        I/O-consolidated read: open the workbook once and return both the
+        LTM and quarter sign-adjusted "Resultaat na belasting" totals.
+
+        Returns ``{'ltm': float|None, 'quarter': float|None}``. The
+        legacy single-scope helper :meth:`_read_bdo_ground_truth`
+        delegates here so we open the BDO sheet at most once per
+        revalidation pass.
+        """
+        result: Dict[str, Optional[float]] = {'ltm': None, 'quarter': None}
+
         bdo_cfg = rules.get('bdo', {})
         data_col = bdo_cfg.get('data_column', 8)
         q_cols = bdo_cfg.get('quarter_columns', [4, 5, 6, 7])
@@ -2746,7 +2949,7 @@ class AIVerificationOrchestrator:
             wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
         except Exception as exc:
             logger.warning(f"[AI Verify] BDO ground-truth open failed: {exc}")
-            return None
+            return result
 
         try:
             bdo_sheet = None
@@ -2755,7 +2958,7 @@ class AIVerificationOrchestrator:
                     bdo_sheet = wb_data[sn]
                     break
             if bdo_sheet is None:
-                return None
+                return result
 
             target_row = None
             for row_idx in range(1, min(bdo_sheet.max_row + 1, 200)):
@@ -2771,12 +2974,13 @@ class AIVerificationOrchestrator:
                     break
 
             if target_row is None:
-                return None
+                return result
 
-            if use_ltm:
-                h_val = bdo_sheet.cell(row=target_row, column=data_col).value
-                if isinstance(h_val, (int, float)):
-                    return -float(h_val)
+            # LTM: prefer cached H, else sum C:G.
+            h_val = bdo_sheet.cell(row=target_row, column=data_col).value
+            if isinstance(h_val, (int, float)):
+                result['ltm'] = -float(h_val)
+            else:
                 running = 0.0
                 cols_for_sum = (
                     list(range(3, q_cols[-1] + 1)) if q_cols
@@ -2788,7 +2992,7 @@ class AIVerificationOrchestrator:
                     if isinstance(v, (int, float)):
                         running += float(v)
                         saw_value = True
-                return -running if saw_value else None
+                result['ltm'] = -running if saw_value else None
 
             # Quarter actuals: sum of mutation columns only (D:G).
             running = 0.0
@@ -2798,7 +3002,9 @@ class AIVerificationOrchestrator:
                 if isinstance(v, (int, float)):
                     running += float(v)
                     saw_value = True
-            return -running if saw_value else None
+            result['quarter'] = -running if saw_value else None
+
+            return result
         finally:
             wb_data.close()
 
@@ -3201,13 +3407,14 @@ class AIVerificationOrchestrator:
 
         tolerance = 1.0
 
-        # Read the BDO ground-truth value (Resultaat na belasting,
-        # sign-adjusted) so we can reconcile against it as well as
-        # checking PL68 vs BS19. ``_read_bdo_ground_truth`` handles the
-        # data_only cache-miss fallback (sum of C:G when H is not cached).
-        bdo_ground_truth = self._read_bdo_ground_truth(
-            workbook_path, rules, use_ltm=True
-        )
+        # Read both BDO ground-truth values (Resultaat na belasting,
+        # sign-adjusted) in one workbook open: H for LTM, C:G summed for
+        # the latest quarter mutation total. ``_read_bdo_ground_truth_pair``
+        # handles the data_only cache-miss fallback and lets us avoid the
+        # second ``load_workbook`` call the older code performed.
+        bdo_pair = self._read_bdo_ground_truth_pair(workbook_path, rules)
+        bdo_ground_truth = bdo_pair['ltm']
+        bdo_ground_truth_quarter = bdo_pair['quarter']
         report['bdo_ground_truth'] = bdo_ground_truth
 
         # Primary path: evaluate the actual workbook formulas in column AD
@@ -3219,22 +3426,23 @@ class AIVerificationOrchestrator:
         # check passed regardless of what formulas were actually in the
         # workbook). The only authoritative answer is what the LTM column
         # formulas in the saved workbook evaluate to.
+        #
+        # I/O consolidation: ``evaluate_ma_columns_from_formulas`` opens
+        # the workbook once and evaluates both columns in a single
+        # session, replacing the two sequential ``load_workbook`` calls
+        # the prior implementation performed.
         try:
             from .management_accounts import ManagementAccountsBuilder
-            eval_quarter = ManagementAccountsBuilder.evaluate_ma_column_from_formulas(
-                workbook_path,
-                self.config.summary_sheet_name,
-                self.config.bdo_sheet_name,
-                column_scope='quarter',
-                rules=rules,
+            evaluated = (
+                ManagementAccountsBuilder.evaluate_ma_columns_from_formulas(
+                    workbook_path,
+                    self.config.summary_sheet_name,
+                    self.config.bdo_sheet_name,
+                    rules=rules,
+                )
             )
-            eval_ltm = ManagementAccountsBuilder.evaluate_ma_column_from_formulas(
-                workbook_path,
-                self.config.summary_sheet_name,
-                self.config.bdo_sheet_name,
-                column_scope='ltm',
-                rules=rules,
-            )
+            eval_quarter = evaluated.get('quarter')
+            eval_ltm = evaluated.get('ltm')
         except Exception as exc:
             logger.warning(f"[AI Verify] Formula evaluator failed: {exc}")
             eval_quarter = None
@@ -3273,9 +3481,6 @@ class AIVerificationOrchestrator:
             # round on quarter mismatches when we actually have a number.
             quarter_diff = None
             quarter_passed = True
-            bdo_ground_truth_quarter = self._read_bdo_ground_truth(
-                workbook_path, rules, use_ltm=False
-            )
             report['bdo_ground_truth_quarter'] = bdo_ground_truth_quarter
             if (
                 eval_quarter is not None

@@ -4744,6 +4744,117 @@ class ManagementAccountsBuilder:
         result['scope'] = column_scope
         return result
 
+    @staticmethod
+    def evaluate_ma_columns_from_formulas(
+        workbook_path: str,
+        summary_sheet_name: str,
+        bdo_sheet_name: str,
+        rules: Optional[dict] = None,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Dual-column convenience wrapper around
+        :func:`formula_mirror.evaluate_ma_columns`. Evaluates BOTH the
+        quarter and LTM columns in a single workbook session and returns
+        ``{"quarter": <result>, "ltm": <result>}`` (each value is shaped
+        like :func:`evaluate_ma_column_from_formulas` returns, or ``None``
+        if the column cannot be resolved).
+
+        This is the I/O-consolidated path used by the AI verification
+        pre-flight + post-flight checks: opening the workbook once and
+        evaluating both columns shaves the duplicate ``load_workbook``
+        cost off every verification round.
+        """
+        from .formula_mirror import evaluate_ma_columns
+
+        if rules is None:
+            rules_path = Path("config/accounting_rules.yaml")
+            if rules_path.exists():
+                try:
+                    with open(rules_path, 'r', encoding='utf-8') as f:
+                        rules = yaml.safe_load(f) or {}
+                except Exception:
+                    rules = {}
+            else:
+                rules = {}
+
+        layout_cfg = rules.get('layout', {})
+        bs_range = layout_cfg.get('balance_sheet_rows', [3, 19])
+        pl_range = layout_cfg.get('profit_loss_rows', [23, 68])
+        bank_range = layout_cfg.get('bank_rows', [107, 114])
+        header_row = layout_cfg.get('header_row', 22)
+
+        rows_of_interest = (
+            list(range(bs_range[0], bs_range[1] + 1))
+            + list(range(pl_range[0], pl_range[1] + 1))
+            + list(range(bank_range[0], bank_range[1] + 1))
+        )
+
+        wb = openpyxl.load_workbook(workbook_path, data_only=False)
+        try:
+            sheet = (
+                wb[summary_sheet_name]
+                if summary_sheet_name in wb.sheetnames else None
+            )
+            if sheet is None:
+                for sn in wb.sheetnames:
+                    if 'Management Cijfers' in sn:
+                        sheet = wb[sn]
+                        break
+            if sheet is None:
+                return {'quarter': None, 'ltm': None}
+
+            layout = scan_summary_column_layout(sheet, header_row)
+            ltm_col = layout.ltm_column
+            quarter_col = layout.last_quarter_column
+
+            if sheet.title and ' - ' in sheet.title:
+                quarter_label = sheet.title.split(' - ', 1)[1].strip()
+                aligned = find_column_by_header_label(
+                    sheet, quarter_label, header_row
+                )
+                if aligned:
+                    quarter_col = aligned
+                    ltm_col = find_ltm_column_near_quarter(
+                        sheet, quarter_col, header_row
+                    ) or ltm_col
+        finally:
+            wb.close()
+
+        columns: List[Tuple[str, int]] = []
+        if quarter_col:
+            columns.append(('quarter', quarter_col))
+        if ltm_col:
+            columns.append(('ltm', ltm_col))
+
+        if not columns:
+            return {'quarter': None, 'ltm': None}
+
+        evaluated = evaluate_ma_columns(
+            workbook_path,
+            summary_sheet_name=summary_sheet_name,
+            bdo_sheet_name=bdo_sheet_name,
+            columns=columns,
+            rows_of_interest=rows_of_interest,
+        )
+
+        out: Dict[str, Optional[Dict[str, Any]]] = {
+            'quarter': None,
+            'ltm': None,
+        }
+        if quarter_col and 'quarter' in evaluated:
+            out['quarter'] = {
+                **evaluated['quarter'],
+                'column': quarter_col,
+                'scope': 'quarter',
+            }
+        if ltm_col and 'ltm' in evaluated:
+            out['ltm'] = {
+                **evaluated['ltm'],
+                'column': ltm_col,
+                'scope': 'ltm',
+            }
+        return out
+
     def _add_validation_warning_to_sheet(self, messages: list):
         """Write visible red warning rows in Management Cijfers if validation fails."""
         summary_sheets = [name for name in self.workbook.sheetnames

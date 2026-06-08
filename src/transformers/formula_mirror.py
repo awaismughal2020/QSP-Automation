@@ -299,6 +299,90 @@ def _evaluate_formula_string(
         return None
 
 
+def _evaluate_one_column(
+    *,
+    sheet,
+    bdo_sheet,
+    bdo_data_only_sheet,
+    bdo_sheet_name: str,
+    target_col: int,
+    rows_of_interest: List[int],
+    max_passes: int,
+) -> Dict[str, Any]:
+    """
+    Inner evaluator that operates on already-opened openpyxl sheets.
+    Shared by ``evaluate_ma_column`` and ``evaluate_ma_columns`` so a
+    single workbook open can serve multiple target columns.
+    """
+    formulas: Dict[int, str] = {}
+    static_values: Dict[int, float] = {}
+    for row_idx in rows_of_interest:
+        cell_val = sheet.cell(row=row_idx, column=target_col).value
+        if isinstance(cell_val, str) and cell_val.startswith('='):
+            formulas[row_idx] = cell_val
+        else:
+            num = _read_numeric(cell_val)
+            if num is not None:
+                static_values[row_idx] = num
+
+    row_values: Dict[int, float] = dict(static_values)
+    pending = set(formulas.keys())
+    target_formula_rows = set(formulas.keys())
+    for _ in range(max_passes):
+        if not pending:
+            break
+        progressed = False
+        for row_idx in list(pending):
+            value = _evaluate_formula_string(
+                formulas[row_idx],
+                target_col=target_col,
+                row_values=row_values,
+                target_formula_rows=target_formula_rows,
+                bdo_sheet=bdo_sheet,
+                bdo_data_only_sheet=bdo_data_only_sheet,
+                sheet=sheet,
+                bdo_sheet_name=bdo_sheet_name,
+            )
+            if value is not None:
+                row_values[row_idx] = value
+                pending.discard(row_idx)
+                progressed = True
+        if not progressed:
+            break
+
+    return {
+        'values': row_values,
+        'unresolved': sorted(pending),
+    }
+
+
+def _resolve_ma_sheets(
+    *,
+    wb,
+    wb_data,
+    summary_sheet_name: str,
+    bdo_sheet_name: str,
+):
+    """Resolve the MA summary and BDO sheet handles from open workbooks."""
+    sheet = (
+        wb[summary_sheet_name]
+        if summary_sheet_name in wb.sheetnames else None
+    )
+    if sheet is None:
+        for sn in wb.sheetnames:
+            if 'Management Cijfers' in sn:
+                sheet = wb[sn]
+                break
+    bdo_sheet = (
+        wb[bdo_sheet_name] if bdo_sheet_name in wb.sheetnames else None
+    )
+    bdo_data_only_sheet = (
+        wb_data[bdo_sheet_name]
+        if bdo_sheet_name in wb_data.sheetnames else None
+    )
+    return sheet, bdo_sheet, bdo_data_only_sheet
+
+
 def evaluate_ma_column(
     workbook_path: str,
     *,
@@ -307,6 +391,7 @@ def evaluate_ma_column(
     target_col: int,
     rows_of_interest: List[int],
     max_passes: int = 6,
+    workbooks: Optional[Tuple[Any, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate every formula in ``target_col`` of the Management Cijfers
@@ -317,64 +402,95 @@ def evaluate_ma_column(
 
     Multiple passes are performed (default 6) so calc subtotals like
     ``SUM(AD3:AD18)`` resolve once their dependencies have a value.
+
+    Pass ``workbooks=(wb, wb_data)`` (already-opened ``openpyxl`` workbooks
+    in formulas mode and data-only mode respectively) to share the open
+    handles with another evaluator call. When provided, this function
+    will not close them.
     """
-    wb = openpyxl.load_workbook(workbook_path, data_only=False)
-    wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
+    if workbooks is not None:
+        wb, wb_data = workbooks
+        owns_handles = False
+    else:
+        wb = openpyxl.load_workbook(workbook_path, data_only=False)
+        wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
+        owns_handles = True
+
     try:
-        sheet = wb[summary_sheet_name] if summary_sheet_name in wb.sheetnames else None
-        if sheet is None:
-            for sn in wb.sheetnames:
-                if 'Management Cijfers' in sn:
-                    sheet = wb[sn]
-                    break
-        bdo_sheet = wb[bdo_sheet_name] if bdo_sheet_name in wb.sheetnames else None
-        bdo_data_only_sheet = (
-            wb_data[bdo_sheet_name]
-            if bdo_sheet_name in wb_data.sheetnames else None
+        sheet, bdo_sheet, bdo_data_only_sheet = _resolve_ma_sheets(
+            wb=wb,
+            wb_data=wb_data,
+            summary_sheet_name=summary_sheet_name,
+            bdo_sheet_name=bdo_sheet_name,
         )
         if sheet is None:
             return {'values': {}, 'unresolved': list(rows_of_interest)}
 
-        formulas: Dict[int, str] = {}
-        static_values: Dict[int, float] = {}
-        for row_idx in rows_of_interest:
-            cell_val = sheet.cell(row=row_idx, column=target_col).value
-            if isinstance(cell_val, str) and cell_val.startswith('='):
-                formulas[row_idx] = cell_val
-            else:
-                num = _read_numeric(cell_val)
-                if num is not None:
-                    static_values[row_idx] = num
+        return _evaluate_one_column(
+            sheet=sheet,
+            bdo_sheet=bdo_sheet,
+            bdo_data_only_sheet=bdo_data_only_sheet,
+            bdo_sheet_name=bdo_sheet_name,
+            target_col=target_col,
+            rows_of_interest=rows_of_interest,
+            max_passes=max_passes,
+        )
+    finally:
+        if owns_handles:
+            wb.close()
+            wb_data.close()
 
-        row_values: Dict[int, float] = dict(static_values)
-        pending = set(formulas.keys())
-        target_formula_rows = set(formulas.keys())
-        for _ in range(max_passes):
-            if not pending:
-                break
-            progressed = False
-            for row_idx in list(pending):
-                value = _evaluate_formula_string(
-                    formulas[row_idx],
-                    target_col=target_col,
-                    row_values=row_values,
-                    target_formula_rows=target_formula_rows,
-                    bdo_sheet=bdo_sheet,
-                    bdo_data_only_sheet=bdo_data_only_sheet,
-                    sheet=sheet,
-                    bdo_sheet_name=bdo_sheet_name,
-                )
-                if value is not None:
-                    row_values[row_idx] = value
-                    pending.discard(row_idx)
-                    progressed = True
-            if not progressed:
-                break
 
-        return {
-            'values': row_values,
-            'unresolved': sorted(pending),
-        }
+def evaluate_ma_columns(
+    workbook_path: str,
+    *,
+    summary_sheet_name: str,
+    bdo_sheet_name: str,
+    columns: List[Tuple[str, int]],
+    rows_of_interest: List[int],
+    max_passes: int = 6,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Evaluate multiple MA columns in a single workbook session.
+
+    ``columns`` is a list of ``(label, target_col)`` tuples; each label is
+    used as the key in the returned dict (e.g. ``[('quarter', 29),
+    ('ltm', 30)]``). Returns
+    ``{label: {"values": {row: float}, "unresolved": [...]}}``.
+
+    Equivalent to calling :func:`evaluate_ma_column` once per ``(label,
+    target_col)`` pair, but opens the workbook only once (saves a few
+    seconds per AI verification round when the file is large).
+    """
+    wb = openpyxl.load_workbook(workbook_path, data_only=False)
+    wb_data = openpyxl.load_workbook(workbook_path, data_only=True)
+    try:
+        sheet, bdo_sheet, bdo_data_only_sheet = _resolve_ma_sheets(
+            wb=wb,
+            wb_data=wb_data,
+            summary_sheet_name=summary_sheet_name,
+            bdo_sheet_name=bdo_sheet_name,
+        )
+        results: Dict[str, Dict[str, Any]] = {}
+        if sheet is None:
+            for label, _ in columns:
+                results[label] = {
+                    'values': {},
+                    'unresolved': list(rows_of_interest),
+                }
+            return results
+
+        for label, target_col in columns:
+            results[label] = _evaluate_one_column(
+                sheet=sheet,
+                bdo_sheet=bdo_sheet,
+                bdo_data_only_sheet=bdo_data_only_sheet,
+                bdo_sheet_name=bdo_sheet_name,
+                target_col=target_col,
+                rows_of_interest=rows_of_interest,
+                max_passes=max_passes,
+            )
+        return results
     finally:
         wb.close()
         wb_data.close()

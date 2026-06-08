@@ -23,6 +23,7 @@ from openpyxl import Workbook
 
 from src.transformers.formula_mirror import (
     evaluate_ma_column,
+    evaluate_ma_columns,
     mirror_quarter_column_to_ltm,
     mirror_quarter_formula_to_ltm,
 )
@@ -215,6 +216,56 @@ class TestEvaluateMaColumnFromFormulas:
         assert result is not None
         assert result["scope"] == "ltm"
         assert result["values"][19] == pytest.approx(2950.0)
+
+
+class TestEvaluateMaColumnsBothScopes:
+    """
+    Phase 4 (I/O consolidation): the dual-column evaluator opens the
+    workbook once and returns both quarter and LTM results. The numbers
+    must match what calling :func:`evaluate_ma_column` per-column
+    returns.
+    """
+
+    def test_evaluate_ma_columns_both_scopes_one_open(self, synthetic_workbook):
+        rows = [3, 4, 19, 67, 68]
+        per_column_q = evaluate_ma_column(
+            str(synthetic_workbook),
+            summary_sheet_name="Management Cijfers - Q1 2026",
+            bdo_sheet_name="BDO",
+            target_col=29,
+            rows_of_interest=rows,
+        )
+        per_column_ltm = evaluate_ma_column(
+            str(synthetic_workbook),
+            summary_sheet_name="Management Cijfers - Q1 2026",
+            bdo_sheet_name="BDO",
+            target_col=30,
+            rows_of_interest=rows,
+        )
+
+        dual = evaluate_ma_columns(
+            str(synthetic_workbook),
+            summary_sheet_name="Management Cijfers - Q1 2026",
+            bdo_sheet_name="BDO",
+            columns=[("quarter", 29), ("ltm", 30)],
+            rows_of_interest=rows,
+        )
+
+        assert dual["quarter"]["values"] == per_column_q["values"]
+        assert dual["ltm"]["values"] == per_column_ltm["values"]
+
+    def test_dual_column_static_method_returns_both(self, synthetic_workbook):
+        result = ManagementAccountsBuilder.evaluate_ma_columns_from_formulas(
+            str(synthetic_workbook),
+            "Management Cijfers - Q1 2026",
+            "BDO",
+        )
+        assert result["quarter"] is not None
+        assert result["ltm"] is not None
+        assert result["quarter"]["scope"] == "quarter"
+        assert result["ltm"]["scope"] == "ltm"
+        assert result["ltm"]["values"][19] == pytest.approx(2950.0)
+        assert result["quarter"]["values"][19] == pytest.approx(300.0)
 
 
 # ---------------------------------------------------------------------------

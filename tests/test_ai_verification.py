@@ -667,12 +667,10 @@ class TestAIVerificationOrchestrator:
         """
         Simulate Claude finding issues and returning patches.
 
-        With the retry loop introduced for BDO reconciliation, the
-        orchestrator may call Claude up to ``MAX_VERIFY_ROUNDS`` times
-        when reconciliation does not pass. The synthetic mock here always
-        returns the same patch, so each round re-applies it; we therefore
-        assert that *at least* one patch was applied and that the final
-        cell value reflects Claude's patch.
+        Under the single-Opus pipeline (``AI_VERIFY_MAX_ROUNDS=1``,
+        the default) the orchestrator calls Claude exactly once and
+        applies the returned patch in-place — no retry. We assert the
+        patch landed and the cell value reflects Claude's response.
         """
         mock_response = {
             'status': 'ISSUES_FOUND',
@@ -703,7 +701,7 @@ class TestAIVerificationOrchestrator:
             'notes': 'Fixed wrong BDO row reference in row 23',
         }
 
-        with patch.object(ClaudeVerifier, 'verify', return_value=mock_response):
+        with patch.object(ClaudeVerifier, 'verify', return_value=mock_response) as mock_verify:
             orchestrator = AIVerificationOrchestrator(
                 config=verification_config,
                 api_key='fake-key',
@@ -715,8 +713,10 @@ class TestAIVerificationOrchestrator:
             )
 
         assert result.status == 'ISSUES_FOUND'
-        assert result.patches_applied >= 1
-        assert result.patches_applied <= AIVerificationOrchestrator.MAX_VERIFY_ROUNDS
+        # Single-Opus: exactly one Claude call, exactly one patch applied.
+        assert mock_verify.call_count == 1
+        assert result.patches_applied == 1
+        assert result.claude_rounds == 1
         assert len(result.issues) == 1
         assert Path(result.verified_file).exists()
 
@@ -760,6 +760,192 @@ class TestAIVerificationOrchestrator:
 
         assert result.status == 'PASS'
         assert Path(result.verified_file).exists()
+
+
+# ---------------------------------------------------------------------------
+# Single Opus Verification Pipeline
+# ---------------------------------------------------------------------------
+
+class TestSingleOpusPipeline:
+    """
+    Verify the default single-Opus pipeline: exactly one Claude call per
+    run, pre-flight evaluator output injected into the prompt, and the
+    legacy multi-round retry loop available behind the
+    ``AI_VERIFY_MAX_ROUNDS`` env override.
+    """
+
+    def test_default_max_rounds_is_one(self, monkeypatch):
+        """``AI_VERIFY_MAX_ROUNDS`` unset → resolved value is 1."""
+        monkeypatch.delenv('AI_VERIFY_MAX_ROUNDS', raising=False)
+        assert AIVerificationOrchestrator._resolve_max_rounds() == 1
+
+    def test_legacy_multi_round_env(self, monkeypatch):
+        """``AI_VERIFY_MAX_ROUNDS=3`` re-enables the legacy retry loop."""
+        monkeypatch.setenv('AI_VERIFY_MAX_ROUNDS', '3')
+        assert AIVerificationOrchestrator._resolve_max_rounds() == 3
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv('AI_VERIFY_MAX_ROUNDS', 'not-an-int')
+        assert AIVerificationOrchestrator._resolve_max_rounds() == 1
+
+    def test_zero_env_clamped_to_one(self, monkeypatch):
+        monkeypatch.setenv('AI_VERIFY_MAX_ROUNDS', '0')
+        assert AIVerificationOrchestrator._resolve_max_rounds() == 1
+
+    def test_single_round_only_one_claude_call(
+        self, sample_workbook, verification_config, sample_bdo_result, monkeypatch
+    ):
+        """
+        Even when revalidation reports failure, the single-Opus pipeline
+        must call Claude exactly once. The legacy 3-round loop would
+        retry on failure; that behaviour is now opt-in via the env var.
+        """
+        monkeypatch.delenv('AI_VERIFY_MAX_ROUNDS', raising=False)
+
+        mock_response = {
+            'status': 'ISSUES_FOUND',
+            'issues': [],
+            'patches': [],
+            'validation_summary': {},
+            'notes': '',
+        }
+
+        with patch.object(ClaudeVerifier, 'verify', return_value=mock_response) as mock_verify, \
+             patch.object(
+                 AIVerificationOrchestrator,
+                 '_revalidate_detailed',
+                 return_value={'passed': False, 'failure_reasons': ['mock failure']},
+             ):
+            orchestrator = AIVerificationOrchestrator(
+                config=verification_config,
+                api_key='fake-key',
+            )
+            result = orchestrator.run(
+                workbook_path=str(sample_workbook),
+                bdo_result=sample_bdo_result,
+            )
+
+        assert mock_verify.call_count == 1
+        assert result.claude_rounds == 1
+        assert result.preflight_passed is False
+        assert result.postflight_passed is False
+
+    def test_preflight_report_injected_in_prompt(
+        self, sample_workbook, verification_config, sample_bdo_result, monkeypatch
+    ):
+        """
+        The pre-flight re-validator output must reach the prompt under
+        the ``PRE-FLIGHT EVALUATOR`` header before Claude is called.
+        """
+        monkeypatch.delenv('AI_VERIFY_MAX_ROUNDS', raising=False)
+
+        preflight_report = {
+            'passed': False,
+            'failure_reasons': ['Synthetic preflight failure'],
+            'auth_row_value': 1234.5,
+            'dep_row_value': 1230.0,
+            'bdo_ground_truth': 1234.5,
+            'bdo_ground_truth_quarter': 1000.0,
+            'evaluated_ltm': {3: 100.0, 19: 1234.5},
+            'evaluated_quarter': {3: 80.0, 19: 1000.0},
+            'ltm_row_mismatches': [
+                {'row': 5, 'actual': "='X'!H10", 'expected': "='X'!H11"},
+            ],
+        }
+
+        captured_prompts = []
+
+        def fake_verify(self, prompt):
+            captured_prompts.append(prompt)
+            return {
+                'status': 'PASS',
+                'issues': [],
+                'patches': [],
+                'validation_summary': {},
+                'notes': '',
+            }
+
+        with patch.object(ClaudeVerifier, 'verify', fake_verify), \
+             patch.object(
+                 AIVerificationOrchestrator,
+                 '_revalidate_detailed',
+                 return_value=preflight_report,
+             ):
+            orchestrator = AIVerificationOrchestrator(
+                config=verification_config,
+                api_key='fake-key',
+            )
+            orchestrator.run(
+                workbook_path=str(sample_workbook),
+                bdo_result=sample_bdo_result,
+            )
+
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert 'PRE-FLIGHT EVALUATOR' in prompt
+        assert 'Synthetic preflight failure' in prompt
+        assert 'EVALUATED LTM COLUMN VALUES' in prompt
+
+    def test_legacy_retry_loop_runs_multiple_rounds(
+        self, sample_workbook, verification_config, sample_bdo_result, monkeypatch
+    ):
+        """With ``AI_VERIFY_MAX_ROUNDS=3``, a failing revalidation triggers retries."""
+        monkeypatch.setenv('AI_VERIFY_MAX_ROUNDS', '3')
+
+        mock_response = {
+            'status': 'ISSUES_FOUND',
+            'issues': [],
+            'patches': [],
+            'validation_summary': {},
+            'notes': '',
+        }
+
+        with patch.object(ClaudeVerifier, 'verify', return_value=mock_response) as mock_verify, \
+             patch.object(
+                 AIVerificationOrchestrator,
+                 '_revalidate_detailed',
+                 return_value={'passed': False, 'failure_reasons': ['mock']},
+             ):
+            orchestrator = AIVerificationOrchestrator(
+                config=verification_config,
+                api_key='fake-key',
+            )
+            result = orchestrator.run(
+                workbook_path=str(sample_workbook),
+                bdo_result=sample_bdo_result,
+            )
+
+        assert mock_verify.call_count == 3
+        assert result.claude_rounds == 3
+
+    def test_timing_attached_to_result(
+        self, sample_workbook, verification_config, sample_bdo_result
+    ):
+        """Verification result carries per-phase wall-clock timings."""
+        with patch.object(
+            ClaudeVerifier, 'verify',
+            return_value={
+                'status': 'PASS',
+                'issues': [],
+                'patches': [],
+                'validation_summary': {},
+                'notes': '',
+            },
+        ):
+            orchestrator = AIVerificationOrchestrator(
+                config=verification_config,
+                api_key='',
+            )
+            result = orchestrator.run(
+                workbook_path=str(sample_workbook),
+                bdo_result=sample_bdo_result,
+            )
+
+        assert isinstance(result.timing, dict)
+        assert 'context_extract' in result.timing
+        assert 'preflight' in result.timing
+        assert 'claude' in result.timing
+        assert 'total' in result.timing
 
 
 # ---------------------------------------------------------------------------
