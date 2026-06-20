@@ -26,6 +26,7 @@ VALUE SOURCES (from Management Cijfers sheet):
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
+from datetime import datetime
 import subprocess
 import re
 import shutil
@@ -356,6 +357,308 @@ def extract_values_from_management_accounts(ma_path: str, quarter: int, year: in
         return {}
 
 
+_DUTCH_MONTHS = {
+    1: 'januari', 2: 'februari', 3: 'maart', 4: 'april',
+    5: 'mei', 6: 'juni', 7: 'juli', 8: 'augustus',
+    9: 'september', 10: 'oktober', 11: 'november', 12: 'december',
+}
+_DUTCH_MONTHS_ALT = '|'.join(_DUTCH_MONTHS.values())
+_ENGLISH_MONTHS = (
+    'January|February|March|April|May|June|July|August|'
+    'September|October|November|December'
+)
+_QUARTER_CANONICAL_RE = re.compile(r'Q([1-4])\s+(\d{4})')
+_QUARTER_VARIANT_RES = [
+    re.compile(r'Q([1-4])\s+(\d{4})'),
+    re.compile(r'Q([1-4])[-/](\d{4})'),
+    re.compile(r'Q([1-4])\s+(\d{2})\b'),
+]
+_ORDINAL_MAP = {
+    '1': ('first', 'eerste'),
+    '2': ('second', 'tweede'),
+    '3': ('third', 'derde'),
+    '4': ('fourth', 'vierde'),
+}
+_QUARTER_END_MONTHS = {
+    '1': ('March', 'maart', '31', '3'),
+    '2': ('June', 'juni', '30', '6'),
+    '3': ('September', 'september', '30', '9'),
+    '4': ('December', 'december', '31', '12'),
+}
+
+
+def format_report_date_dutch(when: datetime) -> str:
+    """Format a datetime as a Dutch cover-page date (e.g. ``7 juni 2026``)."""
+    return f"{when.day} {_DUTCH_MONTHS[when.month]} {when.year}"
+
+
+def _strip_xml_to_text(xml_content: str) -> str:
+    return re.sub(r'<[^>]+>', '', xml_content)
+
+
+def read_docx_xml_text(docx_path: Path) -> str:
+    """Concatenate visible text from document body, headers, and footers."""
+    import zipfile
+
+    parts: List[str] = []
+    with zipfile.ZipFile(docx_path, 'r') as zin:
+        for name in zin.namelist():
+            if not name.endswith('.xml'):
+                continue
+            if not (
+                name == 'word/document.xml'
+                or '/header' in name
+                or '/footer' in name
+            ):
+                continue
+            parts.append(zin.read(name).decode('utf-8', errors='replace'))
+    return _strip_xml_to_text(''.join(parts))
+
+
+def discover_quarter_references(text: str, exclude: Optional[str] = None) -> List[str]:
+    """Find unique quarter strings (``Q{n} YYYY``) anywhere in plain text."""
+    found: set = set()
+    for pattern in _QUARTER_VARIANT_RES:
+        for match in pattern.finditer(text):
+            q_num, year_part = match.group(1), match.group(2)
+            year = year_part if len(year_part) == 4 else f"20{year_part}"
+            canonical = f"Q{q_num} {year}"
+            if exclude and canonical == exclude:
+                continue
+            found.add(canonical)
+    return sorted(found, key=len, reverse=True)
+
+
+def discover_quarter_references_in_docx(
+    docx_path: Path, exclude: Optional[str] = None
+) -> List[str]:
+    return discover_quarter_references(read_docx_xml_text(docx_path), exclude=exclude)
+
+
+def _parse_euro_k(text: str) -> float:
+    return float(text.replace(',', '').replace(' ', ''))
+
+
+def extract_prev_values_from_template(docx_path: Path) -> Dict[str, float]:
+    """
+    Read KPI values currently embedded in the Word template so replacements
+    work regardless of how many reporting cycles the template has been through.
+    """
+    text = read_docx_xml_text(docx_path)
+    prev: Dict[str, float] = {}
+
+    patterns = [
+        ('prev_gtri', r'GTRI[^€%]*€([\d,\.]+)\s*k'),
+        ('prev_gross_rental_income', r'[Gg]ross rental income[^€%]*€([\d,\.]+)\s*k'),
+        ('prev_vacancy_pct', r'[Ff]inancial vacancy[^%]*?([\d,\.]+)\s*%'),
+        ('prev_vacancy_amount', r'[Ff]inancial vacancy[^€]*€([\d,\.]+)\s*k'),
+        ('prev_gtri_ltm', r'(?:rent roll|yields)[^€]*€([\d,\.]+)\s*k'),
+        ('prev_maintenance', r'[Mm]aintenance[^€]*€([\d,\.]+)\s*k'),
+        ('prev_unit_sales_proceeds', r'(?:Unit sale proceeds|sale proceeds)[^€]*€([\d,\.]+)\s*k'),
+    ]
+    for key, pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        raw = match.group(1)
+        if key == 'prev_vacancy_pct':
+            prev[key] = float(raw.replace(',', '.'))
+        else:
+            prev[key] = _parse_euro_k(raw)
+
+    return prev
+
+
+def build_quarter_replacement_pairs(
+    stale_quarters: List[str], current_quarter: str
+) -> List[Tuple[str, str]]:
+    """Build (old, new) replacement pairs for every stale quarter string."""
+    pairs: List[Tuple[str, str]] = []
+    seen: set = set()
+
+    def add(old: str, new: str) -> None:
+        if not old or old == new or (old, new) in seen:
+            return
+        seen.add((old, new))
+        pairs.append((old, new))
+
+    for stale in stale_quarters:
+        if stale == current_quarter:
+            continue
+        stale_parts = stale.split()
+        current_parts = current_quarter.split()
+        if len(stale_parts) != 2 or len(current_parts) != 2:
+            add(stale, current_quarter)
+            continue
+
+        old_q_num = stale_parts[0][1]
+        old_year = stale_parts[1]
+        new_q_num = current_parts[0][1]
+        new_year = current_parts[1]
+
+        add(stale, current_quarter)
+        add(stale.replace(' ', '-'), current_quarter.replace(' ', '-'))
+        add(stale.replace(' ', '/'), current_quarter.replace(' ', '/'))
+        add(f"Q{old_q_num} {old_year[-2:]}", f"Q{new_q_num} {new_year[-2:]}")
+        add(f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}")
+        add(f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}")
+        add(f"{old_year} – Q{old_q_num}", f"{new_year} – Q{new_q_num}")
+        add(f"{old_year} - Q{old_q_num}", f"{new_year} - Q{new_q_num}")
+
+        if old_q_num in _ORDINAL_MAP and new_q_num in _ORDINAL_MAP:
+            old_en, old_nl = _ORDINAL_MAP[old_q_num]
+            new_en, new_nl = _ORDINAL_MAP[new_q_num]
+            add(f"{old_en} quarter", f"{new_en} quarter")
+            add(f"{old_en.capitalize()} quarter", f"{new_en.capitalize()} quarter")
+            add(f"{old_nl} kwartaal", f"{new_nl} kwartaal")
+
+        if old_q_num in _QUARTER_END_MONTHS and new_q_num in _QUARTER_END_MONTHS:
+            old_month, old_month_nl, old_day, old_month_num = _QUARTER_END_MONTHS[old_q_num]
+            new_month, new_month_nl, new_day, new_month_num = _QUARTER_END_MONTHS[new_q_num]
+            add(old_month, new_month)
+            add(old_month.lower(), new_month.lower())
+            add(old_month_nl, new_month_nl)
+            add(
+                f"{old_day} {old_month} {old_year}",
+                f"{new_day} {new_month} {new_year}",
+            )
+            add(
+                f"{old_day} {old_month_nl} {old_year}",
+                f"{new_day} {new_month_nl} {new_year}",
+            )
+            add(
+                f"{old_day}-{old_month_num}-{old_year}",
+                f"{new_day}-{new_month_num}-{new_year}",
+            )
+            add(
+                f"1-{int(old_month_num) + 1}-{old_year}",
+                f"1-{int(new_month_num) + 1}-{new_year}",
+            )
+
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    return pairs
+
+
+def discover_cover_date_strings(docx_path: Path, report_date: str) -> List[str]:
+    """Find cover-page date strings in the template that should become ``report_date``."""
+    text = read_docx_xml_text(docx_path)
+    dates: set = set()
+    for pattern in (
+        rf'\d{{1,2}}\s+(?:{_DUTCH_MONTHS_ALT})\s+\d{{4}}',
+        rf'\d{{1,2}}\s+(?:{_ENGLISH_MONTHS})\s+\d{{4}}',
+    ):
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            candidate = match.group(0)
+            if candidate.lower() != report_date.lower():
+                dates.add(candidate)
+    return sorted(dates, key=len, reverse=True)
+
+
+def build_report_values(
+    *,
+    ma_values: Dict[str, float],
+    rent_roll_k: float,
+    rent_roll_units: int,
+    units_sold_quarter: int,
+    unit_sales_proceeds: float,
+    word_template_path: Path,
+    report_date: Optional[datetime] = None,
+) -> ReportValues:
+    """Assemble ``ReportValues`` with template-derived previous KPI anchors."""
+    prev = extract_prev_values_from_template(word_template_path)
+    when = report_date or datetime.now()
+    gtri_ltm = ma_values.get('gtri_ltm') or 0.0
+    if gtri_ltm <= 0:
+        gtri_ltm = rent_roll_k
+
+    return ReportValues(
+        report_date=format_report_date_dutch(when),
+        gtri=ma_values.get('gtri', 0.0),
+        gtri_ltm=gtri_ltm,
+        gross_rental_income=ma_values.get('gross_rental', 0.0),
+        gross_rental_income_ltm=ma_values.get('gross_rental_ltm', 0.0),
+        financial_vacancy_pct=ma_values.get('vacancy_pct', 0.0),
+        financial_vacancy_amount=ma_values.get('vacancy_amount', 0.0),
+        rent_roll_annual=rent_roll_k,
+        rent_roll_units=rent_roll_units,
+        units_sold_quarter=units_sold_quarter,
+        unit_sales_proceeds=unit_sales_proceeds,
+        maintenance_amount=ma_values.get('maintenance', 0.0),
+        maintenance_ltm=ma_values.get('maintenance_ltm', 0.0),
+        capex_amount=0.0,
+        capex_ltm=0.0,
+        unit_sales_narrative=(
+            f"{units_sold_quarter} unit(s) sold for €{unit_sales_proceeds:,.0f}k"
+            if units_sold_quarter > 0
+            else "No unit sales this quarter."
+        ),
+        maintenance_detail="",
+        sustainability_detail="",
+        prev_gtri=prev.get('prev_gtri', 0.0),
+        prev_gtri_ltm=prev.get('prev_gtri_ltm', 0.0),
+        prev_gross_rental_income=prev.get('prev_gross_rental_income', 0.0),
+        prev_vacancy_pct=prev.get('prev_vacancy_pct', 0.0),
+        prev_vacancy_amount=prev.get('prev_vacancy_amount', 0.0),
+        prev_rent_roll=0.0,
+        prev_maintenance=prev.get('prev_maintenance', 0.0),
+        prev_unit_sales_proceeds=prev.get('prev_unit_sales_proceeds', 0.0),
+    )
+
+
+def _numeric_variants(value: float) -> List[float]:
+    if value <= 0:
+        return []
+    variants = {round(value, 1), round(value, 0), value}
+    if value >= 100:
+        variants.add(round(value, -1))
+    return [v for v in variants if v > 0]
+
+
+def _collapse_xml_runs_to_single_value(xml_span: str, new_text: str) -> str:
+    first = True
+
+    def repl(_match: re.Match) -> str:
+        nonlocal first
+        if first:
+            first = False
+            return f'>{new_text}</w:t>'
+        return '></w:t>'
+
+    return re.sub(r'>([^<]*)</w:t>', repl, xml_span)
+
+
+def _find_fragmented_number_span(content: str, target_value: float, max_runs: int = 12) -> Optional[str]:
+    """Locate an XML span whose concatenated ``w:t`` text equals ``target_value``."""
+    if target_value <= 0:
+        return None
+
+    runs = list(re.finditer(r'>([^<]*)</w:t>', content))
+    targets = _numeric_variants(target_value)
+
+    for i in range(len(runs)):
+        combined = ''
+        for j in range(i, min(i + max_runs, len(runs))):
+            combined += runs[j].group(1)
+            normalized = (
+                combined.replace('€', '')
+                .replace(' ', '')
+                .replace(',', '')
+                .replace('k', '')
+                .replace('m', '')
+                .replace('%', '')
+            )
+            if not normalized or normalized in ('.', '-'):
+                continue
+            try:
+                parsed = float(normalized)
+            except ValueError:
+                continue
+            for candidate in targets:
+                if abs(parsed - candidate) <= 0.25:
+                    return content[runs[i].start():runs[j].end()]
+    return None
+
+
 @dataclass 
 class NumericValueMapping:
     """Maps a KPI to its context pattern and value formatter."""
@@ -657,18 +960,36 @@ class WordTemplateUpdater:
         
         logger.info(f"Updating Word template for {current_quarter} (python-docx + XML method)")
         
+        stale_quarters = discover_quarter_references_in_docx(
+            self.template_path, exclude=current_quarter
+        )
+        if previous_quarter not in stale_quarters and previous_quarter != current_quarter:
+            stale_quarters.append(previous_quarter)
+        self._quarter_pairs = build_quarter_replacement_pairs(
+            stale_quarters, current_quarter
+        )
+        self._cover_date_patterns = discover_cover_date_strings(
+            self.template_path, values.report_date
+        )
+        self._cover_date_patterns.extend(self._get_old_date_patterns(previous_quarter))
+        seen_dates = set()
+        self._cover_date_patterns = [
+            p for p in self._cover_date_patterns
+            if p.lower() != values.report_date.lower()
+            and not (p.lower() in seen_dates or seen_dates.add(p.lower()))
+        ]
+        self._cover_date_patterns.sort(key=len, reverse=True)
+        
         # Copy template to output location
         shutil.copy2(self.template_path, self.output_path)
         
         # Step 1: Update regular paragraphs/tables via python-docx (basic text replacements)
         doc = Document(self.output_path)
         
-        old_date_patterns = self._get_old_date_patterns(previous_quarter)
-        
         # Process paragraphs
         for para in doc.paragraphs:
             self._process_paragraph(para, values, previous_quarter, current_quarter)
-            self._update_cover_page_date(para, old_date_patterns, values.report_date)
+            self._update_cover_page_date(para, self._cover_date_patterns, values.report_date)
         
         # Process tables
         for table in doc.tables:
@@ -676,14 +997,16 @@ class WordTemplateUpdater:
                 for cell in row.cells:
                     for para in cell.paragraphs:
                         self._process_paragraph(para, values, previous_quarter, current_quarter)
-                        self._update_cover_page_date(para, old_date_patterns, values.report_date)
+                        self._update_cover_page_date(para, self._cover_date_patterns, values.report_date)
         
         # Process headers/footers
         for section in doc.sections:
             for para in section.header.paragraphs:
                 self._process_paragraph(para, values, previous_quarter, current_quarter)
+                self._update_cover_page_date(para, self._cover_date_patterns, values.report_date)
             for para in section.footer.paragraphs:
                 self._process_paragraph(para, values, previous_quarter, current_quarter)
+                self._update_cover_page_date(para, self._cover_date_patterns, values.report_date)
         
         doc.save(self.output_path)
         
@@ -705,89 +1028,31 @@ class WordTemplateUpdater:
         Returns list of (old_text, new_text) tuples, sorted longest-first.
         
         INCLUDES: 
-        - Quarter text replacements (Q2 -> Q3)
+        - Quarter text replacements (all stale quarters found in template)
         - Date replacements
         - NUMERIC VALUE REPLACEMENTS (Page 4 KPIs)
         """
-        replacements = []
-        
-        # Extract quarter components
-        old_parts = old_quarter.split()
-        new_parts = new_quarter.split()
-        old_q_num = old_parts[0][1] if len(old_parts) == 2 else ''
-        old_year = old_parts[1] if len(old_parts) == 2 else ''
-        new_q_num = new_parts[0][1] if len(new_parts) == 2 else ''
-        new_year = new_parts[1] if len(new_parts) == 2 else ''
-        
-        # === NUMERIC VALUE REPLACEMENTS (Page 4 KPIs) ===
-        # These replace last quarter's numeric values with new quarter's values
+        replacements: List[Tuple[str, str]] = []
+
+        stale_quarters = discover_quarter_references_in_docx(
+            self.template_path, exclude=new_quarter
+        )
+        if old_quarter not in stale_quarters and old_quarter != new_quarter:
+            stale_quarters.append(old_quarter)
+        replacements.extend(build_quarter_replacement_pairs(stale_quarters, new_quarter))
+
         numeric_replacements = self._build_numeric_replacements(values)
         replacements.extend(numeric_replacements)
-        
-        # Quarter text replacements
-        replacements.extend([
-            (old_quarter, new_quarter),
-            (old_quarter.replace(' ', '-'), new_quarter.replace(' ', '-')),
-            (old_quarter.replace(' ', '/'), new_quarter.replace(' ', '/')),
-            (f"Q{old_q_num} {old_year[-2:]}", f"Q{new_q_num} {new_year[-2:]}"),
-            (f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}"),
-            (f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}"),
-            (f"{old_year} – Q{old_q_num}", f"{new_year} – Q{new_q_num}"),
-            (f"{old_year} - Q{old_q_num}", f"{new_year} - Q{new_q_num}"),
-        ])
-        
-        # Ordinal replacements
-        ordinal_map = {
-            '1': ('first', 'eerste'),
-            '2': ('second', 'tweede'),
-            '3': ('third', 'derde'),
-            '4': ('fourth', 'vierde'),
-        }
-        if old_q_num in ordinal_map and new_q_num in ordinal_map:
-            old_en, old_nl = ordinal_map[old_q_num]
-            new_en, new_nl = ordinal_map[new_q_num]
-            replacements.extend([
-                (f"{old_en} quarter", f"{new_en} quarter"),
-                (f"the {old_en}", f"the {new_en}"),
-                (f"{old_nl} kwartaal", f"{new_nl} kwartaal"),
-            ])
-        
-        # Date replacements
-        quarter_to_month = {
-            '1': ('March', 'maart', '31', '3'),
-            '2': ('June', 'juni', '30', '6'),
-            '3': ('September', 'september', '30', '9'),
-            '4': ('December', 'december', '31', '12'),
-        }
-        
-        if old_q_num in quarter_to_month and new_q_num in quarter_to_month:
-            old_month, old_month_nl, old_day, old_month_num = quarter_to_month[old_q_num]
-            new_month, new_month_nl, new_day, new_month_num = quarter_to_month[new_q_num]
-            
-            # Month names
-            replacements.extend([
-                (old_month, new_month),
-                (old_month.lower(), new_month.lower()),
-                (old_month_nl, new_month_nl),
-            ])
-            
-            # Date formats
-            replacements.extend([
-                (f"{old_day} {old_month} {old_year}", f"{new_day} {new_month} {new_year}"),
-                (f"{old_day} {old_month_nl} {old_year}", f"{new_day} {new_month_nl} {new_year}"),
-                (f"{old_day}-{old_month_num}-{old_year}", f"{new_day}-{new_month_num}-{new_year}"),
-                # Rent roll date (1st of next month)
-                (f"1-{int(old_month_num)+1}-{old_year}", f"1-{int(new_month_num)+1}-{new_year}"),
-            ])
-        
-        # Cover page date - get patterns and replace with current report date
+
+        for old_date in discover_cover_date_strings(self.template_path, values.report_date):
+            replacements.append((old_date, values.report_date))
+
         old_date_patterns = self._get_old_date_patterns(old_quarter)
         for old_date in old_date_patterns:
-            replacements.append((old_date, values.report_date))
-        
-        # Sort by length (longest first) to prevent partial matches
+            if old_date.lower() != values.report_date.lower():
+                replacements.append((old_date, values.report_date))
+
         replacements.sort(key=lambda x: len(x[0]), reverse=True)
-        
         return replacements
     
     def _build_numeric_replacements(self, values: ReportValues) -> List[Tuple[str, str]]:
@@ -1103,36 +1368,18 @@ class WordTemplateUpdater:
         # Define specific value replacements: (old_value, new_value, value_format, context_keywords)
         # Using exact Q2 values found in the template document
         specific_replacements = [
-            # GTRI quarterly: €3,200.6k → new GTRI
-            (3200.6, values.gtri, 'euro_k_decimal', ['GTRI', 'Gross Theoretical rental income']),
-            (3200, values.gtri, 'euro_k', ['GTRI', 'Gross Theoretical rental income']),
-            
-            # Financial vacancy amount: €106.3k → new vacancy amount  
-            (106.3, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),
-            (128.5, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),  # Alternative Q2 value
-            
-            # Financial vacancy percentage: 4.1% → new percentage
-            (4.1, values.financial_vacancy_pct, 'percent', ['vacancy']),
-            
-            # Gross rental income: €3,067.5k → new gross rental
-            (3067.5, values.gross_rental_income, 'euro_k_decimal', ['gross rental income']),
-            (3067, values.gross_rental_income, 'euro_k', ['gross rental income']),
-            
-            # Rent roll yields (this is LTM GTRI): €12,940.2k → new LTM GTRI
-            (12940.2, values.gtri_ltm, 'euro_k_decimal', ['rent roll', 'yields']),
-            (12940, values.gtri_ltm, 'euro_k', ['rent roll', 'yields']),
-            
-            # Unit sales proceeds: €762.5k → new proceeds
-            (762.5, values.unit_sales_proceeds, 'euro_k_decimal', ['Unit sale proceeds', 'proceeds']),
-            (762, values.unit_sales_proceeds, 'euro_k', ['sale proceeds']),
-            
-            # Maintenance: €297k → new maintenance
-            (297, values.maintenance_amount, 'euro_k', ['Maintenance']),
+            (values.prev_gtri, values.gtri, 'euro_k_decimal', ['GTRI', 'Gross Theoretical rental income']),
+            (values.prev_vacancy_amount, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),
+            (values.prev_vacancy_pct, values.financial_vacancy_pct, 'percent', ['vacancy']),
+            (values.prev_gross_rental_income, values.gross_rental_income, 'euro_k_decimal', ['gross rental income']),
+            (values.prev_gtri_ltm, values.gtri_ltm, 'euro_k_decimal', ['rent roll', 'yields']),
+            (values.prev_unit_sales_proceeds, values.unit_sales_proceeds, 'euro_k_decimal', ['Unit sale proceeds', 'proceeds']),
+            (values.prev_maintenance, values.maintenance_amount, 'euro_k', ['Maintenance']),
         ]
         
         # Apply specific replacements
         for old_val, new_val, fmt, keywords in specific_replacements:
-            if new_val <= 0:
+            if new_val <= 0 or old_val <= 0:
                 continue
             
             # Generate old and new formatted strings
@@ -1353,189 +1600,43 @@ class WordTemplateUpdater:
     
     def _apply_fragmented_euro_replacements(self, content: str, values: ReportValues) -> Tuple[str, int]:
         """
-        Apply replacements for fragmented euro values in Word XML.
-        
-        Word XML often splits numbers like "€3,200.6k" into multiple elements:
-        - <w:t>€</w:t><w:t>3,0</w:t><w:t>6</w:t><w:t>7</w:t><w:t>.</w:t><w:t>5</w:t><w:t> k</w:t>
-        
-        This method finds specific old values and replaces them with new values,
-        handling the XML fragmentation.
-        
-        Returns:
-            (updated_content, count_of_replacements)
+        Replace fragmented euro/percent KPI values in Word XML.
+
+        Uses template-derived previous values (``values.prev_*``) so replacements
+        work after multiple reporting cycles, not only from one hardcoded anchor.
         """
-        import re
         updates_made = 0
-        
-        # Define specific value replacements
-        # Format: (old_first_frag, old_pattern_regex, new_value, description)
-        # The pattern should capture the first numeric fragment that will hold the new value
-        
-        value_replacements = [
-            # === Portfolio Highlights Section ===
-            # GTRI: "€" + "3," + "20" + "0" + "." + "6" + "k" -> new GTRI value
-            # Exact fragmentation from template: € | 3, | 20 | 0 | . | 6
-            # Pattern must capture all fragments including the decimal digit (any digit)
-            (r'>(3,)</w:t>(.*?<w:t[^>]*>)(20)</w:t>(.*?<w:t[^>]*>)(0)</w:t>(.*?<w:t[^>]*>)(\.)</w:t>(.*?<w:t[^>]*>)(\d)</w:t>',
-             values.gtri, 'gtri_portfolio'),
-            
-            # Gross rental income: "€" + "3,0" + "6" + "7" + "." + "5" + "k"
-            (r'>(3,0)</w:t>(.*?<w:t[^>]*>)(6)(</w:t>.*?<w:t[^>]*>)(7)(</w:t>.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(5)</w:t>',
-             values.gross_rental_income, 'gross_rental'),
-            
-            # Financial vacancy percentage pattern 1: "4" + "." + "1" + "%" -> "5.4%"
-            (r'>(4)</w:t>(.*?<w:t[^>]*>)(\.)</w:t>(.*?<w:t[^>]*>)(1)</w:t>(.*?<w:t[^>]*>)(%)</w:t>',
-             values.financial_vacancy_pct, 'vacancy_pct'),
-            
-            # Financial vacancy percentage pattern 2: "4." + "1" + "%" (4. together) -> "5.4%"
-            (r'>(4\.)</w:t>(.*?<w:t[^>]*>)(1)</w:t>(.*?<w:t[^>]*>)(%)',
-             values.financial_vacancy_pct, 'vacancy_pct_combined'),
-            
-            # Rent roll yields: " yields €12," + "940" + "." + "2" -> new LTM value  
-            (r'>( yields €12,)</w:t>(.*?<w:t[^>]*>)(940)(</w:t>.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(2)</w:t>',
-             values.gtri_ltm, 'rent_roll_yields'),
-            
-            # Unit sale proceeds: "762" + "." + "5" -> new value
-            (r'>(762)</w:t>(.*?<w:t[^>]*>)(\.)(<w:t[^>]*>|</w:t>.*?<w:t[^>]*>)(5)</w:t>',
-             values.unit_sales_proceeds, 'unit_sales'),
+
+        euro_replacements = [
+            (values.prev_gtri, values.gtri, lambda v: f'{v:,.1f}'),
+            (values.prev_gross_rental_income, values.gross_rental_income, lambda v: f'{v:,.1f}'),
+            (values.prev_vacancy_amount, values.financial_vacancy_amount, lambda v: f'{v:,.1f}'),
+            (values.prev_gtri_ltm, values.gtri_ltm, lambda v: f'{v:,.1f}'),
+            (values.prev_unit_sales_proceeds, values.unit_sales_proceeds, lambda v: f'{int(round(v))}'),
+            (values.prev_maintenance, values.maintenance_amount, lambda v: f'{v:,.0f}'),
         ]
-        
-        for pattern, new_value, desc in value_replacements:
-            if new_value <= 0:
+
+        for old_value, new_value, formatter in euro_replacements:
+            if new_value <= 0 or old_value <= 0:
                 continue
-            
-            # Find all matches and process them
-            # Use re.sub with count or process one at a time with fresh search
-            while True:
-                match = re.search(pattern, content, re.DOTALL)
-                if not match:
-                    break
-                # Format new value based on type
-                if 'pct' in desc:
-                    new_formatted = f'{new_value:.1f}'
-                else:
-                    new_formatted = f'{new_value:,.1f}'
-                
-                old_full = match.group(0)
-                first_group = match.group(1)
-                
-                # Handle different replacement types
-                if desc == 'rent_roll_yields':
-                    int_part = int(new_value)
-                    dec_part = int(round((new_value - int_part) * 10))
-                    
-                    new_full = old_full.replace(f'>{first_group}</w:t>', '> yields €</w:t>', 1)
-                    new_full = re.sub(r'>(940)</w:t>', f'>{int_part:,}</w:t>', new_full)
-                    new_full = re.sub(r'>(2)</w:t>', f'>{dec_part}</w:t>', new_full)
-                    
-                elif desc == 'gtri_portfolio':
-                    # GTRI: "3," + "20" + "0" + "." + "6" -> "3,273.6"
-                    # Round to 1 decimal place to ensure consistent formatting
-                    rounded_value = round(new_value, 1)
-                    int_part = int(rounded_value)
-                    dec_part = int(round((rounded_value - int_part) * 10))
-                    
-                    # Get the old decimal digit from match (group 9)
-                    old_dec_digit = match.group(9) if len(match.groups()) >= 9 else None
-                    
-                    # Replace "3," with new thousands part (includes decimal point)
-                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part:,}.</w:t>', 1)
-                    # Replace "20" with new decimal digit (single digit only)
-                    new_full = re.sub(r'>(20)</w:t>', f'>{dec_part}</w:t>', new_full)
-                    # Clear "0" - keep the tag structure but remove digit
-                    new_full = re.sub(r'>(0)</w:t>', '></w:t>', new_full)
-                    # Clear "." since we already added decimal point above
-                    new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
-                    # Clear the old decimal digit (captured from match) - it's been replaced above
-                    if old_dec_digit:
-                        # Replace only the specific old decimal digit fragment
-                        new_full = new_full.replace(f'>{old_dec_digit}</w:t>', '></w:t>', 1)
-                    
-                    # Additional safety: After all replacements, ensure we don't have a second decimal digit
-                    # Check if the result contains "273.6" followed by another digit fragment
-                    # This is a cleanup pass to handle any edge cases
-                    if f'273.{dec_part}' in new_full:
-                        # If we see "273.6" followed by another digit (like "273.66"), remove the second digit
-                        # Pattern: "273.6" + any XML + another digit fragment
-                        new_full = re.sub(
-                            r'(273\.' + str(dec_part) + r')</w:t>(.*?<w:t[^>]*>)(\d)</w:t>',
-                            r'\1</w:t>\2></w:t>',
-                            new_full,
-                            count=1  # Only replace first occurrence
-                        )
-                    
-                elif desc == 'vacancy_pct':
-                    # Vacancy percentage: "4" + "." + "1" + "%" -> "5.4%"
-                    int_part = int(new_value)
-                    dec_part = int(round((new_value - int_part) * 10))
-                    
-                    # Replace the entire fragmented pattern at once to avoid creating new matches
-                    # Extract positions of key elements in the match
-                    # Simply put the whole value in the first element and clear others
-                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part}.{dec_part}</w:t>', 1)
-                    # Clear the original "." 
-                    new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
-                    # Clear the "1" completely (don't replace with 4 which creates new match)
-                    new_full = re.sub(r'>(1)</w:t>', '></w:t>', new_full)
-                    
-                elif desc == 'vacancy_pct_combined':
-                    # Vacancy percentage: "4." + "1" + "%" -> "5.4%"
-                    int_part = int(new_value)
-                    dec_part = int(round((new_value - int_part) * 10))
-                    
-                    # Put the whole value in the first element
-                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{int_part}.{dec_part}</w:t>', 1)
-                    # Clear "1" completely
-                    new_full = re.sub(r'>(1)</w:t>', '></w:t>', new_full)
-                    
-                elif desc == 'unit_sales':
-                    # Unit sales proceeds: "762" + "." + "5" -> "204" (new value)
-                    # Put the rounded value in the first element and clear others
-                    new_int = int(round(new_value))
-                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{new_int}</w:t>', 1)
-                    # Clear "." 
-                    new_full = re.sub(r'>(\.)</w:t>', '></w:t>', new_full)
-                    # Clear "5" 
-                    new_full = re.sub(r'>(5)</w:t>', '></w:t>', new_full)
-                    
-                else:
-                    # Default: Replace first numeric group with new value
-                    new_full = old_full.replace(f'>{first_group}</w:t>', f'>{new_formatted}</w:t>', 1)
-                    
-                    # Clear subsequent numeric fragments
-                    first_close = new_full.find('</w:t>')
-                    if first_close > 0:
-                        rest = new_full[first_close:]
-                        rest = re.sub(r'>(\d+)</w:t>', '></w:t>', rest)
-                        rest = re.sub(r'>( ?\d+)</w:t>', '></w:t>', rest)
-                        rest = re.sub(r'>(\.)</w:t>', '></w:t>', rest)
-                        new_full = new_full[:first_close] + rest
-                
-                if new_full != old_full:
-                    content = content.replace(old_full, new_full, 1)
+            span = _find_fragmented_number_span(content, old_value)
+            if not span:
+                continue
+            new_text = formatter(new_value)
+            new_span = _collapse_xml_runs_to_single_value(span, new_text)
+            if new_span != span:
+                content = content.replace(span, new_span, 1)
+                updates_made += 1
+
+        if values.financial_vacancy_pct > 0 and values.prev_vacancy_pct > 0:
+            pct_span = _find_fragmented_number_span(content, values.prev_vacancy_pct)
+            if pct_span:
+                new_pct = f'{values.financial_vacancy_pct:.1f}'
+                new_span = _collapse_xml_runs_to_single_value(pct_span, new_pct)
+                if new_span != pct_span:
+                    content = content.replace(pct_span, new_span, 1)
                     updates_made += 1
-                    logger.debug(f"Replaced fragmented {desc}: {new_formatted}")
-        
-        # Final cleanup pass: Fix any GTRI values that still have 2 decimal places
-        # This catches cases where the pattern didn't match or there's a different structure
-        # Pattern: "273.6" + XML + another digit -> "273.6" (remove second digit)
-        # Handle fragmented case: "273." + "6" + XML + "6" -> "273." + "6" + XML + ""
-        gtri_2dec_pattern = r'(273\.(\d))</w:t>(.*?<w:t[^>]*>)(\d)</w:t>'
-        def fix_gtri_2dec(m):
-            first_dec = m.group(2)
-            second_dec = m.group(4)
-            # Round: if second decimal is 5 or more, round up first decimal
-            if int(second_dec) >= 5:
-                new_first_dec = str((int(first_dec) + 1) % 10)
-                return f'273.{new_first_dec}</w:t>{m.group(3)}></w:t>'
-            else:
-                # Just remove the second digit
-                return f'{m.group(1)}</w:t>{m.group(3)}></w:t>'
-        
-        # Only apply if we see "273.XX" pattern (where XX are two digits)
-        if '273.' in content:
-            content = re.sub(gtri_2dec_pattern, fix_gtri_2dec, content, count=2)  # Max 2 occurrences
-        
+
         return content, updates_made
     
     def _apply_fragmented_date_replacements(self, content: str, replacements: List[Tuple[str, str]]) -> str:
@@ -1603,152 +1704,88 @@ class WordTemplateUpdater:
     
     def _apply_xml_aware_patterns(self, content: str, replacements: List[Tuple[str, str]]) -> str:
         """
-        Apply XML-aware patterns for commonly fragmented text.
-        
-        Word frequently fragments text like "Q2 2025" into separate runs:
-        - <w:t>Q2</w:t>...<w:t> 2025</w:t>
-        - <w:t>Q</w:t>...<w:t>2</w:t>...<w:t> 2025</w:t>
-        - <w:t>21</w:t>...<w:t> juli</w:t>...<w:t> 2025</w:t>
-        - <w:t>in Q</w:t>...<w:t>2</w:t>...<w:t> 2025</w:t>
-        
-        This function handles these cases with targeted regex patterns.
+        Apply XML-aware patterns for commonly fragmented quarter text.
+
+        Processes every canonical ``Q{n} YYYY`` replacement pair (not just the
+        calendar-previous quarter) so stale template references are updated too.
         """
         import re
-        
-        # Extract quarter numbers from replacements for dynamic pattern building
-        old_q_num = None
-        new_q_num = None
-        old_year = None
-        new_year = None
-        
+
+        seen_pairs: set = set()
         for old_text, new_text in replacements:
-            # Find "Q2 2025" -> "Q3 2025" style replacements
             old_match = re.match(r'Q(\d)\s+(\d{4})', old_text)
             new_match = re.match(r'Q(\d)\s+(\d{4})', new_text)
-            if old_match and new_match:
-                old_q_num = old_match.group(1)
-                old_year = old_match.group(2)
-                new_q_num = new_match.group(1)
-                new_year = new_match.group(2)
-                break
-        
-        if not old_q_num:
-            return content
-        
-        # CRITICAL: Handle fragmented pattern where "in Q" is followed by "2" in next run
-        # Pattern: <w:t>in Q</w:t></w:r>...<w:t>2</w:t> → replace 2 with 3
-        #
-        # IMPORTANT: Use a restrictive pattern that only matches the IMMEDIATELY NEXT <w:t> element
-        # to prevent accidentally matching "2" that's part of year "2025" (which can be stored as "20"|"2"|"5")
-        #
-        # KEY FIX: Use (?:(?!</w:rPr>).)* instead of .*? in <w:rPr> to prevent backtracking
-        # from consuming multiple </w:rPr> closings (which would skip over multiple runs)
-        
-        # Pattern for matching immediately next <w:t> after closing </w:r>
-        # The (?:(?!</w:rPr>).)* is a negative lookahead that prevents matching </w:rPr>
+            if not old_match or not new_match:
+                continue
+            key = (old_match.group(1), old_match.group(2))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            content = self._apply_xml_quarter_pair(
+                content,
+                old_match.group(1),
+                old_match.group(2),
+                new_match.group(1),
+                new_match.group(2),
+            )
+        return content
+
+    def _apply_xml_quarter_pair(
+        self,
+        content: str,
+        old_q_num: str,
+        old_year: str,
+        new_q_num: str,
+        new_year: str,
+    ) -> str:
+        """Apply fragmented XML quarter patterns for one stale → current pair."""
+        import re
+
         next_wt_pattern = r'</w:t></w:r><w:r[^>]*>(?:<w:rPr>(?:(?!</w:rPr>).)*</w:rPr>)?<w:t[^>]*>'
-        
-        # Match: 'in Q</w:t>' followed by IMMEDIATE next <w:t> containing the quarter number
-        fragmented_pattern = rf'(in Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Also handle '% in Q</w:t>' pattern
-        fragmented_pattern2 = rf'(% in Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern2, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle 'In Q</w:t>' (capital I)
-        fragmented_pattern3 = rf'(In Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern3, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle ' Q</w:t>' followed by number (space before Q)
-        fragmented_pattern4 = rf'( Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern4, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle 'Actions Q</w:t>' followed by number
-        fragmented_pattern5 = rf'(Actions Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern5, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle '– Q</w:t>' followed by number (for Portfolio highlights)
-        fragmented_pattern6 = rf'(– Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern6, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle '- Q</w:t>' followed by number (dash variant)
-        fragmented_pattern7 = rf'(- Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern7, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle 's Q</w:t>' followed by number (for 'highlights Q2')
-        fragmented_pattern8 = rf'(s Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern8, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # Handle single 'Q</w:t>' followed by number in separate element
-        # This catches cases where "Q" and "2" are completely split
-        fragmented_pattern9 = rf'(>Q{next_wt_pattern}){old_q_num}(</w:t>)'
-        content = re.sub(fragmented_pattern9, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL)
-        
-        # XML tag pattern that may appear between text fragments
-        xml_gap = r'</w:t></w:r>(?:<w:r[^>]*>)?(?:<w:rPr[^>]*>.*?</w:rPr>)?<w:t[^>]*>'
-        
-        # Define fragmented pattern replacements
+
+        fragmented_patterns = [
+            rf'(in Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(% in Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(In Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'( Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(Actions Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(– Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(- Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(s Q{next_wt_pattern}){old_q_num}(</w:t>)',
+            rf'(>Q{next_wt_pattern}){old_q_num}(</w:t>)',
+        ]
+        for pattern in fragmented_patterns:
+            content = re.sub(
+                pattern, rf'\g<1>{new_q_num}\g<2>', content, flags=re.DOTALL
+            )
+
         xml_patterns = [
-            # "Q2 2025" fragmented as Q + 2 + " 2025" or "Q2" + " 2025"
             (rf'>Q{old_q_num}</w:t>', f'>Q{new_q_num}</w:t>'),
             (rf'>Q{old_q_num}<', f'>Q{new_q_num}<'),
             (rf'>Q{old_q_num} {old_year}<', f'>Q{new_q_num} {new_year}<'),
-            
-            # "in Q2" patterns (common in narrative text)
             (rf'> in Q{old_q_num}<', f'> in Q{new_q_num}<'),
             (rf'>in Q{old_q_num}<', f'>in Q{new_q_num}<'),
             (rf' in Q{old_q_num} {old_year}', f' in Q{new_q_num} {new_year}'),
             (rf'in Q{old_q_num} {old_year}', f'in Q{new_q_num} {new_year}'),
-            
-            # "Actions Q2 2025" patterns
             (rf'>Actions Q{old_q_num} {old_year}<', f'>Actions Q{new_q_num} {new_year}<'),
             (rf'Actions Q{old_q_num} {old_year}', f'Actions Q{new_q_num} {new_year}'),
             (rf'>Actions Q{old_q_num}<', f'>Actions Q{new_q_num}<'),
-            
-            # "In Q2 2025" patterns
             (rf'>In Q{old_q_num} {old_year}<', f'>In Q{new_q_num} {new_year}<'),
             (rf'In Q{old_q_num} {old_year}', f'In Q{new_q_num} {new_year}'),
-            
-            # Unit/amount references like "units in Q2 2025"
             (rf' Q{old_q_num} {old_year}', f' Q{new_q_num} {new_year}'),
-            
-            # "2025 – Q2" patterns
             (rf'>{old_year} – Q{old_q_num}<', f'>{new_year} – Q{new_q_num}<'),
             (rf'>{old_year} - Q{old_q_num}<', f'>{new_year} - Q{new_q_num}<'),
             (rf'>{old_year[-2:]} – Q{old_q_num}<', f'>{new_year[-2:]} – Q{new_q_num}<'),
-            (rf'5 – Q{old_q_num}<', f'5 – Q{new_q_num}<'),  # For "2025 – Q2" split
             (rf'{old_year} – Q{old_q_num}', f'{new_year} – Q{new_q_num}'),
-            
-            # Ordinal patterns - dynamically determined by quarter
-            # TODO: Make these dynamic based on quarter numbers
-            (r'>second quarter<', '>third quarter<'),
-            (r'>second<', '>third<'),  # For split "second quarter"
-            (r'>the second<', '>the third<'),
-            (r'second quarter', 'third quarter'),
-            (r'the second quarter', 'the third quarter'),
-            
-            # NOTE: Cover page date is handled by _build_replacement_map with values.report_date
-            # Do NOT add hardcoded date patterns here that would override the proper replacement
-            
-            # Quarter-end date patterns (these are data dates, not report date)
-            (rf'>30-6-{old_year}<', f'>30-9-{new_year}<'),
-            (rf'>1-7-{old_year}<', f'>1-10-{new_year}<'),
-            
-            # Month patterns for quarter-end references (e.g., "as of June 2025")
-            # NOT for report/cover page dates
-            (r'>June<', '>September<'),
-            (r'>juni<', '>september<'),
         ]
-        
+
         for pattern, replacement in xml_patterns:
             try:
                 if re.search(pattern, content):
                     content = re.sub(pattern, replacement, content)
-                    logger.debug(f"XML pattern: {pattern} -> {replacement}")
             except re.error as e:
                 logger.debug(f"Regex error for pattern {pattern}: {e}")
-        
+
         return content
     
     def _get_old_date_patterns(self, previous_quarter: str) -> List[str]:
@@ -1811,88 +1848,20 @@ class WordTemplateUpdater:
     def _process_paragraph(self, para, values: ReportValues, 
                           old_quarter: str, new_quarter: str):
         """Process a single paragraph for replacements."""
-        # Check if paragraph contains text to replace
         text = para.text
-        
-        # Extract quarter components for dynamic patterns
-        old_parts = old_quarter.split()
-        new_parts = new_quarter.split()
-        old_q_num = old_parts[0][1] if len(old_parts) == 2 else ''
-        old_year = old_parts[1] if len(old_parts) == 2 else ''
-        new_q_num = new_parts[0][1] if len(new_parts) == 2 else ''
-        new_year = new_parts[1] if len(new_parts) == 2 else ''
-        
-        # Quarter replacement
-        if old_quarter in text:
-            self._replace_in_runs(para, old_quarter, new_quarter)
-        
-        # Handle various quarter formats dynamically
-        quarter_patterns = [
-            (old_quarter.replace(' ', '-'), new_quarter.replace(' ', '-')),  # Q2-2025
-            (old_quarter.replace(' ', '/'), new_quarter.replace(' ', '/')),  # Q2/2025
-            (f"Q{old_q_num} {old_year[-2:]}", f"Q{new_q_num} {new_year[-2:]}"),  # Q2 25
-            (f"Q{old_q_num}-{old_year[-2:]}", f"Q{new_q_num}-{new_year[-2:]}"),  # Q2-25
-            (f"{old_year[-2:]}Q{old_q_num}", f"{new_year[-2:]}Q{new_q_num}"),  # 25Q2
-        ]
-        for old_pattern, new_pattern in quarter_patterns:
+        quarter_pairs = getattr(self, '_quarter_pairs', None)
+        if quarter_pairs is None:
+            stale = discover_quarter_references_in_docx(
+                self.template_path, exclude=new_quarter
+            )
+            if old_quarter not in stale:
+                stale.append(old_quarter)
+            quarter_pairs = build_quarter_replacement_pairs(stale, new_quarter)
+
+        for old_pattern, new_pattern in quarter_pairs:
             if old_pattern in text:
                 self._replace_in_runs(para, old_pattern, new_pattern)
-        
-        # Handle ordinal quarter references (second quarter, third quarter, etc.)
-        ordinal_map = {
-            '1': ('first', 'eerste'),
-            '2': ('second', 'tweede'),
-            '3': ('third', 'derde'),
-            '4': ('fourth', 'vierde'),
-        }
-        if old_q_num in ordinal_map and new_q_num in ordinal_map:
-            old_ordinal_en, old_ordinal_nl = ordinal_map[old_q_num]
-            new_ordinal_en, new_ordinal_nl = ordinal_map[new_q_num]
-            
-            # English ordinal patterns
-            ordinal_patterns = [
-                (f"{old_ordinal_en} quarter", f"{new_ordinal_en} quarter"),
-                (f"{old_ordinal_en.capitalize()} quarter", f"{new_ordinal_en.capitalize()} quarter"),
-                (f"{old_ordinal_en} Quarter", f"{new_ordinal_en} Quarter"),
-                # Dutch ordinal patterns
-                (f"{old_ordinal_nl} kwartaal", f"{new_ordinal_nl} kwartaal"),
-                (f"{old_ordinal_nl} Kwartaal", f"{new_ordinal_nl} Kwartaal"),
-            ]
-            for old_ord, new_ord in ordinal_patterns:
-                if old_ord in text:
-                    self._replace_in_runs(para, old_ord, new_ord)
-        
-        # Handle month/date replacements dynamically
-        quarter_to_month = {
-            '1': ('March', 'maart', '31', '3'),
-            '2': ('June', 'juni', '30', '6'),
-            '3': ('September', 'september', '30', '9'),
-            '4': ('December', 'december', '31', '12'),
-        }
-        
-        if old_q_num in quarter_to_month and new_q_num in quarter_to_month:
-            old_month, old_month_nl, old_day, old_month_num = quarter_to_month[old_q_num]
-            new_month, new_month_nl, new_day, new_month_num = quarter_to_month[new_q_num]
-            
-            # Replace month names (only if they appear as standalone words related to quarter)
-            # Be careful not to replace months in unrelated contexts
-            if old_month in text:
-                self._replace_in_runs(para, old_month, new_month)
-            if old_month_nl in text:
-                self._replace_in_runs(para, old_month_nl, new_month_nl)
-            
-            # Replace date patterns - sort by length to prevent partial matches
-            date_patterns = [
-                # Longer patterns first
-                (f"{old_day} {old_month} {old_year}", f"{new_day} {new_month} {new_year}"),
-                (f"{old_day} {old_month_nl} {old_year}", f"{new_day} {new_month_nl} {new_year}"),
-                (f"{old_day}-{old_month_num}-{old_year}", f"{new_day}-{new_month_num}-{new_year}"),
-                # Rent roll date: 1-7-2025 (first of month after quarter)
-                (f"1-{int(old_month_num)+1}-{old_year}", f"1-{int(new_month_num)+1}-{new_year}"),
-            ]
-            for old_date, new_date in date_patterns:
-                if old_date in text:
-                    self._replace_in_runs(para, old_date, new_date)
+                text = para.text
         
         # Placeholder replacements
         for placeholder, attr_name in self.PLACEHOLDERS.items():

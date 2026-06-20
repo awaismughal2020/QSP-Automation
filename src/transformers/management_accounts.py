@@ -152,6 +152,29 @@ def scan_summary_column_layout(
     )
 
 
+def interest_absorbed_ltm_sum_range(
+    quarter_columns: Tuple[int, ...],
+    current_quarter_col: int,
+    *,
+    num_quarters: int = 4,
+) -> Tuple[int, int]:
+    """
+    Column range for LTM rows 61 & 64: exactly ``num_quarters`` quarter columns
+    ending at the current quarter (inclusive).
+
+    Example: quarters Z..AC with current AC → (Z, AC) — four columns, not Y..AC.
+    """
+    eligible = [c for c in quarter_columns if c <= current_quarter_col]
+    if len(eligible) >= num_quarters:
+        window = eligible[-num_quarters:]
+        return window[0], window[-1]
+    if eligible:
+        return eligible[0], eligible[-1]
+    end = current_quarter_col
+    start = max(end - num_quarters + 1, 2)
+    return start, end
+
+
 def ltm_column_after_insert(
     pre_ltm_col: Optional[int],
     insert_column: int,
@@ -459,7 +482,7 @@ class ManagementAccountsBuilder:
         """
         Deterministic post-AI safety net for interest rows:
         - Row 60 LTM: copy quarter row 60 formula, swap BDO !G→!H
-        - Rows 61/64 LTM: =SUM(Y:quarter_col)
+        - Rows 61/64 LTM: =SUM(last 4 quarter cols through current quarter)
         - Row 60 quarter: extend from previous column
         """
         p = Path(file_path)
@@ -1693,11 +1716,16 @@ class ManagementAccountsBuilder:
                     color=text_color,
                 )
 
+        layout_cfg = self._rules.get('layout', {})
         identity_cfg = self._rules.get('identity_alignment', {})
-        bold_rows = set(identity_cfg.get(
+        bold_rows = set(layout_cfg.get(
+            'bold_total_rows',
+            [19, 25, 30, 44, 45, 48, 55, 57, 66, 68],
+        ))
+        bold_rows.update(identity_cfg.get(
             'formula_total_rows',
             [identity_cfg.get('authoritative_row', 19),
-             identity_cfg.get('dependent_row', 68)]
+             identity_cfg.get('dependent_row', 68)],
         ))
         for br in bold_rows:
             for col_idx in range(1, new_ltm_col + 1):
@@ -2416,33 +2444,20 @@ class ManagementAccountsBuilder:
                 f"{new_letter} (BDO !{q_bdo_letter}→!{ltm_bdo_letter})"
             )
 
-        # Rows 61 & 64 LTM: SUM of last 4 quarter columns (skip FY / LTM columns)
+        # Rows 61 & 64 LTM: SUM of exactly 4 quarter columns through current quarter
         header_row = self._rules.get('layout', {}).get('header_row', 22)
         layout = scan_summary_column_layout(sheet, header_row)
-        prior_quarters = [c for c in layout.quarter_columns if c < new_quarter_col]
-        if len(prior_quarters) >= 4:
-            sum_start = prior_quarters[-4]
-        elif prior_quarters:
-            sum_start = prior_quarters[0]
-        else:
-            sum_start = new_quarter_col - 3
-        configured_start = self._rules.get('layout', {}).get(
-            'interest_quarter_horizontal_sum_start_column', 25
+        sum_start, sum_end = interest_absorbed_ltm_sum_range(
+            layout.quarter_columns, new_quarter_col
         )
-        first_q = self._detect_first_quarter_column_from_header_row(
-            sheet, header_row, new_quarter_col
-        )
-        if first_q is not None:
-            sum_start = max(sum_start, first_q)
-        sum_start = max(sum_start, configured_start, 2)
         start_letter = get_column_letter(sum_start)
-        quarter_letter = get_column_letter(new_quarter_col)
+        end_letter = get_column_letter(sum_end)
         for row_num in (61, 64):
-            formula = f'=SUM({start_letter}{row_num}:{quarter_letter}{row_num})'
+            formula = f'=SUM({start_letter}{row_num}:{end_letter}{row_num})'
             sheet.cell(row=row_num, column=ltm_col).value = formula
         logger.info(
             f"Interest rows 61 & 64: LTM col {get_column_letter(ltm_col)} "
-            f"=SUM({start_letter}*:{quarter_letter}*)"
+            f"=SUM({start_letter}61:{end_letter}61)"
         )
 
     def _build_pl_formulas_from_templates(self, sheet, col_idx: int, bdo_column: str = 'G',

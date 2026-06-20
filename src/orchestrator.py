@@ -21,7 +21,7 @@ from .transformers.management_accounts import ManagementAccountsBuilder, Managem
 from .transformers.ai_verification import AIVerificationOrchestrator, VerificationConfig
 from .transformers.compliance_builder import ComplianceBuilder, ComplianceConfig
 from .transformers.compliance_calc import ComplianceCalculator
-from .generators.word_updater import WordTemplateUpdater, ReportValues
+from .generators.word_updater import WordTemplateUpdater, ReportValues, build_report_values
 from .generators.pdf_assembler import PDFAssembler, PDFSource
 from .validators.balance_validator import BalanceValidator
 from .validators.covenant_validator import CovenantValidator
@@ -715,10 +715,19 @@ class QuarterlyReportOrchestrator:
                 
                 gross_rental_income = gtri_amount - vacancy_amount
                 vacancy_pct = (vacancy_amount / gtri_amount * 100) if gtri_amount > 0 else 0.0
-                # Estimate LTM as 4x quarterly (approximation)
                 gtri_ltm = gtri_amount * 4
                 gross_rental_ltm = gross_rental_income * 4
                 maintenance_ltm = maintenance_amount * 4
+                ma_values.update({
+                    'gtri': gtri_amount,
+                    'gtri_ltm': gtri_ltm,
+                    'vacancy_amount': vacancy_amount,
+                    'gross_rental': gross_rental_income,
+                    'gross_rental_ltm': gross_rental_ltm,
+                    'vacancy_pct': vacancy_pct,
+                    'maintenance': maintenance_amount,
+                    'maintenance_ltm': maintenance_ltm,
+                })
             
             # Calculate unit sales proceeds from sales tracker (in thousands)
             unit_sales_proceeds = ma_values.get('unit_sales_proceeds', 0.0)
@@ -738,42 +747,13 @@ class QuarterlyReportOrchestrator:
             logger.info(f"  Unit sales proceeds: €{unit_sales_proceeds:,.1f}k")
             logger.info(f"  Unit sales: {sales_data.quarter_units_sold} units, €{unit_sales_proceeds:,.0f}k")
             
-            report_values = ReportValues(
-                report_date=datetime.now().strftime("%d %B %Y"),
-                # Page 4 - from BDO/Management Accounts
-                gtri=gtri_amount,  # Q3 GTRI in thousands
-                # gtri_ltm is used for "rent roll yields" value in Word document
-                # Use rent_roll_k (annual rent from rent roll file) as this matches the expected document
-                gtri_ltm=rent_roll_k,  # Rent roll annual (appears as "yields €X,XXXk" in Word)
-                gross_rental_income=gross_rental_income,  # Q3 gross rental in thousands
-                gross_rental_income_ltm=gross_rental_ltm,
-                financial_vacancy_pct=vacancy_pct,
-                financial_vacancy_amount=vacancy_amount,
-                # Page 4 - from Rent Roll
-                rent_roll_annual=rent_roll_k,
+            report_values = build_report_values(
+                ma_values=ma_values,
+                rent_roll_k=rent_roll_k,
                 rent_roll_units=rent_roll.total_units,
-                # Page 4 - from Sales Tracker
                 units_sold_quarter=sales_data.quarter_units_sold,
                 unit_sales_proceeds=unit_sales_proceeds,
-                # Page 4/6 - Maintenance and CAPEX
-                maintenance_amount=maintenance_amount,
-                maintenance_ltm=maintenance_ltm,
-                capex_amount=0,  # CAPEX is entered manually per mainPlan.pdf
-                capex_ltm=0,
-                # Narratives
-                unit_sales_narrative=f"{sales_data.quarter_units_sold} unit(s) sold for €{unit_sales_proceeds:,.0f}k" if sales_data.quarter_units_sold > 0 else "No unit sales this quarter.",
-                maintenance_detail="",
-                sustainability_detail="",
-                # Previous quarter values (Q2 2025 values from template document)
-                # Used for finding and replacing old values with new values
-                prev_gtri=3200.6,  # Q2 GTRI
-                prev_gtri_ltm=12940.2,  # Q2 LTM GTRI (shown as "rent roll yields")
-                prev_gross_rental_income=3067.5,  # Q2 gross rental income
-                prev_vacancy_pct=4.1,  # Q2 vacancy percentage
-                prev_vacancy_amount=106.3,  # Q2 vacancy amount
-                prev_rent_roll=0,
-                prev_maintenance=297.0,  # Q2 maintenance
-                prev_unit_sales_proceeds=762.5,  # Q2 unit sales proceeds
+                word_template_path=self.config.word_template,
             )
             word_updater = WordTemplateUpdater(str(self.config.word_template), str(word_output))
             word_updater.update_with_python_docx(
@@ -1079,7 +1059,7 @@ class WordReportOrchestrator:
             word_output = self.config.output_dir / f"Quarterly QSP - {self.config.quarter_str} - Draft.docx"
             
             # Extract values from the Management Accounts Excel file
-            from .generators.word_updater import extract_values_from_management_accounts, WordTemplateUpdater, ReportValues
+            from .generators.word_updater import extract_values_from_management_accounts, build_report_values
             
             ma_values = extract_values_from_management_accounts(
                 str(self.config.management_accounts_file),
@@ -1110,33 +1090,13 @@ class WordReportOrchestrator:
             logger.info(f"  Financial vacancy: {vacancy_pct:.1f}%")
             logger.info(f"  Rent roll (annual): €{rent_roll_k:,.1f}k")
             
-            report_values = ReportValues(
-                report_date=datetime.now().strftime("%d %B %Y"),
-                gtri=gtri_amount,
-                gtri_ltm=rent_roll_k,
-                gross_rental_income=gross_rental_income,
-                gross_rental_income_ltm=gross_rental_ltm,
-                financial_vacancy_pct=vacancy_pct,
-                financial_vacancy_amount=vacancy_amount,
-                rent_roll_annual=rent_roll_k,
+            report_values = build_report_values(
+                ma_values=ma_values,
+                rent_roll_k=rent_roll_k,
                 rent_roll_units=rent_roll.total_units,
                 units_sold_quarter=sales_data.quarter_units_sold,
                 unit_sales_proceeds=unit_sales_proceeds,
-                maintenance_amount=maintenance_amount,
-                maintenance_ltm=maintenance_ltm,
-                capex_amount=0,
-                capex_ltm=0,
-                unit_sales_narrative=f"{sales_data.quarter_units_sold} unit(s) sold for €{unit_sales_proceeds:,.0f}k" if sales_data.quarter_units_sold > 0 else "No unit sales this quarter.",
-                maintenance_detail="",
-                sustainability_detail="",
-                prev_gtri=3200.6,
-                prev_gtri_ltm=12940.2,
-                prev_gross_rental_income=3067.5,
-                prev_vacancy_pct=4.1,
-                prev_vacancy_amount=106.3,
-                prev_rent_roll=0,
-                prev_maintenance=297.0,
-                prev_unit_sales_proceeds=762.5,
+                word_template_path=self.config.word_template,
             )
             
             word_updater = WordTemplateUpdater(str(self.config.word_template), str(word_output))

@@ -19,6 +19,9 @@ import shutil
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter
 from loguru import logger
 
+# Headless LibreOffice conversions can hang on formula-heavy workbooks; cap wait time.
+LIBREOFFICE_TIMEOUT_SECONDS = 300
+
 
 @dataclass
 class PDFSource:
@@ -96,6 +99,27 @@ class PDFAssembler:
             "  - Linux: sudo apt install libreoffice\n"
             "  - Windows: Download from https://www.libreoffice.org/download/"
         )
+
+    def _run_soffice(self, cmd: List[str], description: str) -> subprocess.CompletedProcess:
+        """Run LibreOffice with a timeout so API/n8n requests fail fast instead of hanging."""
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=LIBREOFFICE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"LibreOffice timed out after {LIBREOFFICE_TIMEOUT_SECONDS}s "
+                f"while {description}. Command: {' '.join(cmd)}"
+            ) from exc
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or '').strip()
+            raise RuntimeError(
+                f"LibreOffice conversion failed while {description}: {stderr or 'unknown error'}"
+            )
+        return result
         
     def assemble(self, sources: List[PDFSource]) -> Path:
         """
@@ -295,9 +319,7 @@ class PDFAssembler:
             str(docx_path)
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
+        self._run_soffice(cmd, f"converting Word document {docx_path.name}")
         
         # Find the output file
         pdf_name = docx_path.stem + '.pdf'
@@ -332,9 +354,7 @@ class PDFAssembler:
                 str(xlsx_path)
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
+            self._run_soffice(cmd, f"converting workbook {xlsx_path.name}")
             
             pdf_name = xlsx_path.stem + '.pdf'
             pdf_path = output_dir / pdf_name
@@ -364,10 +384,11 @@ class PDFAssembler:
             str(xlsx_path)
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.warning(f"Recalculation may have failed: {result.stderr}")
-            return xlsx_path  # Return original if recalc fails
+        try:
+            self._run_soffice(cmd, f"recalculating workbook {xlsx_path.name}")
+        except RuntimeError as exc:
+            logger.warning(f"Recalculation may have failed: {exc}")
+            return xlsx_path
         
         recalc_path = recalc_dir / xlsx_path.name
         if recalc_path.exists():
@@ -509,9 +530,7 @@ class PDFAssembler:
             str(temp_xlsx)
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
+        self._run_soffice(cmd, f"exporting sheet {sheet_name!r} from {xlsx_path.name}")
         
         pdf_path = output_dir / f"temp_{sheet_name.replace(' ', '_')}.pdf"
         

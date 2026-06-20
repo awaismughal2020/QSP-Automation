@@ -196,9 +196,45 @@ Generated files are saved to the `outputs/` folder:
   - Column G: Current Quarter Mutations
   - Column H: Closing Balance
 - Updates `Management Cijfers` summary sheet:
-  - Converts LTM column to new quarter data column
-  - Adds new LTM column with closing balance formulas
-  - Creates formulas like `=-'BDO - Q3-25'!G88` referencing BDO sheet
+  - Inserts a new quarter column immediately after the latest `Q{n} YYYY`
+    header (before any `FY YYYY` column).
+  - Rebuilds the LTM column from scratch — see *LTM column rebuild* below.
+  - Creates formulas like `=-'BDO - Q3-25'!G88` referencing the new BDO sheet.
+
+#### LTM column rebuild
+
+The LTM column is always **rebuilt deterministically** after `insert_cols()`
+rather than relying on the formulas that shifted right during the insert.
+After `insert_cols()` the cells in the new LTM slot still carry the previous
+quarter's BDO sheet name (e.g. `'BDO - Q4-25'!H78`) and the subtotal ranges
+mention the new quarter column letter (e.g. `SUM(AC23:AC24)` in column AD).
+`_finalize_ltm_column()` overwrites those cells in this order:
+
+1. Writes the row-22 header `LTM {quarter}` before anything else, so the
+   column is identifiable by header from that point onward.
+2. Clears every formula cell in the Balance Sheet, P&L, and Bank ranges in
+   the new LTM column.
+3. Rebuilds P&L formulas from `config/formula_templates.yaml` against BDO
+   column H, then Balance Sheet formulas the same way.
+4. Re-applies every `calc_formulas` / `ltm_calc_overrides` entry from
+   `config/accounting_rules.yaml` as a safety net for subtotal rows.
+5. Sweeps any surviving stale BDO sheet name and rewrites in-sheet column
+   references that still point at the new quarter column letter.
+6. Refreshes rolling 4-quarter SUM ranges, the bank-account section, the
+   accounting identity formula, and the interest-row overrides.
+7. Runs `_validate_ltm_column_formulas()` before save and attaches the
+   result to `validation_result['ltm_column']`. Hard errors are surfaced as
+   validation messages and flip `is_aligned` to `False`.
+
+Both column layouts are supported:
+
+- `… | Q4 | Q1 | FY | LTM` (FY column present — default for the internal
+  templates).
+- `… | Q4 | Q1 | LTM` (no FY column — matches the client draft).
+
+Column resolution is header-based, so `Q1 2026` will land at whichever
+column letter is correct for the previous quarter's layout (e.g. `AC` in
+the no-FY case, `AD` when FY is present).
 
 ### Step 4b: Build Compliance Certificate
 - Updates Management Accounts sheet with Q3 data
@@ -218,8 +254,12 @@ Generated files are saved to the `outputs/` folder:
 - Cross-file reconciliation checks
 
 ### Step 7: Update Word Template
-- Replaces quarter references (Q2 → Q3)
-- Updates placeholders with calculated values
+
+- Discovers **all** stale `Q{n} YYYY` strings in the template (body, headers, footers, text boxes) and normalizes them to the run quarter
+- Sets the cover date to today's date in Dutch (e.g. `7 juni 2026`)
+- Updates Page 4 KPIs from Management Accounts + Huurlijst; previous values are read from the template for find/replace
+- **Automated:** quarter/year text, cover date, GTRI, gross rental income, financial vacancy (% and €), rent-roll yields (MA LTM GTRI), maintenance, unit-sale proceeds, basic unit-sales narrative
+- **Manual:** CAPEX, maintenance/sustainability narrative paragraphs, free-form commentary and tables
 
 ### Step 8: Assemble PDF (Optional)
 - Converts Word and Excel to PDF using LibreOffice

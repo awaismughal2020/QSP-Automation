@@ -113,9 +113,8 @@ layout:
   # Intermediate P&L rows (net interest, derivatives, etc.)
   intermediate_rows: [60, 61, 64, 65, 67]
 
-  # First Management Cijfers column included in =SUM(...) for interest rows 61 & 64
-  # (new quarter column gets SUM from this column through the prior quarter column).
-  # Excel column index: Y = 25 (Q4 2025 → AC gives =SUM(Y61:AB61); Q1 2026 → AD gives =SUM(Y61:AC61)).
+  # Deprecated — LTM rows 61/64 now use the last 4 quarter columns dynamically.
+  # Kept for backward compatibility only; not read by interest override logic.
   interest_quarter_horizontal_sum_start_column: 25
 
 # ─── Styling ───

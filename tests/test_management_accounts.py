@@ -13,6 +13,7 @@ from src.transformers.management_accounts import (
     _shift_formula_column_letter,
     find_column_by_header_label,
     find_ltm_column_near_quarter,
+    interest_absorbed_ltm_sum_range,
     ltm_column_after_insert,
     resolve_built_ltm_column,
     resolve_built_quarter_column,
@@ -567,6 +568,28 @@ class TestSummaryColumnLayout:
         # LTM at 30 shifts to 31 because pre_ltm_col(30) >= insert_column(30)
         new_ltm = ltm_column_after_insert(layout.ltm_column, 30, layout.fy_columns)
         assert new_ltm == 31
+
+
+class TestInterestAbsorbedLtmSumRange:
+    """LTM rows 61/64 must sum exactly four quarter columns through current quarter."""
+
+    def test_q1_2026_sums_z_through_ac_not_y(self):
+        quarters = tuple(range(25, 30))  # Y .. AC, current quarter AC=29
+        start, end = interest_absorbed_ltm_sum_range(quarters, 29)
+        assert start == 26  # Z
+        assert end == 29      # AC
+
+    def test_q2_2026_after_column_insert(self):
+        quarters = tuple(range(26, 31))  # Z .. AD, current quarter AD=30
+        start, end = interest_absorbed_ltm_sum_range(quarters, 30)
+        assert start == 27  # AA
+        assert end == 30    # AD
+
+    def test_fewer_than_four_quarters_uses_all_available(self):
+        quarters = (28, 29)
+        start, end = interest_absorbed_ltm_sum_range(quarters, 29)
+        assert start == 28
+        assert end == 29
 
 
 class TestShiftFormulaColumnLetter:
