@@ -261,6 +261,25 @@ the no-FY case, `AD` when FY is present).
 - **Automated:** quarter/year text, cover date, GTRI, gross rental income, financial vacancy (% and €), rent-roll yields (MA LTM GTRI), maintenance, unit-sale proceeds, basic unit-sales narrative
 - **Manual:** CAPEX, maintenance/sustainability narrative paragraphs, free-form commentary and tables
 
+> **CAPEX is a manual field.** There is no automated CAPEX source, so `capex_amount`
+> defaults to `0.0` and the template's existing CAPEX figure is left untouched —
+> **fill it in by hand each quarter** (the Word step logs a reminder when CAPEX has
+> no source). To automate it later, add a CAPEX row mapping in
+> `extract_values_from_management_accounts` (mirroring the maintenance row-32
+> extraction) and pass it through as `ma_values['capex']`.
+
+> **Why the KPI logic is fragile, and the durable fix.** The Word step does *not*
+> use live Excel links — it find-and-replaces the previous quarter's printed numbers
+> with the new ones, which means it has to *guess* which printed figure is which KPI.
+> This is the root cause of the whole class of "wrong number landed in the wrong slot"
+> bugs. The robust, recommended end state is to insert explicit placeholders
+> (`{{GTRI}}`, `{{GROSS_RENTAL_INCOME}}`, `{{VACANCY}}`, `{{MAINTENANCE}}`,
+> `{{CAPEX}}`, `{{RENT_ROLL}}`) into the template **once**. The code already supports
+> them (`WordTemplateUpdater.PLACEHOLDERS` / `_replace_placeholders`). Once the
+> template uses placeholders, the value-matching find/replace logic can be retired
+> entirely. The current value-matching path (bounded KPI anchors + fragmented-run
+> collapse) stabilizes the existing approach in the meantime.
+
 ### Step 8: Assemble PDF (Optional)
 - Converts Word and Excel to PDF using LibreOffice
 - Merges all documents in order

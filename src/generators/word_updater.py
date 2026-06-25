@@ -436,6 +436,11 @@ def discover_quarter_references_in_docx(
 
 
 def _parse_euro_k(text: str) -> float:
+    # NOTE (European-decimal limitation): commas are stripped as thousands
+    # separators, so a comma-decimal figure like "106,3" becomes 1063. The KPI
+    # anchors we rely on (GTRI, gross rental, proceeds, maintenance, yields) use
+    # dot-decimals in the template, so this is safe for them. A full locale-aware
+    # rewrite is intentionally out of scope for this pass.
     return float(text.replace(',', '').replace(' ', ''))
 
 
@@ -447,14 +452,29 @@ def extract_prev_values_from_template(docx_path: Path) -> Dict[str, float]:
     text = read_docx_xml_text(docx_path)
     prev: Dict[str, float] = {}
 
+    # Bounded gaps: each KPI's euro/percent figure must sit within ~40 chars of
+    # its keyword and on the same line. The old greedy `[^€]*` gaps let a regex
+    # skip across the whole page and capture the wrong figure (e.g. maintenance
+    # grabbing GTRI). If a KPI has no figure beside it, the pattern now matches
+    # nothing and the corresponding prev_* stays 0.0, disabling that replacement
+    # (safe) instead of corrupting another field (unsafe).
     patterns = [
-        ('prev_gtri', r'GTRI[^€%]*€([\d,\.]+)\s*k'),
-        ('prev_gross_rental_income', r'[Gg]ross rental income[^€%]*€([\d,\.]+)\s*k'),
-        ('prev_vacancy_pct', r'[Ff]inancial vacancy[^%]*?([\d,\.]+)\s*%'),
-        ('prev_vacancy_amount', r'[Ff]inancial vacancy[^€]*€([\d,\.]+)\s*k'),
-        ('prev_gtri_ltm', r'(?:rent roll|yields)[^€]*€([\d,\.]+)\s*k'),
-        ('prev_maintenance', r'[Mm]aintenance[^€]*€([\d,\.]+)\s*k'),
-        ('prev_unit_sales_proceeds', r'(?:Unit sale proceeds|sale proceeds)[^€]*€([\d,\.]+)\s*k'),
+        ('prev_gtri',                 r'GTRI[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
+        ('prev_gross_rental_income',  r'[Gg]ross rental income[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
+        ('prev_vacancy_pct',          r'[Ff]inancial vacancy[^%\n]{0,40}?([\d,\.]+)\s*%'),
+        # Vacancy has no euro amount in the template (only a %). Exclude ':' from
+        # the gap so this cannot jump past "Financial vacancy:8.4%" into the
+        # adjacent "Unit sale proceeds:€762.5k" field. Result: no match -> 0.0.
+        ('prev_vacancy_amount',       r'[Ff]inancial vacancy[^€\n:]{0,40}€\s?([\d,\.]+)\s*k'),
+        # Require the word "yields" so this rent-roll yield figure (LTM GTRI)
+        # cannot collide with the separate rent-roll total anchor (Task 5).
+        ('prev_gtri_ltm',             r'yields[^€\n]{0,20}€\s?([\d,\.]+)\s*k'),
+        ('prev_maintenance',          r'[Mm]aintenance[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
+        ('prev_unit_sales_proceeds',  r'(?:Unit sale proceeds|sale proceeds)[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
+        # Rent-roll total (Task 5): requires the explicit word "total" so it does
+        # NOT match "rent roll per ... yields €..." (that figure is prev_gtri_ltm).
+        # The current template has no such total, so this stays absent (disabled).
+        ('prev_rent_roll',            r'[Rr]ent roll total[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
     ]
     for key, pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -571,6 +591,13 @@ def build_report_values(
     if gtri_ltm <= 0:
         gtri_ltm = rent_roll_k
 
+    if not ma_values.get('capex'):
+        logger.info(
+            "CAPEX has no automated source; it is a MANUAL field. The template's "
+            "CAPEX figure is left untouched — fill it in by hand this quarter "
+            "(see README)."
+        )
+
     return ReportValues(
         report_date=format_report_date_dutch(when),
         gtri=ma_values.get('gtri', 0.0),
@@ -585,8 +612,14 @@ def build_report_values(
         unit_sales_proceeds=unit_sales_proceeds,
         maintenance_amount=ma_values.get('maintenance', 0.0),
         maintenance_ltm=ma_values.get('maintenance_ltm', 0.0),
-        capex_amount=0.0,
-        capex_ltm=0.0,
+        # CAPEX has no automated source yet (see README, "CAPEX is a manual
+        # field"). Defaults to 0.0 so the value-matching pass leaves the
+        # template's CAPEX figure untouched for manual entry rather than
+        # injecting a wrong number. To automate, extract a CAPEX row from the
+        # Management Accounts (mirror the maintenance row-32 extraction) and feed
+        # it in as ma_values['capex'] / ma_values['capex_ltm'].
+        capex_amount=ma_values.get('capex', 0.0),
+        capex_ltm=ma_values.get('capex_ltm', 0.0),
         unit_sales_narrative=(
             f"{units_sold_quarter} unit(s) sold for €{unit_sales_proceeds:,.0f}k"
             if units_sold_quarter > 0
@@ -599,7 +632,12 @@ def build_report_values(
         prev_gross_rental_income=prev.get('prev_gross_rental_income', 0.0),
         prev_vacancy_pct=prev.get('prev_vacancy_pct', 0.0),
         prev_vacancy_amount=prev.get('prev_vacancy_amount', 0.0),
-        prev_rent_roll=0.0,
+        # Driven by the "rent roll total €X k" anchor (Task 1). The current
+        # template has no such standalone total — its only rent-roll euro figure
+        # is the yields value, which maps to prev_gtri_ltm — so this resolves to
+        # 0.0 and the rent-roll swap stays disabled (safe). A template that adds
+        # a real "Rent roll total €..." line activates it automatically.
+        prev_rent_roll=prev.get('prev_rent_roll', 0.0),
         prev_maintenance=prev.get('prev_maintenance', 0.0),
         prev_unit_sales_proceeds=prev.get('prev_unit_sales_proceeds', 0.0),
     )
@@ -655,7 +693,24 @@ def _find_fragmented_number_span(content: str, target_value: float, max_runs: in
                 continue
             for candidate in targets:
                 if abs(parsed - candidate) <= 0.25:
-                    return content[runs[i].start():runs[j].end()]
+                    end_run = j
+                    # Absorb trailing numeric-continuation runs so leftover
+                    # fragments like ".6" cannot survive the collapse and produce
+                    # artifacts such as "3,331.9.6k".
+                    k = j + 1
+                    while k < len(runs):
+                        frag = runs[k].group(1)
+                        stripped = (
+                            frag.replace(',', '').replace('.', '').replace(' ', '')
+                        )
+                        # Stop at the first run with a letter, the euro sign, or
+                        # any other non-numeric character (e.g. "k" or markup).
+                        if stripped == '' or stripped.isdigit():
+                            end_run = k
+                            k += 1
+                        else:
+                            break
+                    return content[runs[i].start():runs[end_run].end()]
     return None
 
 
@@ -1364,22 +1419,30 @@ class WordTemplateUpdater:
             (updated_content, count_of_replacements)
         """
         updates_made = 0
-        
-        # Define specific value replacements: (old_value, new_value, value_format, context_keywords)
-        # Using exact Q2 values found in the template document
+
+        # KPIs already rewritten by the fragmented-euro pass (body + highlights).
+        # Skip them here so this legacy fallback cannot double-apply and corrupt a
+        # value (e.g. appending a second "k"). It still runs for any KPI the
+        # fragmented pass did not handle (e.g. CAPEX, or values whose prev_* anchor
+        # was not found in the template).
+        handled = getattr(self, '_frag_handled_kpis', set())
+
+        # Define specific value replacements:
+        # (kpi_key, old_value, new_value, value_format, context_keywords)
+        # Using exact previous values found in the template document.
         specific_replacements = [
-            (values.prev_gtri, values.gtri, 'euro_k_decimal', ['GTRI', 'Gross Theoretical rental income']),
-            (values.prev_vacancy_amount, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),
-            (values.prev_vacancy_pct, values.financial_vacancy_pct, 'percent', ['vacancy']),
-            (values.prev_gross_rental_income, values.gross_rental_income, 'euro_k_decimal', ['gross rental income']),
-            (values.prev_gtri_ltm, values.gtri_ltm, 'euro_k_decimal', ['rent roll', 'yields']),
-            (values.prev_unit_sales_proceeds, values.unit_sales_proceeds, 'euro_k_decimal', ['Unit sale proceeds', 'proceeds']),
-            (values.prev_maintenance, values.maintenance_amount, 'euro_k', ['Maintenance']),
+            ('gtri', values.prev_gtri, values.gtri, 'euro_k_decimal', ['GTRI', 'Gross Theoretical rental income']),
+            ('vacancy_amount', values.prev_vacancy_amount, values.financial_vacancy_amount, 'euro_k_decimal', ['vacancy']),
+            ('vacancy_pct', values.prev_vacancy_pct, values.financial_vacancy_pct, 'percent', ['vacancy']),
+            ('gross_rental_income', values.prev_gross_rental_income, values.gross_rental_income, 'euro_k_decimal', ['gross rental income']),
+            ('gtri_ltm', values.prev_gtri_ltm, values.gtri_ltm, 'euro_k_decimal', ['rent roll', 'yields']),
+            ('unit_sales_proceeds', values.prev_unit_sales_proceeds, values.unit_sales_proceeds, 'euro_k_decimal', ['Unit sale proceeds', 'proceeds']),
+            ('maintenance', values.prev_maintenance, values.maintenance_amount, 'euro_k', ['Maintenance']),
         ]
-        
+
         # Apply specific replacements
-        for old_val, new_val, fmt, keywords in specific_replacements:
-            if new_val <= 0 or old_val <= 0:
+        for key, old_val, new_val, fmt, keywords in specific_replacements:
+            if new_val <= 0 or old_val <= 0 or key in handled:
                 continue
             
             # Generate old and new formatted strings
@@ -1409,32 +1472,32 @@ class WordTemplateUpdater:
                     logger.debug(f"Replaced '{old_pattern}' with '{new_formatted}'")
         
         # Define KPI contexts and their new values for context-aware replacement
-        # Format: (context_keywords, new_value, value_format)
+        # Format: (kpi_key, context_keywords, new_value, value_format)
         kpi_mappings = [
             # GTRI - appears as "GTRI of the portfolio amounted to €X,XXXk"
-            (['GTRI', 'Gross Theoretical Rental Income'], values.gtri, 'euro_k'),
-            
+            ('gtri', ['GTRI', 'Gross Theoretical Rental Income'], values.gtri, 'euro_k'),
+
             # Gross rental income - "Gross rental income was €X,XXXk"
-            (['Gross rental income', 'gross rental income'], values.gross_rental_income, 'euro_k'),
-            
+            ('gross_rental_income', ['Gross rental income', 'gross rental income'], values.gross_rental_income, 'euro_k'),
+
             # Financial vacancy - "Financial vacancy was X.X%" or "vacancy of X.X%"
-            (['Financial vacancy', 'vacancy'], values.financial_vacancy_pct, 'percent'),
-            
+            ('vacancy_pct', ['Financial vacancy', 'vacancy'], values.financial_vacancy_pct, 'percent'),
+
             # Rent roll yields - uses LTM GTRI value
-            (['rent roll', 'Rent roll', 'yields'], values.gtri_ltm, 'euro_k'),
-            
+            ('gtri_ltm', ['rent roll', 'Rent roll', 'yields'], values.gtri_ltm, 'euro_k'),
+
             # Maintenance - "Maintenance expenses of €XXXk"
-            (['Maintenance', 'maintenance', 'repair costs'], values.maintenance_amount, 'euro_k'),
-            
+            ('maintenance', ['Maintenance', 'maintenance', 'repair costs'], values.maintenance_amount, 'euro_k'),
+
             # Unit sales proceeds - "Unit sales proceeds of €XXXk"
-            (['Unit sales proceeds', 'sale proceeds', 'proceeds'], values.unit_sales_proceeds, 'euro_k'),
-            
-            # CAPEX - "CAPEX of €XXXk"
-            (['CAPEX', 'capex', 'capital expenditure'], values.capex_amount, 'euro_k'),
+            ('unit_sales_proceeds', ['Unit sales proceeds', 'sale proceeds', 'proceeds'], values.unit_sales_proceeds, 'euro_k'),
+
+            # CAPEX - "CAPEX of €XXXk" (not handled by the fragmented pass)
+            ('capex', ['CAPEX', 'capex', 'capital expenditure'], values.capex_amount, 'euro_k'),
         ]
-        
-        for keywords, new_value, value_format in kpi_mappings:
-            if new_value <= 0:
+
+        for key, keywords, new_value, value_format in kpi_mappings:
+            if new_value <= 0 or key in handled:
                 continue
                 
             # Find context regions containing the keywords
@@ -1604,40 +1667,97 @@ class WordTemplateUpdater:
 
         Uses template-derived previous values (``values.prev_*``) so replacements
         work after multiple reporting cycles, not only from one hardcoded anchor.
+        Every printed copy of a KPI (narrative body AND Portfolio Highlights box)
+        is updated so they stay consistent.
+
+        Records which KPIs it successfully rewrote in ``self._frag_handled_kpis``
+        so the legacy context pass can skip them and avoid double-applying (which
+        produced artifacts like ``€3,400kk``).
         """
         updates_made = 0
+        handled: set = set()
 
+        # (kpi_key, prev_value, new_value, number_formatter)
         euro_replacements = [
-            (values.prev_gtri, values.gtri, lambda v: f'{v:,.1f}'),
-            (values.prev_gross_rental_income, values.gross_rental_income, lambda v: f'{v:,.1f}'),
-            (values.prev_vacancy_amount, values.financial_vacancy_amount, lambda v: f'{v:,.1f}'),
-            (values.prev_gtri_ltm, values.gtri_ltm, lambda v: f'{v:,.1f}'),
-            (values.prev_unit_sales_proceeds, values.unit_sales_proceeds, lambda v: f'{int(round(v))}'),
-            (values.prev_maintenance, values.maintenance_amount, lambda v: f'{v:,.0f}'),
+            ('gtri', values.prev_gtri, values.gtri, lambda v: f'{v:,.1f}'),
+            ('gross_rental_income', values.prev_gross_rental_income, values.gross_rental_income, lambda v: f'{v:,.1f}'),
+            ('vacancy_amount', values.prev_vacancy_amount, values.financial_vacancy_amount, lambda v: f'{v:,.1f}'),
+            ('gtri_ltm', values.prev_gtri_ltm, values.gtri_ltm, lambda v: f'{v:,.1f}'),
+            ('unit_sales_proceeds', values.prev_unit_sales_proceeds, values.unit_sales_proceeds, lambda v: f'{int(round(v))}'),
+            ('maintenance', values.prev_maintenance, values.maintenance_amount, lambda v: f'{v:,.0f}'),
+            ('rent_roll', values.prev_rent_roll, values.rent_roll_annual, lambda v: f'{v:,.1f}'),
         ]
 
-        for old_value, new_value, formatter in euro_replacements:
+        for key, old_value, new_value, formatter in euro_replacements:
             if new_value <= 0 or old_value <= 0:
                 continue
-            span = _find_fragmented_number_span(content, old_value)
-            if not span:
-                continue
-            new_text = formatter(new_value)
-            new_span = _collapse_xml_runs_to_single_value(span, new_text)
-            if new_span != span:
-                content = content.replace(span, new_span, 1)
+            # The cap is a safety backstop; the loop normally ends when no more
+            # spans match (the new value differs from the old, so it is not
+            # re-found).
+            for _ in range(8):
+                span = _find_fragmented_number_span(content, old_value)
+                if not span:
+                    break
+                ext_span, unit = self._span_trailing_unit(content, span)
+                new_text = formatter(new_value)
+                # The collapse writes the new number into the span's first run. If
+                # that run carried the euro sign (e.g. ">€3,</w:t>"), re-emit it so
+                # the currency marker is not dropped.
+                if '€' in span:
+                    new_text = '€' + new_text
+                # Merge the trailing unit ("k"/"m") into the same run so a later
+                # pass cannot append its own (the "€3,400kk" artifact).
+                new_text += unit
+                new_span = _collapse_xml_runs_to_single_value(ext_span, new_text)
+                if new_span == ext_span:
+                    break
+                content = content.replace(ext_span, new_span, 1)
                 updates_made += 1
+                handled.add(key)
 
         if values.financial_vacancy_pct > 0 and values.prev_vacancy_pct > 0:
-            pct_span = _find_fragmented_number_span(content, values.prev_vacancy_pct)
-            if pct_span:
+            for _ in range(8):
+                pct_span = _find_fragmented_number_span(content, values.prev_vacancy_pct)
+                if not pct_span:
+                    break
                 new_pct = f'{values.financial_vacancy_pct:.1f}'
+                # Mirror the currency preservation for percentages: only re-append
+                # '%' when the matched span actually contained it (otherwise the
+                # '%' lives in a separate, untouched run and is preserved already).
+                if '%' in pct_span:
+                    new_pct = new_pct + '%'
                 new_span = _collapse_xml_runs_to_single_value(pct_span, new_pct)
-                if new_span != pct_span:
-                    content = content.replace(pct_span, new_span, 1)
-                    updates_made += 1
+                if new_span == pct_span:
+                    break
+                content = content.replace(pct_span, new_span, 1)
+                updates_made += 1
+                handled.add('vacancy_pct')
 
+        self._frag_handled_kpis = handled
         return content, updates_made
+
+    def _span_trailing_unit(self, content: str, span: str) -> Tuple[str, str]:
+        """If the run immediately after ``span`` is a lone ``k``/``m`` unit suffix,
+        return ``(span_extended_over_it, unit_char)`` so the collapse can merge the
+        suffix into the value run. This prevents a later pass from appending a
+        duplicate unit (the ``€3,400kk`` artifact). Otherwise returns ``(span, '')``.
+        """
+        import re
+
+        idx = content.find(span)
+        if idx == -1:
+            return span, ''
+        after = content[idx + len(span):]
+        # Reach the next NON-EMPTY text run, skipping markup and any empty
+        # ``<w:t></w:t>`` runs in between (Word often leaves empty runs between the
+        # number and its "k"). Absorb it only if it is exactly a lone unit suffix.
+        match = re.match(
+            r'(?:(?!<w:t)[\s\S]|<w:t[^>]*></w:t>){0,600}?<w:t[^>]*>([km])</w:t>',
+            after,
+        )
+        if match:
+            return span + after[:match.end()], match.group(1)
+        return span, ''
     
     def _apply_fragmented_date_replacements(self, content: str, replacements: List[Tuple[str, str]]) -> str:
         """
@@ -1730,6 +1850,102 @@ class WordTemplateUpdater:
             )
         return content
 
+    def _apply_fragmented_quarter_year(
+        self,
+        content: str,
+        old_q_num: str,
+        old_year: str,
+        new_q_num: str,
+        new_year: str,
+    ) -> str:
+        """Roll a ``Q{n} {year}`` reference forward even when the quarter digit
+        and the year digits are split across many ``<w:t>`` runs.
+
+        Word fragments quarter references unpredictably, e.g. ``Q2 2025`` can be
+        stored as runs ``['% in Q','2',' 20','2','5']`` or
+        ``['Q','2',' ','202','5']``. The older digit-only patterns flipped just
+        the quarter digit and left the year stale (producing ``Q1 2025``).
+
+        This walks the runs, finds a word-initial ``Q`` followed (across runs,
+        ignoring spaces) by the full old year digits, and rewrites the digits in
+        place. ``Q{n}{year}`` has the same digit count before and after a rollover
+        (1 quarter digit + ``len(year)`` year digits), so each matched digit is
+        swapped 1:1 for the corresponding digit of ``Q{new_n}{new_year}`` —
+        preserving run structure and formatting. Run BEFORE the digit-only
+        patterns, otherwise the quarter digit flips first and the old-year anchor
+        no longer matches.
+        """
+        import re
+
+        old_digits = old_q_num + old_year
+        new_digits = new_q_num + new_year
+        if len(old_digits) != len(new_digits) or not old_digits.isdigit():
+            return content
+
+        runs = list(re.finditer(r'<w:t[^>]*>([^<]*)</w:t>', content))
+        texts = [m.group(1) for m in runs]
+        n = len(runs)
+
+        edits: Dict[int, Dict[int, str]] = {}  # run_index -> {char_pos: new_char}
+
+        i = 0
+        while i < n:
+            text_i = texts[i]
+            qpos = text_i.find('Q')
+            if qpos == -1:
+                i += 1
+                continue
+            # 'Q' must start a word so we never edit a 'Q' embedded in a token.
+            if qpos > 0 and text_i[qpos - 1].isalnum():
+                i += 1
+                continue
+
+            collected: List[Tuple[int, int]] = []  # (run_index, char_pos)
+            digits_seen = ''
+            matched = False
+            failed = False
+            for r in range(i, min(i + 12, n)):
+                t = texts[r]
+                start = qpos + 1 if r == i else 0
+                for k in range(start, len(t)):
+                    ch = t[k]
+                    if ch == ' ':
+                        continue  # tolerate spaces anywhere between the digits
+                    if ch.isdigit() and ch == old_digits[len(digits_seen)]:
+                        collected.append((r, k))
+                        digits_seen += ch
+                        if len(digits_seen) == len(old_digits):
+                            matched = True
+                            break
+                    else:
+                        failed = True  # any other char breaks the quarter+year run
+                        break
+                if matched or failed:
+                    break
+
+            if matched:
+                for idx, (ridx, k) in enumerate(collected):
+                    edits.setdefault(ridx, {})[k] = new_digits[idx]
+                i = collected[-1][0] + 1
+                continue
+            i += 1
+
+        if not edits:
+            return content
+
+        out: List[str] = []
+        cursor = 0
+        for ridx in sorted(edits):
+            match = runs[ridx]
+            chars = list(texts[ridx])
+            for k, ch in edits[ridx].items():
+                chars[k] = ch
+            out.append(content[cursor:match.start(1)])
+            out.append(''.join(chars))
+            cursor = match.end(1)
+        out.append(content[cursor:])
+        return ''.join(out)
+
     def _apply_xml_quarter_pair(
         self,
         content: str,
@@ -1740,6 +1956,12 @@ class WordTemplateUpdater:
     ) -> str:
         """Apply fragmented XML quarter patterns for one stale → current pair."""
         import re
+
+        # Roll fragmented "Q{n} {year}" references (digit + full year) first, so
+        # the year is corrected before the digit-only patterns flip the quarter.
+        content = self._apply_fragmented_quarter_year(
+            content, old_q_num, old_year, new_q_num, new_year
+        )
 
         next_wt_pattern = r'</w:t></w:r><w:r[^>]*>(?:<w:rPr>(?:(?!</w:rPr>).)*</w:rPr>)?<w:t[^>]*>'
 

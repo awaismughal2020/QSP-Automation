@@ -756,6 +756,10 @@ class QuarterlyReportOrchestrator:
                 word_template_path=self.config.word_template,
             )
             word_updater = WordTemplateUpdater(str(self.config.word_template), str(word_output))
+            logger.info(
+                f"Word step: configured previous={self.config.previous_quarter_str}, "
+                f"discovered stale quarters drive the actual rollover"
+            )
             word_updater.update_with_python_docx(
                 report_values,
                 self.config.previous_quarter_str,
@@ -766,7 +770,7 @@ class QuarterlyReportOrchestrator:
                 'output': str(word_output)
             }
             results['output_files'].append(str(word_output))
-            
+
             # Step 8: Assemble PDF (optional - requires LibreOffice)
             # Per Issue 8: Each section introduction should be immediately followed by its attachment
             # The reference PDF structure has sections interleaved with attachments, not bulk at end
@@ -1100,18 +1104,22 @@ class WordReportOrchestrator:
             )
             
             word_updater = WordTemplateUpdater(str(self.config.word_template), str(word_output))
+            logger.info(
+                f"Word step: configured previous={self.config.previous_quarter_str}, "
+                f"discovered stale quarters drive the actual rollover"
+            )
             word_updater.update_with_python_docx(
                 report_values,
                 self.config.previous_quarter_str,
                 self.config.quarter_str
             )
-            
+
             results['steps']['word_update'] = {
                 'status': 'success',
                 'output': str(word_output)
             }
             results['output_files'].append(str(word_output))
-            
+
             results['completed_at'] = datetime.now().isoformat()
             results['status'] = 'success'
             
