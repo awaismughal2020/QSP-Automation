@@ -72,6 +72,11 @@ class ReportValues:
     # Previous quarter values (for finding/replacing)
     # These are extracted from the template document (Q2 values)
     prev_gtri: float = 0.0
+    # The Portfolio Highlights box prints GTRI separately and can hold a DIFFERENT
+    # (often more stale) value than the body — it is anchored on its own label so a
+    # divergent highlights figure is still found and replaced. See
+    # extract_prev_values_from_template.
+    prev_gtri_highlights: float = 0.0
     prev_gtri_ltm: float = 0.0  # Previous LTM GTRI (for rent roll yields)
     prev_gross_rental_income: float = 0.0
     prev_vacancy_pct: float = 0.0
@@ -460,6 +465,12 @@ def extract_prev_values_from_template(docx_path: Path) -> Dict[str, float]:
     # (safe) instead of corrupting another field (unsafe).
     patterns = [
         ('prev_gtri',                 r'GTRI[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
+        # Portfolio Highlights box GTRI, anchored on its full label and a tight gap
+        # ("...income:€X,XXXk") so it captures the BOX value, not the body sentence
+        # ("Gross Theoretical Rental Income (\"GTRI\") ... amounted to €..." — the
+        # euro there is too far for the {0,3} gap). The box value can differ from
+        # the body's, so it needs its own anchor to be found and replaced.
+        ('prev_gtri_highlights',      r'Gross Theoretical rental income[^€\n]{0,3}€\s?([\d,\.]+)\s*k'),
         ('prev_gross_rental_income',  r'[Gg]ross rental income[^€\n]{0,40}€\s?([\d,\.]+)\s*k'),
         ('prev_vacancy_pct',          r'[Ff]inancial vacancy[^%\n]{0,40}?([\d,\.]+)\s*%'),
         # Vacancy has no euro amount in the template (only a %). Exclude ':' from
@@ -628,6 +639,7 @@ def build_report_values(
         maintenance_detail="",
         sustainability_detail="",
         prev_gtri=prev.get('prev_gtri', 0.0),
+        prev_gtri_highlights=prev.get('prev_gtri_highlights', 0.0),
         prev_gtri_ltm=prev.get('prev_gtri_ltm', 0.0),
         prev_gross_rental_income=prev.get('prev_gross_rental_income', 0.0),
         prev_vacancy_pct=prev.get('prev_vacancy_pct', 0.0),
@@ -1680,6 +1692,11 @@ class WordTemplateUpdater:
         # (kpi_key, prev_value, new_value, number_formatter)
         euro_replacements = [
             ('gtri', values.prev_gtri, values.gtri, lambda v: f'{v:,.1f}'),
+            # The Portfolio Highlights box GTRI can hold a value that diverges from
+            # the body's (it historically never updated), so it gets its own
+            # label-anchored old value. Without this, a stale box figure outside the
+            # ±0.25 value-match tolerance is never found and keeps the old number.
+            ('gtri', values.prev_gtri_highlights, values.gtri, lambda v: f'{v:,.1f}'),
             ('gross_rental_income', values.prev_gross_rental_income, values.gross_rental_income, lambda v: f'{v:,.1f}'),
             ('vacancy_amount', values.prev_vacancy_amount, values.financial_vacancy_amount, lambda v: f'{v:,.1f}'),
             ('gtri_ltm', values.prev_gtri_ltm, values.gtri_ltm, lambda v: f'{v:,.1f}'),
